@@ -744,9 +744,6 @@ func (sp *testSelectorPolicy) RedirectFilters() iter.Seq2[*policy.L4Filter, poli
 func (sp *testSelectorPolicy) GetSelectorSnapshot() policy.SelectorSnapshot {
 	return policy.SelectorSnapshot{}
 }
-func (sp *testSelectorPolicy) GetAuthTypes(_ identity.NumericIdentity) policytypes.AuthTypes {
-	return nil
-}
 func (sp *testSelectorPolicy) AddHold() bool       { return true }
 func (sp *testSelectorPolicy) ReleaseHold()        {}
 func (sp *testSelectorPolicy) Detach()             {}
@@ -759,8 +756,8 @@ func (sp *testSelectorPolicy) createSelectorCache() (policy.CachedSelector, *pol
 	// slogloggercheck: the default logger is enough for tests.
 	sc := policy.NewSelectorCache(logging.DefaultSlogLogger,
 		identity.IdentityMap{
-			dnsServerIdentity: labels.LabelArray{
-				labels.Label{
+			dnsServerIdentity: labels.Labels{
+				"app": labels.Label{
 					Key:   "app",
 					Value: "test",
 				},

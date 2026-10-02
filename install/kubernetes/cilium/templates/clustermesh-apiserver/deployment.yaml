@@ -1,6 +1,6 @@
 {{- if .Values.clustermesh.useAPIServer }}
-{{- if not (list "legacy" "migration" "cluster" | has .Values.clustermesh.apiserver.tls.authMode) -}}
-{{- fail ".Values.clustermesh.apiserver.tls.authMode must be one of legacy, migration, cluster" -}}
+{{- if not (list "legacy" "migration" "cluster" "cluster-strict" | has .Values.clustermesh.apiserver.tls.authMode) -}}
+{{- fail ".Values.clustermesh.apiserver.tls.authMode must be one of legacy, migration, cluster, cluster-strict" -}}
 {{- end -}}
 apiVersion: apps/v1
 kind: Deployment
@@ -78,6 +78,7 @@ spec:
         - --etcd-cluster-name=clustermesh-apiserver
         - --etcd-initial-cluster-token=$(INITIAL_CLUSTER_TOKEN)
         - --etcd-data-dir=/var/run/etcd
+        - --etcd-create-shared-remote-user={{ ne .Values.clustermesh.apiserver.tls.authMode "cluster-strict" }}
         {{- with .Values.clustermesh.apiserver.etcd.init.extraArgs }}
         {{- toYaml . | trim | nindent 8 }}
         {{- end }}
@@ -162,7 +163,7 @@ spec:
           containerPort: 2379
           protocol: TCP
         {{- if .Values.clustermesh.apiserver.metrics.etcd.enabled }}
-        - name: etcd-metrics
+        - name: {{ .Values.clustermesh.apiserver.metrics.etcd.portName | quote }}
           containerPort: {{ .Values.clustermesh.apiserver.metrics.etcd.port }}
           protocol: TCP
         {{- end }}
@@ -263,7 +264,7 @@ spec:
           containerPort: {{ .Values.clustermesh.apiserver.healthPort }}
           protocol: TCP
         {{- if .Values.clustermesh.apiserver.metrics.enabled }}
-        - name: apiserv-metrics
+        - name: {{ .Values.clustermesh.apiserver.metrics.portName | quote }}
           containerPort: {{ .Values.clustermesh.apiserver.metrics.port }}
           protocol: TCP
         {{- end }}
@@ -295,7 +296,6 @@ spec:
           {{- toYaml . | nindent 10 }}
         {{- end }}
       {{- end }}
-      {{- if .Values.clustermesh.apiserver.kvstoremesh.enabled }}
       - name: kvstoremesh
         image: {{ include "cilium.image" .Values.clustermesh.apiserver.image | quote }}
         imagePullPolicy: {{ .Values.clustermesh.apiserver.image.pullPolicy }}
@@ -355,7 +355,7 @@ spec:
           containerPort: {{ .Values.clustermesh.apiserver.kvstoremesh.healthPort }}
           protocol: TCP
         {{- if .Values.clustermesh.apiserver.metrics.kvstoremesh.enabled }}
-        - name: kvmesh-metrics
+        - name: {{ .Values.clustermesh.apiserver.metrics.kvstoremesh.portName | quote }}
           containerPort: {{ .Values.clustermesh.apiserver.metrics.kvstoremesh.port }}
           protocol: TCP
         {{- end }}
@@ -391,7 +391,6 @@ spec:
         lifecycle:
           {{- toYaml . | nindent 10 }}
         {{- end }}
-      {{- end }}
       volumes:
       {{- if (eq .Values.clustermesh.apiserver.kvstoremesh.kvstoreMode "internal") }}
       {{- if not .Values.clustermesh.apiserver.tls.disableDefaultVolumes }}
@@ -451,8 +450,7 @@ spec:
         emptyDir:
           medium: {{ ternary "Memory" "" (eq .Values.clustermesh.apiserver.etcd.storageMedium "Memory") | quote }}
       {{- end }}
-      {{- if .Values.clustermesh.apiserver.kvstoremesh.enabled }}
-        # To read the kvstoremesh configuration and TLS certificates
+      # To read the kvstoremesh configuration and TLS certificates
       {{- if not .Values.clustermesh.apiserver.tls.disableDefaultVolumes }}
       - name: kvstoremesh-secrets
         projected:
@@ -494,7 +492,6 @@ spec:
             path: etcd-config.yaml
           name: cilium-config
         name: etcd-config
-      {{- end }}
       {{- end }}
       {{- with .Values.clustermesh.apiserver.extraVolumes }}
       {{- toYaml . | nindent 6 }}

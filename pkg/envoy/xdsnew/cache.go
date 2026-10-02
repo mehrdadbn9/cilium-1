@@ -32,6 +32,7 @@ import (
 	"github.com/cilium/cilium/pkg/envoy/xds"
 	callbacks "github.com/cilium/cilium/pkg/envoy/xdsnew/callbacks"
 	"github.com/cilium/cilium/pkg/lock"
+	"github.com/cilium/cilium/pkg/logging/logfields"
 )
 
 const (
@@ -46,7 +47,7 @@ type Cache interface {
 
 	GetVersion(resources *xds.Resources) string
 	GenerateSnapshot(resources *xds.Resources, logger *slog.Logger) (cache.ResourceSnapshot, error)
-	UpdateSnapshot(ctx context.Context, nodeID string, newSnapshot cache.ResourceSnapshot, wg *completion.WaitGroup, updatedTypeURLS map[string]func(err error), revertFunc func()) error
+	UpdateSnapshot(ctx context.Context, nodeID string, newSnapshot cache.ResourceSnapshot, wg *completion.WaitGroup, updatedTypeURLS map[string]func(err error), revertFuncs map[string]func()) error
 	SetResources(nodeID string, resources *xds.Resources)
 	GetAllResources(nodeID string) *xds.Resources
 	AreDifferentSnapshots(left, right cache.ResourceSnapshot) bool
@@ -209,14 +210,18 @@ func snapshotCacheLogger(logger *slog.Logger) controlplanelog.Logger {
 		logger = slog.Default()
 	}
 	logger = logger.With(logFieldComponent, "go-control-plane-snapshot-cache")
-	return controlplanelog.LoggerFuncs{
-		DebugFunc: func(format string, args ...any) {
+
+	// Empty logger for disabled debug level
+	debugLogger := func(string, ...any) {}
+	if logger.Enabled(context.Background(), slog.LevelDebug) {
+		debugLogger = func(format string, args ...any) {
 			logger.Debug(fmt.Sprintf(format, args...))
-		},
-		InfoFunc: func(format string, args ...any) {
-			// Consider using Debug here if Info is too chatty
-			logger.Info(fmt.Sprintf(format, args...))
-		},
+		}
+	}
+
+	return controlplanelog.LoggerFuncs{
+		DebugFunc: debugLogger,
+		InfoFunc:  debugLogger, // Punt info to debug to calm the logs
 		WarnFunc: func(format string, args ...any) {
 			logger.Warn(fmt.Sprintf(format, args...))
 		},
@@ -626,7 +631,7 @@ func (c *cacheImpl) SetResources(nodeID string, resources *xds.Resources) {
 	c.resourcesInSnapshot[nodeID] = resources
 }
 
-func (c *cacheImpl) UpdateSnapshot(ctx context.Context, nodeID string, newSnapshot cache.ResourceSnapshot, wg *completion.WaitGroup, updatedTypeURLS map[string]func(err error), revertFunc func()) error {
+func (c *cacheImpl) UpdateSnapshot(ctx context.Context, nodeID string, newSnapshot cache.ResourceSnapshot, wg *completion.WaitGroup, updatedTypeURLS map[string]func(err error), revertFuncs map[string]func()) error {
 	type immediateCompletion struct {
 		comp                      *completion.Completion
 		typeURL                   string
@@ -636,17 +641,24 @@ func (c *cacheImpl) UpdateSnapshot(ctx context.Context, nodeID string, newSnapsh
 
 	completions := make([]*completion.Completion, 0, len(updatedTypeURLS))
 	immediateCompletions := make([]immediateCompletion, 0, 1)
+	handledTypeURLs := make(map[string]struct{}, len(updatedTypeURLS))
+	oldSnapshot, _ := c.GetSnapshot(nodeID)
 	if wg != nil && len(updatedTypeURLS) > 0 {
-		oldSnapshot, _ := c.GetSnapshot(nodeID)
 		for typeURL, completionCallback := range updatedTypeURLS {
-			comp := wg.AddCompletionWithCallback(nil, completionCallback)
+			handledTypeURLs[typeURL] = struct{}{}
+			version := newSnapshot.GetVersion(typeURL)
+			owner := c.completionCbs.NewTypeVersionCompletionOwner(nodeID, typeURL, version)
+			comp := wg.AddCompletionWithCallback(owner, completionCallback)
 			if typeURL == NetworkPolicyTypeURL && len(newSnapshot.GetResources(NetworkPolicyTypeURL)) == 0 {
-				immediateCompletions = append(immediateCompletions, immediateCompletion{comp: comp})
+				immediateCompletions = append(immediateCompletions, immediateCompletion{
+					comp:                      comp,
+					typeURL:                   typeURL,
+					completeUnsentCompletions: true,
+				})
 				continue
 			}
-			version := newSnapshot.GetVersion(typeURL)
 			versionChanged := oldSnapshot == nil || oldSnapshot.GetVersion(typeURL) != version
-			registered, err := c.completionCbs.AddTypeVersionCompletion(comp, version, typeURL, nodeID, versionChanged, revertFunc)
+			registered, err := c.completionCbs.AddTypeVersionCompletion(comp, version, typeURL, nodeID, versionChanged, revertFuncs[typeURL])
 			if !registered {
 				immediateCompletions = append(immediateCompletions, immediateCompletion{
 					comp:                      comp,
@@ -659,13 +671,56 @@ func (c *cacheImpl) UpdateSnapshot(ctx context.Context, nodeID string, newSnapsh
 			completions = append(completions, comp)
 		}
 	}
+
+	// A newer snapshot may be published without a completion, for example when
+	// the synthetic ingress endpoint updates NPDS. Record changed versions while
+	// older completions are pending so a response for the newer snapshot can
+	// claim and eventually complete coalesced updates.
+	markers := make([]*callbacks.TypeVersionMarker, 0, len(snapshotResourceTypes))
+	completeUnsentTypeURLs := make([]string, 0, 1)
+	for _, typeURL := range snapshotResourceTypes {
+		if _, handled := handledTypeURLs[typeURL]; handled {
+			continue
+		}
+		// An empty NPDS snapshot intentionally does not wait for an ACK.
+		if typeURL == NetworkPolicyTypeURL && len(newSnapshot.GetResources(typeURL)) == 0 {
+			completeUnsentTypeURLs = append(completeUnsentTypeURLs, typeURL)
+			continue
+		}
+		version := newSnapshot.GetVersion(typeURL)
+		versionChanged := oldSnapshot == nil || oldSnapshot.GetVersion(typeURL) != version
+		marker, completeUnsent := c.completionCbs.AddTypeVersionMarker(version, typeURL, nodeID, versionChanged, revertFuncs[typeURL])
+		if marker != nil {
+			markers = append(markers, marker)
+		}
+		if completeUnsent {
+			completeUnsentTypeURLs = append(completeUnsentTypeURLs, typeURL)
+		}
+	}
 	err := c.SetSnapshot(ctx, nodeID, newSnapshot)
 
 	if err != nil {
-		for _, comp := range completions {
-			c.completionCbs.RemoveTypeVersionCompletion(comp)
+		// go-control-plane stores a snapshot before delivering responses and can
+		// return an error after the new snapshot is already observable. Treat that
+		// case as committed so callback ordering and resourcesInSnapshot stay in
+		// sync with the underlying cache.
+		currentSnapshot, getErr := c.GetSnapshot(nodeID)
+		committed := getErr == nil && !c.AreDifferentSnapshots(currentSnapshot, newSnapshot)
+		if !committed {
+			for _, comp := range completions {
+				c.completionCbs.RemoveTypeVersionCompletion(comp)
+			}
+			for _, marker := range markers {
+				c.completionCbs.RemoveTypeVersionMarker(marker)
+			}
+			return err
 		}
-		return err
+		c.logger.Debug("Snapshot was installed despite response delivery error",
+			logfields.NodeID, nodeID,
+			logfields.Error, err)
+	}
+	for _, typeURL := range completeUnsentTypeURLs {
+		c.completionCbs.CompleteUnsentPendingCompletions(nodeID, typeURL, nil)
 	}
 	for _, completion := range immediateCompletions {
 		if completion.completeUnsentCompletions {

@@ -6,19 +6,21 @@ package gateway_api
 import (
 	"time"
 
+	"github.com/cilium/cilium/operator/pkg/gateway-api/helpers"
+
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 )
 
 // setGatewayAccepted inserts or updates the Accepted condition for the provided Gateway resource.
 func setGatewayAccepted(gw *gatewayv1.Gateway, accepted bool, msg string, reason gatewayv1.GatewayConditionReason) *gatewayv1.Gateway {
-	gw.Status.Conditions = merge(gw.Status.Conditions, gatewayStatusAcceptedCondition(gw, accepted, msg, reason))
+	gw.Status.Conditions = helpers.MergeConditions(gw.Status.Conditions, gatewayStatusAcceptedCondition(gw, accepted, msg, reason))
 	return gw
 }
 
 // setGatewayProgrammed inserts or updates the Programmed condition for the provided Gateway resource.
 func setGatewayProgrammed(gw *gatewayv1.Gateway, status metav1.ConditionStatus, msg string, reason gatewayv1.GatewayConditionReason) *gatewayv1.Gateway {
-	gw.Status.Conditions = merge(gw.Status.Conditions, gatewayStatusProgrammedCondition(gw, status, msg, reason))
+	gw.Status.Conditions = helpers.MergeConditions(gw.Status.Conditions, gatewayStatusProgrammedCondition(gw, status, msg, reason))
 	return gw
 }
 
@@ -70,29 +72,6 @@ func gatewayStatusProgrammedCondition(gw *gatewayv1.Gateway, scheduled metav1.Co
 			Type:               string(gatewayv1.GatewayConditionProgrammed),
 			Status:             metav1.ConditionFalse,
 			Reason:             string(reason),
-			Message:            msg,
-			ObservedGeneration: gw.GetGeneration(),
-			LastTransitionTime: metav1.NewTime(time.Now()),
-		}
-	}
-}
-
-func gatewayStatusReadyCondition(gw *gatewayv1.Gateway, scheduled bool, msg string) metav1.Condition {
-	switch scheduled {
-	case true:
-		return metav1.Condition{
-			Type:               string(gatewayv1.GatewayConditionReady),
-			Status:             metav1.ConditionTrue,
-			Reason:             string(gatewayv1.GatewayReasonReady),
-			Message:            msg,
-			ObservedGeneration: gw.GetGeneration(),
-			LastTransitionTime: metav1.NewTime(time.Now()),
-		}
-	default:
-		return metav1.Condition{
-			Type:               string(gatewayv1.GatewayConditionReady),
-			Status:             metav1.ConditionFalse,
-			Reason:             string(gatewayv1.GatewayReasonListenersNotReady),
 			Message:            msg,
 			ObservedGeneration: gw.GetGeneration(),
 			LastTransitionTime: metav1.NewTime(time.Now()),
@@ -173,7 +152,7 @@ func setListenerSetAccepted(ls *gatewayv1.ListenerSet, accepted bool, msg string
 	if !accepted {
 		status = metav1.ConditionFalse
 	}
-	ls.Status.Conditions = merge(ls.Status.Conditions, metav1.Condition{
+	ls.Status.Conditions = helpers.MergeConditions(ls.Status.Conditions, metav1.Condition{
 		Type:               string(gatewayv1.ListenerSetConditionAccepted),
 		Status:             status,
 		Reason:             string(reason),
@@ -188,7 +167,7 @@ func setListenerSetProgrammed(ls *gatewayv1.ListenerSet, programmed bool, msg st
 	if !programmed {
 		status = metav1.ConditionFalse
 	}
-	ls.Status.Conditions = merge(ls.Status.Conditions, metav1.Condition{
+	ls.Status.Conditions = helpers.MergeConditions(ls.Status.Conditions, metav1.Condition{
 		Type:               string(gatewayv1.ListenerSetConditionProgrammed),
 		Status:             status,
 		Reason:             string(reason),

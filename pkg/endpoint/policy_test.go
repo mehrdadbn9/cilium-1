@@ -18,6 +18,8 @@ import (
 	"github.com/stretchr/testify/require"
 	"k8s.io/apimachinery/pkg/util/sets"
 
+	cmtypes "github.com/cilium/cilium/pkg/clustermesh/types"
+	"github.com/cilium/cilium/pkg/container/set"
 	"github.com/cilium/cilium/pkg/endpoint/regeneration"
 	"github.com/cilium/cilium/pkg/identity"
 	"github.com/cilium/cilium/pkg/identity/identitymanager"
@@ -53,7 +55,7 @@ func TestIncrementalUpdatesDuringPolicyGeneration(t *testing.T) {
 	logger := hivetest.Logger(t)
 	fakeAllocator := testidentity.NewMockIdentityAllocator(idcache)
 	idManager := identitymanager.NewIDManager(hivetest.Logger(t))
-	repo := policy.NewPolicyRepository(logger, fakeAllocator.GetIdentityCache(), nil, nil, idManager, testpolicy.NewPolicyMetricsNoop())
+	repo := policy.NewPolicyRepository(logger, cmtypes.DefaultClusterInfo, fakeAllocator.GetIdentityCache(), nil, nil, idManager, testpolicy.NewPolicyMetricsNoop())
 	polComputer := testcompute.InstantiateCellForTesting(t, logger, "endpoint-policy_test", "TestIncrementalUpdatesDuringPolicyGeneration", repo, idManager)
 
 	addIdentity := func(labelKeys ...string) *identity.Identity {
@@ -70,7 +72,7 @@ func TestIncrementalUpdatesDuringPolicyGeneration(t *testing.T) {
 
 		wg := &sync.WaitGroup{}
 		repo.GetSelectorCache().UpdateIdentities(identity.IdentityMap{
-			id.ID: id.LabelArray,
+			id.ID: id.Labels,
 		}, nil, wg)
 		wg.Wait()
 		return id
@@ -219,14 +221,14 @@ func newPolicyTestFixture(t *testing.T) *policyTestFixture {
 	idcache := make(identity.IdentityMap)
 	fakeAllocator := testidentity.NewMockIdentityAllocator(idcache)
 	idManager := identitymanager.NewIDManager(logger)
-	repo := policy.NewPolicyRepository(logger, fakeAllocator.GetIdentityCache(), nil, nil, idManager, testpolicy.NewPolicyMetricsNoop())
+	repo := policy.NewPolicyRepository(logger, cmtypes.DefaultClusterInfo, fakeAllocator.GetIdentityCache(), nil, nil, idManager, testpolicy.NewPolicyMetricsNoop())
 	polComputer := testcompute.InstantiateCellForTesting(t, logger, "endpoint-policy_test", t.Name(), repo, idManager)
 
 	podLbls := labels.Labels{"pod": labels.NewLabel("k8s:pod", "", "")}
 	podID, _, err := fakeAllocator.AllocateIdentity(context.Background(), podLbls, false, 0)
 	require.NoError(t, err)
 	wg := &sync.WaitGroup{}
-	repo.GetSelectorCache().UpdateIdentities(identity.IdentityMap{podID.ID: podID.LabelArray}, nil, wg)
+	repo.GetSelectorCache().UpdateIdentities(identity.IdentityMap{podID.ID: podID.Labels}, nil, wg)
 	wg.Wait()
 
 	idManager.Add(podID)
@@ -282,6 +284,20 @@ func (f *supersedeFetcher) GetIdentityPolicyByIdentity(*identity.Identity) (comp
 	return res, 0, watch, true
 }
 
+type recomputeRecordingFetcher struct {
+	compute.PolicyRecomputer
+	identity *identity.Identity
+	revision uint64
+}
+
+func (f *recomputeRecordingFetcher) RecomputeIdentityPolicy(identity *identity.Identity, revision uint64) (<-chan struct{}, error) {
+	f.identity = identity
+	f.revision = revision
+	done := make(chan struct{})
+	close(done)
+	return done, nil
+}
+
 // waitForPolicyComputationResult must skip a superseded policy and wait for the
 // replacement instead of failing.
 func TestWaitSkipsSupersededPolicy(t *testing.T) {
@@ -297,8 +313,8 @@ func TestWaitSkipsSupersededPolicy(t *testing.T) {
 	fetcher := &supersedeFetcher{
 		PolicyRecomputer: f.polComputer,
 		results: []compute.Result{
-			{NewPolicy: detached, Revision: rev},
-			{NewPolicy: live, Revision: rev},
+			{NewPolicy: detached, Revision: rev, CurrentAtRevision: rev},
+			{NewPolicy: live, Revision: rev, CurrentAtRevision: rev},
 		},
 		watch: make(chan struct{}),
 	}
@@ -414,5 +430,31 @@ func TestSkippedPolicyRevision(t *testing.T) {
 		ep.unconditionalLock()
 		defer ep.unlock()
 		require.Nil(t, ep.consumeDeferredRegenerationLocked())
+	})
+
+	t.Run("new unaffected endpoint buffers policy revision", func(t *testing.T) {
+		ep := newEP()
+		ep.state = StateWaitingToRegenerate
+		ep.SecurityIdentity = &identity.Identity{ID: 1234}
+		fetcher := &recomputeRecordingFetcher{}
+		ep.policyFetcher = fetcher
+		affected := set.NewSet[identity.NumericIdentity]()
+
+		ep.UpdatePolicy(&affected, rev1, rev2)
+
+		// An initializing endpoint must explicitly request recomputation because
+		// unaffected identities are not normally recomputed at the new revision.
+		require.Same(t, ep.SecurityIdentity, fetcher.identity)
+		require.Equal(t, uint64(rev2), fetcher.revision)
+
+		// The endpoint must not report the revision as realized before regeneration.
+		require.Zero(t, ep.policyRevision)
+		require.Equal(t, uint64(rev2), ep.skippedPolicyRevision)
+
+		// The queued regeneration must consume and clear the deferred target.
+		ctx := &datapathRegenerationContext{}
+		consume(ep, ctx)
+		require.Equal(t, uint64(rev2), ctx.policyRevisionToWaitFor)
+		require.Zero(t, ep.skippedPolicyRevision)
 	})
 }

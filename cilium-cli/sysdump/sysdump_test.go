@@ -69,6 +69,65 @@ func TestSysdumpCollector(t *testing.T) {
 	assert.NoError(t, err)
 }
 
+func TestWithFileSinkContainment(t *testing.T) {
+	client := fakeClient{
+		nodeList: &corev1.NodeList{
+			Items: []corev1.Node{
+				{ObjectMeta: metav1.ObjectMeta{Name: "node-a"}},
+			},
+		},
+	}
+	collector, err := NewCollector(&client, Options{
+		OutputFileName: "my-sysdump-<ts>",
+		Writer:         io.Discard,
+	}, &nopHooks{}, time.Unix(946713600, 0))
+	assert.NoError(t, err)
+
+	// A name that escapes the sysdump directory, e.g. a CNI config filename
+	// listed by a compromised pod.
+	outside := filepath.Join(t.TempDir(), "escape.txt")
+	escaping, err := filepath.Rel(collector.sysdumpDir, outside)
+	assert.NoError(t, err)
+
+	tests := []struct {
+		name     string
+		filename string
+		// wantPath is checked after the write: it must exist for an accepted
+		// sink and must not exist for a rejected one.
+		wantPath string
+		wantErr  bool
+	}{
+		{
+			name:     "contained filename is written",
+			filename: "cniconf-bridge.conf-pod",
+			wantPath: path.Join(collector.sysdumpDir, "cniconf-bridge.conf-pod"),
+		},
+		{
+			name:     "escaping filename is rejected",
+			filename: escaping,
+			wantPath: outside,
+			wantErr:  true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := collector.WithFileSink(tt.filename, func(w io.Writer) error {
+				_, werr := io.WriteString(w, "data")
+				return werr
+			})
+			_, statErr := os.Stat(tt.wantPath)
+			if tt.wantErr {
+				assert.Error(t, err)
+				assert.True(t, os.IsNotExist(statErr))
+				return
+			}
+			assert.NoError(t, err)
+			assert.NoError(t, statErr)
+		})
+	}
+}
+
 func TestNodeList(t *testing.T) {
 	options := Options{
 		Writer: io.Discard,
@@ -412,10 +471,6 @@ func (c *fakeClient) ListCiliumBGPNodeConfigOverrides(ctx context.Context, opts 
 }
 
 func (c *fakeClient) ListCiliumNodeConfigs(_ context.Context, _ string, _ metav1.ListOptions) (*ciliumv2.CiliumNodeConfigList, error) {
-	panic("implement me")
-}
-
-func (c *fakeClient) ListCiliumPodIPPools(_ context.Context, _ metav1.ListOptions) (*ciliumv2alpha1.CiliumPodIPPoolList, error) {
 	panic("implement me")
 }
 
@@ -780,4 +835,53 @@ func Test_untar(t *testing.T) {
 		err := untar(archivePath, dst)
 		assert.ErrorContains(t, err, "invalid path in tar entry")
 	})
+}
+
+func TestFormatNodeDiskUsageRow(t *testing.T) {
+	// Shape and field names as served by kubelet's /stats/summary, trimmed to
+	// the disk fields. Sizes are those of the AKS 30 GB OS disk nodes.
+	summary := `{
+	  "node": {
+	    "nodeName": "aks-nodepool1-16135303-vmss000003",
+	    "fs": {
+	      "availableBytes": 3221225472,
+	      "capacityBytes": 30089314304,
+	      "usedBytes": 26868088832,
+	      "inodesFree": 1835008
+	    },
+	    "runtime": {
+	      "imageFs": {
+	        "availableBytes": 3221225472,
+	        "capacityBytes": 30089314304,
+	        "usedBytes": 20401094656
+	      }
+	    }
+	  }
+	}`
+
+	row := formatNodeDiskUsageRow("aks-nodepool1-16135303-vmss000003", summary, "True")
+	fields := strings.Split(row, "\t")
+	assert.Len(t, fields, 8)
+	assert.Equal(t, "aks-nodepool1-16135303-vmss000003", fields[0])
+	assert.Equal(t, "25623Mi", fields[1])
+	assert.Equal(t, "28695Mi", fields[2])
+	assert.Equal(t, "89%", fields[3])
+	assert.Equal(t, "19456Mi", fields[4])
+	assert.Equal(t, "28695Mi", fields[5])
+	assert.Equal(t, "1835008", fields[6])
+	assert.Equal(t, "True", fields[7])
+
+	// Missing stats must not panic or drop the node from the table.
+	row = formatNodeDiskUsageRow("node-without-stats", `{"node":{"nodeName":"node-without-stats"}}`, "False")
+	fields = strings.Split(row, "\t")
+	assert.Len(t, fields, 8)
+	assert.Equal(t, "<unknown>", fields[1])
+	assert.Equal(t, "<unknown>", fields[3])
+	assert.Equal(t, "False", fields[7])
+
+	// A garbage payload keeps the node and its condition visible.
+	row = formatNodeDiskUsageRow("node-broken", "not json", "Unknown")
+	assert.Contains(t, row, "node-broken")
+	assert.Contains(t, row, "unparseable")
+	assert.Contains(t, row, "Unknown")
 }

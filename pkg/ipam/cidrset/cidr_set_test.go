@@ -5,11 +5,14 @@
 package cidrset
 
 import (
+	"errors"
 	"math/big"
+	"math/bits"
 	"net/netip"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"go4.org/netipx"
 )
 
 func TestCIDRSetFullyAllocated(t *testing.T) {
@@ -758,6 +761,244 @@ func TestInvalidSubNetMaskSize(t *testing.T) {
 			a, err := NewCIDRSet(clusterPrefix, tc.subNetMaskSize)
 			if gotErr := err != nil; gotErr != tc.expectErr {
 				t.Fatalf("NewCIDRSet(%v, %v) = %v, %v; gotErr = %t, want %t", clusterPrefix, tc.subNetMaskSize, a, err, gotErr, tc.expectErr)
+			}
+		})
+	}
+}
+
+func TestCountUnavailableCIDRs(t *testing.T) {
+	cases := []struct {
+		description     string
+		usedIndices     []int
+		reservedIndices []int
+		want            int
+	}{
+		{
+			description: "Used bitmap spans more words",
+			usedIndices: []int{
+				bits.UintSize - 1,
+				bits.UintSize,
+				bits.UintSize*2 + 1,
+			},
+			reservedIndices: []int{bits.UintSize, bits.UintSize + 1},
+			want:            4,
+		},
+		{
+			description: "Reserved bitmap spans more words",
+			usedIndices: []int{
+				bits.UintSize - 1,
+				bits.UintSize,
+			},
+			reservedIndices: []int{
+				bits.UintSize,
+				bits.UintSize + 1,
+				bits.UintSize*2 + 1,
+			},
+			want: 4,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.description, func(t *testing.T) {
+			var used, reserved big.Int
+			for _, index := range tc.usedIndices {
+				used.SetBit(&used, index, 1)
+			}
+			for _, index := range tc.reservedIndices {
+				reserved.SetBit(&reserved, index, 1)
+			}
+
+			assert.Equal(t, tc.want, countUnavailableCIDRs(&used, &reserved))
+		})
+	}
+}
+
+func TestSetReservedRanges(t *testing.T) {
+	cases := []struct {
+		description    string
+		clusterCIDR    string
+		subNetMaskSize int
+		reservedFrom   string
+		reservedTo     string
+		allocatedCIDR  string
+		unreservedCIDR string
+	}{
+		{
+			description:    "IPv4",
+			clusterCIDR:    "10.0.0.0/30",
+			subNetMaskSize: 31,
+			reservedFrom:   "10.0.0.0",
+			reservedTo:     "10.0.0.1",
+			allocatedCIDR:  "10.0.0.2/31",
+			unreservedCIDR: "10.0.0.0/31",
+		},
+		{
+			description:    "IPv6",
+			clusterCIDR:    "fd00::/126",
+			subNetMaskSize: 127,
+			reservedFrom:   "fd00::",
+			reservedTo:     "fd00::1",
+			allocatedCIDR:  "fd00::2/127",
+			unreservedCIDR: "fd00::/127",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.description, func(t *testing.T) {
+			cidrSet, err := NewCIDRSet(netip.MustParsePrefix(tc.clusterCIDR), tc.subNetMaskSize)
+			if err != nil {
+				t.Fatalf("NewCIDRSet() returned an unexpected error: %v", err)
+			}
+
+			reserved := netipx.IPRangeFrom(
+				netip.MustParseAddr(tc.reservedFrom),
+				netip.MustParseAddr(tc.reservedTo),
+			)
+			if err := cidrSet.SetReservedRanges([]netipx.IPRange{reserved}); err != nil {
+				t.Fatalf("SetReservedRanges() returned an unexpected error: %v", err)
+			}
+			assert.Equal(t, 1, cidrSet.unavailableCIDRs)
+
+			allocated, err := cidrSet.AllocateNext()
+			if err != nil {
+				t.Fatalf("AllocateNext() returned an unexpected error: %v", err)
+			}
+			assert.Equal(t, netip.MustParsePrefix(tc.allocatedCIDR), allocated)
+			assert.Equal(t, 2, cidrSet.unavailableCIDRs)
+			assert.True(t, cidrSet.IsFull())
+
+			_, err = cidrSet.AllocateNext()
+			assert.ErrorIs(t, err, ErrCIDRRangeNoCIDRsRemaining)
+
+			if err := cidrSet.SetReservedRanges(nil); err != nil {
+				t.Fatalf("SetReservedRanges(nil) returned an unexpected error: %v", err)
+			}
+			assert.Equal(t, 1, cidrSet.unavailableCIDRs)
+			assert.False(t, cidrSet.IsFull())
+
+			allocated, err = cidrSet.AllocateNext()
+			if err != nil {
+				t.Fatalf("AllocateNext() returned an unexpected error after clearing reserved ranges: %v", err)
+			}
+			assert.Equal(t, netip.MustParsePrefix(tc.unreservedCIDR), allocated)
+			assert.Equal(t, 2, cidrSet.unavailableCIDRs)
+		})
+	}
+}
+
+func TestSetReservedRangesOverlap(t *testing.T) {
+	cidrSet, err := NewCIDRSet(netip.MustParsePrefix("10.0.0.0/30"), 31)
+	if err != nil {
+		t.Fatalf("NewCIDRSet() returned an unexpected error: %v", err)
+	}
+
+	first, err := cidrSet.AllocateNext()
+	if err != nil {
+		t.Fatalf("AllocateNext() returned an unexpected error: %v", err)
+	}
+	assert.Equal(t, netip.MustParsePrefix("10.0.0.0/31"), first)
+	assert.Equal(t, 1, cidrSet.unavailableCIDRs)
+
+	reserved := netipx.IPRangeFrom(
+		netip.MustParseAddr("10.0.0.0"),
+		netip.MustParseAddr("10.0.0.1"),
+	)
+	if err := cidrSet.SetReservedRanges([]netipx.IPRange{reserved}); err != nil {
+		t.Fatalf("SetReservedRanges() returned an unexpected error: %v", err)
+	}
+	assert.Equal(t, 1, cidrSet.unavailableCIDRs)
+
+	if err := cidrSet.Release(first); err != nil {
+		t.Fatalf("Release() returned an unexpected error: %v", err)
+	}
+	assert.Equal(t, 1, cidrSet.unavailableCIDRs)
+
+	if err := cidrSet.SetReservedRanges(nil); err != nil {
+		t.Fatalf("SetReservedRanges(nil) returned an unexpected error: %v", err)
+	}
+	assert.Equal(t, 0, cidrSet.unavailableCIDRs)
+}
+
+func TestNewCIDRSets(t *testing.T) {
+	type args struct {
+		isV6     bool
+		strCIDRs []string
+		maskSize int
+	}
+	tests := []struct {
+		name    string
+		args    args
+		wantErr error
+	}{
+		{
+			name: "test-1",
+			args: args{
+				isV6:     false,
+				strCIDRs: []string{"10.0.0.0/16"},
+				maskSize: 24,
+			},
+			wantErr: nil,
+		},
+		{
+			name: "test-2 - CIDRs collide",
+			args: args{
+				isV6:     false,
+				strCIDRs: []string{"10.0.0.0/16", "10.0.0.0/8"},
+				maskSize: 24,
+			},
+			wantErr: &ErrCIDRCollision{
+				cidr: "10.0.0.0/8",
+			},
+		},
+		{
+			name: "test-2 - CIDRs collide",
+			args: args{
+				isV6:     false,
+				strCIDRs: []string{"10.0.0.0/8"},
+				maskSize: 24,
+			},
+			wantErr: nil,
+		},
+		{
+			name: "test-4 - CIDRs collide",
+			args: args{
+				isV6:     true,
+				strCIDRs: []string{"fd00::/100", "fd00::/96"},
+				maskSize: 112,
+			},
+			wantErr: &ErrCIDRCollision{
+				cidr: "fd00::/96",
+			},
+		},
+		{
+			name: "test-5 - CIDRs do not collide",
+			args: args{
+				isV6:     true,
+				strCIDRs: []string{"fd00::/100", "fd00::1:0000:0000/96"},
+				maskSize: 112,
+			},
+			wantErr: nil,
+		},
+		{
+			name: "test-6 - CIDR does not collide",
+			args: args{
+				isV6:     true,
+				strCIDRs: []string{"fd00::/104"},
+				maskSize: 120,
+			},
+			wantErr: nil,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := NewCIDRSets(tt.args.isV6, tt.args.strCIDRs, tt.args.maskSize)
+			if (err != nil) != (tt.wantErr != nil) {
+				t.Errorf("newCIDRSets() error = %v, wantErr %v", err, tt.wantErr)
+				return
+			}
+			if tt.wantErr != nil && !errors.Is(err, tt.wantErr) {
+				t.Errorf("newCIDRSets() error = %v, wantErr %v", err, tt.wantErr)
+				return
 			}
 		})
 	}

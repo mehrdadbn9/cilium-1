@@ -330,7 +330,7 @@ func (p *Proxy) removeRedirect(id string) {
 	}
 }
 
-func (p *Proxy) UpdateNetworkPolicy(ctx context.Context, ep endpoint.EndpointUpdater, policy *policy.EndpointPolicy, wg *completion.WaitGroup) (error, revert.RevertFunc, revert.FinalizeFunc) {
+func (p *Proxy) UpdateNetworkPolicy(ctx context.Context, ep endpoint.EndpointUpdater, policy *policy.EndpointPolicy, wg *completion.WaitGroup) (error, revert.Revertible) {
 	return p.envoyIntegration.UpdateNetworkPolicy(ctx, ep, policy, wg)
 }
 
@@ -387,8 +387,8 @@ func (p *Proxy) getProxyIP(ctx context.Context) string {
 		return "n/a"
 	}
 
-	localNodeIP := ln.GetCiliumInternalIP(false)
-	if localNodeIP == nil {
+	localNodeIP := ln.GetCiliumInternalIPv4()
+	if !localNodeIP.IsValid() {
 		return "n/a"
 	}
 

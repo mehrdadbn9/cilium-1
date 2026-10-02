@@ -17,7 +17,7 @@ import (
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/cloud"
 	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/compute/armcompute/v8"
-	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/network/armnetwork/v10"
+	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/network/armnetwork/v12"
 	"k8s.io/apimachinery/pkg/util/rand"
 
 	"github.com/cilium/cilium/pkg/api/helpers"
@@ -25,6 +25,7 @@ import (
 	iputil "github.com/cilium/cilium/pkg/ip"
 	ipamTypes "github.com/cilium/cilium/pkg/ipam/types"
 	"github.com/cilium/cilium/pkg/logging/logfields"
+	"github.com/cilium/cilium/pkg/mac"
 	"github.com/cilium/cilium/pkg/spanstat"
 	"github.com/cilium/cilium/pkg/version"
 )
@@ -320,8 +321,17 @@ func parseInterface(logger *slog.Logger, iface *armnetwork.Interface, subnets ip
 	}
 
 	if iface.Properties.MacAddress != nil {
-		// Azure API reports MAC addresses as AA-BB-CC-DD-EE-FF
-		i.MAC = strings.ReplaceAll(*iface.Properties.MacAddress, "-", ":")
+		// Azure API reports MAC addresses as AA-BB-CC-DD-EE-FF, which
+		// mac.ParseMAC accepts and normalizes to aa:bb:cc:dd:ee:ff.
+		if m, err := mac.ParseMACOrUnset(*iface.Properties.MacAddress); err != nil {
+			logger.Warn(
+				"Ignoring unparseable interface MAC address",
+				logfields.MACAddr, *iface.Properties.MacAddress,
+				logfields.Error, err,
+			)
+		} else {
+			i.MAC = m
+		}
 	}
 
 	if iface.ID != nil {

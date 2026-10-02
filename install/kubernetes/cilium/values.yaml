@@ -132,7 +132,7 @@ k8sClientExponentialBackoff:
   # -- Configure maximum duration (in seconds) for exponential backoff.
   backoffMaxDurationSeconds: 120
 cluster:
-  # -- Name of the cluster. Only required for Cluster Mesh and mutual authentication with SPIRE.
+  # -- Name of the cluster. Only required for Cluster Mesh.
   # It must respect the following constraints:
   # * It must contain at most 32 characters;
   # * It must begin and end with a lower case alphanumeric character;
@@ -562,12 +562,9 @@ bpf:
   # -- Enables pre-allocation of eBPF map values. This increases
   # memory usage but can reduce latency.
   preallocateMaps: false
-  # @schema
-  # type: [null, integer]
-  # @schema
-  # -- (int) Configure the maximum number of entries in auth map.
-  # @default -- `524288`
-  authMapMax: ~
+  stats:
+    # -- Enable BPF statistics collection
+    enabled: false
   # -- Enable CT accounting for packets and bytes
   ctAccounting: false
   # @schema
@@ -1280,7 +1277,7 @@ endpointHealthChecking:
   # -- Enable connectivity health checking between virtual endpoints.
   enabled: true
 # -- Max duration to wait for envoy to respond to configuration changes. Default "10s".
-endpointPolicyUpdateTimeoutDuration: null
+endpointPolicyUpdateTimeoutDuration: ""
 endpointRoutes:
   # @schema
   # type: [boolean, string]
@@ -1407,8 +1404,8 @@ certgen:
     # @schema
     override: ~
     repository: "quay.io/cilium/certgen"
-    tag: "v0.4.9"
-    digest: "sha256:6213a4c54a1f36e14a9280765f058aaa2017550c28bc122f5b09ad146fd0da2b"
+    tag: "v0.4.11"
+    digest: "sha256:14d29a176fc96d15b154559ce1a5baf01367c10baabfa7bb8028b72f087a56f0"
     useDigest: true
     pullPolicy: "Always"
   # @schema
@@ -1499,6 +1496,8 @@ hubble:
     enableOpenMetrics: false
     # -- Configure the port the hubble metric server listens on.
     port: 9965
+    # -- Name of the Hubble metrics container port.
+    portName: hubble-metrics
     tls:
       # Enable hubble metrics server TLS.
       enabled: false
@@ -1950,6 +1949,8 @@ hubble:
     prometheus:
       enabled: false
       port: 9966
+      # -- Name of the hubble-relay Prometheus container port.
+      portName: prometheus
       serviceMonitor:
         # -- Enable service monitors.
         # This requires the prometheus CRDs to be available (see https://github.com/prometheus-operator/prometheus-operator/blob/main/example/prometheus-operator-crd/monitoring.coreos.com_servicemonitors.yaml)
@@ -2059,8 +2060,8 @@ hubble:
         # @schema
         override: ~
         repository: "quay.io/cilium/hubble-ui-backend"
-        tag: "v0.13.5"
-        digest: "sha256:fac0c300ae119274edca11fd89b1ad23c788792d8bc4ea2ba631c709e8d3c688"
+        tag: "v0.13.6"
+        digest: "sha256:83b3fc763f3d49948c306bf49b08277383e195904b9ca5c0c0022b2112628787"
         useDigest: true
         pullPolicy: "Always"
       # -- Hubble-ui backend security context.
@@ -2092,8 +2093,8 @@ hubble:
         # @schema
         override: ~
         repository: "quay.io/cilium/hubble-ui"
-        tag: "v0.13.5"
-        digest: "sha256:f7d514fc54d784ed6df9d58cf0e97648b143f92b766dd1780ed3fc845bd4c516"
+        tag: "v0.13.6"
+        digest: "sha256:049a80a03585c043d0c3121bdc518c72b0fd42bae07e4bcce0fdb8f1e88041d0"
         useDigest: true
         pullPolicy: "Always"
       # -- Hubble-ui frontend security context.
@@ -2305,7 +2306,6 @@ hubble:
     # --- Drop reasons to emit events for.
     # ref: https://docs.cilium.io/en/stable/_api/v1/flow/README/#dropreason
     reasons:
-      - auth_required
       - policy_denied
 # -- Method to use for identity allocation (`crd`, `kvstore` or `doublewrite-readkvstore` / `doublewrite-readcrd` for migrating between identity backends).
 identityAllocationMode: "crd"
@@ -2510,8 +2510,12 @@ maglev: {}
 # -- (bool) Enables masquerading of IPv4 traffic leaving the node from endpoints.
 # @default -- `true` unless ipam eni mode is active
 enableIPv4Masquerade: ~
-# -- Enables masquerading of IPv6 traffic leaving the node from endpoints.
-enableIPv6Masquerade: true
+# @schema
+# type: [null, boolean]
+# @schema
+# -- (bool) Enables masquerading of IPv6 traffic leaving the node from endpoints.
+# @default -- `true` unless ipam eni mode is active
+enableIPv6Masquerade: ~
 # -- Enables masquerading to the source of the route for traffic leaving the node from endpoints.
 enableMasqueradeRouteSource: false
 # -- Enables IPv4 BIG TCP support which increases maximum IPv4 GSO/GRO limits for nodes and pods
@@ -2655,6 +2659,9 @@ nodePort:
   # -- Enable dynamic source IP resolution for SNAT via linux's routing table.
   # The kernel must support this feature.
   enableDynamicSourceLookup: false
+  # -- (string) Configure an extended range of ephemeral ports for BPF masquerade (e.g. "1024,29999")
+  # @default -- `""`
+  extendedNATPortRange: ""
 # policyAuditMode: false
 
 # -- The agent can be put into one of the three policy enforcement modes:
@@ -2683,6 +2690,8 @@ prometheus:
   metricsService: false
   enabled: false
   port: 9962
+  # -- Name of the cilium-agent Prometheus container port.
+  portName: prometheus
   serviceMonitor:
     # -- Enable service monitors.
     # This requires the prometheus CRDs to be available (see https://github.com/prometheus-operator/prometheus-operator/blob/main/example/prometheus-operator-crd/monitoring.coreos.com_servicemonitors.yaml)
@@ -2828,6 +2837,8 @@ envoy:
   maxGlobalDownstreamConnections: 50000
   # -- Maximum number of retries for each HTTP request
   httpRetryCount: 3
+  # -- Time in seconds after which a forwarded but uncompleted HTTP request is retried. Default 0 (never).
+  httpRetryTimeout: 0
   # -- ProxyMaxRequestsPerConnection specifies the max_requests_per_connection setting for Envoy
   maxRequestsPerConnection: 0
   # -- Set Envoy HTTP option max_connection_duration seconds. Default 0 (disable)
@@ -2850,6 +2861,9 @@ envoy:
   # @schema
   # -- Max duration to wait for endpoint policies to be restored on restart. Default "3m".
   policyRestoreTimeoutDuration: null
+  # @schema
+  # type: [null, integer]
+  # @schema
   # -- Time in seconds to block Envoy worker thread while an upstream HTTP connection is closing. If set to 0, the connection is closed immediately (with TCP RST). If set to -1, the connection is closed asynchronously in the background.
   httpUpstreamLingerTimeout: null
   # -- Static runtime bootstrap config for envoy.
@@ -2865,9 +2879,9 @@ envoy:
     # @schema
     override: ~
     repository: "quay.io/cilium/cilium-envoy"
-    tag: "v1.37.5-1784087459-5c6d365aae12510675d55f3576539472045d6b03"
+    tag: "v1.39.1-1790794634-fbfb16f5f9d4c09131542931999a2cbe79a863f8"
     pullPolicy: "Always"
-    digest: "sha256:4fb60b44dbc775cecad17eb5ba877c3893375d5aeb46486898a5d1cc1fd00208"
+    digest: "sha256:0c59f308419ac92d18d61d381a8bb3004ba8ea0d5c2a03c5283626871b26953e"
     useDigest: true
   # -- Init containers added to the cilium Envoy DaemonSet.
   initContainers: []
@@ -3103,6 +3117,8 @@ envoy:
       metricRelabelings: ~
     # -- Serve prometheus metrics for cilium-envoy on the configured port
     port: "9964"
+    # -- Name of the Envoy Prometheus container port, for both standalone and embedded Envoy.
+    portName: envoy-metrics
 # -- Enable/Disable use of node label based identity
 nodeSelectorLabels: false
 # To include or exclude matched resources from cilium node identity evaluation
@@ -3433,6 +3449,8 @@ operator:
     metricsService: false
     enabled: true
     port: 9963
+    # -- Name of the cilium-operator Prometheus container port.
+    portName: prometheus
     serviceMonitor:
       # -- Enable service monitors.
       # This requires the prometheus CRDs to be available (see https://github.com/prometheus-operator/prometheus-operator/blob/main/example/prometheus-operator-crd/monitoring.coreos.com_servicemonitors.yaml)
@@ -3627,9 +3645,9 @@ preflight:
       # @schema
       override: ~
       repository: "quay.io/cilium/cilium-envoy"
-      tag: "v1.37.5-1784087459-5c6d365aae12510675d55f3576539472045d6b03"
+      tag: "v1.39.1-1790794634-fbfb16f5f9d4c09131542931999a2cbe79a863f8"
       pullPolicy: "Always"
-      digest: "sha256:4fb60b44dbc775cecad17eb5ba877c3893375d5aeb46486898a5d1cc1fd00208"
+      digest: "sha256:0c59f308419ac92d18d61d381a8bb3004ba8ea0d5c2a03c5283626871b26953e"
       useDigest: true
   # -- The priority class to use for the preflight pod.
   priorityClassName: ""
@@ -3954,9 +3972,6 @@ clustermesh:
       # the memory limits of the container.
       storageMedium: Disk
     kvstoremesh:
-      # -- Enable KVStoreMesh. KVStoreMesh caches the information retrieved
-      # from the remote clusters in the local etcd instance (deprecated - KVStoreMesh will always be enabled once the option is removed).
-      enabled: true
       # -- TCP port for the KVStoreMesh health API.
       healthPort: 9881
       # -- Configuration for the KVStoreMesh readiness probe.
@@ -4178,7 +4193,10 @@ clustermesh:
       #               The "remote" certificate must be generated with CN=remote-<cluster-name>
       #               if provided manually. Cluster mode is meaningful only when the same
       #               CA is shared across all clusters part of the mesh.
-      authMode: migration
+      # - cluster-strict:
+      #               Same as cluster, but does not create the shared remote username.
+      #               Enable only after all clusters in the mesh use cluster mode.
+      authMode: cluster
       # -- Configure automatic TLS certificates generation.
       # A Kubernetes CronJob is used the generate any
       # certificates not provided by the user at installation
@@ -4250,11 +4268,15 @@ clustermesh:
       enabled: true
       # -- Configure the port the apiserver metric server listens on.
       port: 9962
+      # -- Name of the clustermesh-apiserver metrics container port.
+      portName: apiserv-metrics
       kvstoremesh:
         # -- Enables exporting KVStoreMesh metrics in OpenMetrics format.
         enabled: true
         # -- Configure the port the KVStoreMesh metric server listens on.
         port: 9964
+        # -- Name of the KVStoreMesh metrics container port.
+        portName: kvmesh-metrics
       etcd:
         # -- Enables exporting etcd metrics in OpenMetrics format.
         enabled: true
@@ -4262,6 +4284,8 @@ clustermesh:
         mode: basic
         # -- Configure the port the etcd metric server listens on.
         port: 9963
+        # -- Name of the etcd metrics container port.
+        portName: etcd-metrics
       serviceMonitor:
         # -- Enable service monitor.
         # This requires the prometheus CRDs to be available (see https://github.com/prometheus-operator/prometheus-operator/blob/main/example/prometheus-operator-crd/monitoring.coreos.com_servicemonitors.yaml)
@@ -4392,29 +4416,8 @@ sctp:
   enabled: false
 # -- Enable Non-Default-Deny policies
 enableNonDefaultDenyPolicies: true
-# Configuration for types of authentication for Cilium (beta)
 authentication:
-  # -- Enable authentication processing and garbage collection.
-  # Note that if disabled, policy enforcement will still block requests that require authentication.
-  # But the resulting authentication requests for these requests will not be processed, therefore the requests not be allowed.
-  enabled: false
-  # -- Buffer size of the channel Cilium uses to receive authentication events from the signal map.
-  queueSize: 1024
-  # -- Buffer size of the channel Cilium uses to receive certificate expiration events from auth handlers.
-  rotatedIdentitiesQueueSize: 1024
-  # -- Interval for garbage collection of auth map entries.
-  gcInterval: "5m0s"
-  # Configuration for Cilium's service-to-service mutual authentication using TLS handshakes.
-  # Note that this is not full mTLS support without also enabling encryption of some form.
-  # Current encryption options are WireGuard or IPsec, configured in encryption block above.
-  #
-  # Deprecated as of Cilium v1.20, this feature will be removed in Cilium v1.21.
-  # See https://github.com/cilium/cilium/issues/47132 for details.
   mutual:
-    # -- Port on the agent where mutual authentication handshakes between agents will be performed
-    port: 4250
-    # -- Timeout for connecting to the remote node TCP socket
-    connectTimeout: 5s
     # Settings for SPIRE
     spire:
       # -- Enable SPIRE integration (beta)
@@ -4438,7 +4441,7 @@ authentication:
           override: ~
           repository: "docker.io/library/busybox"
           tag: "1.38.0"
-          digest: "sha256:dc2d74b28e4cf8984fa52af1f39bc7c3d9c73760b41a74d629f5d11b1ab28616"
+          digest: "sha256:fd7dc98638c8e305f4dc34e979f1c0fdfdcaeb0fbf8fcff77ae834b6da3d7e6e"
           useDigest: true
           pullPolicy: "Always"
         # SPIRE agent configuration
@@ -4452,8 +4455,8 @@ authentication:
             # @schema
             override: ~
             repository: "ghcr.io/spiffe/spire-agent"
-            tag: "1.15.2"
-            digest: "sha256:1d042e4040466686e0ee46f74981ff2167c86adfadca19b3835946f4d6047536"
+            tag: "1.15.3"
+            digest: "sha256:41b0dcd8b258a69db9e2768292a060766fb76fd866e4bc925849981ea1b825ff"
             useDigest: true
             pullPolicy: "Always"
           # -- SPIRE agent service account
@@ -4507,8 +4510,8 @@ authentication:
             # @schema
             override: ~
             repository: "ghcr.io/spiffe/spire-server"
-            tag: "1.15.2"
-            digest: "sha256:aa74ef1be86bc8e0684007d84a4d9859d294384d842c30425048d73429f3216e"
+            tag: "1.15.3"
+            digest: "sha256:4082f30d3e0ddc4000a171392c4ea174345ee44d161ee917c70b97b2ecfba141"
             useDigest: true
             pullPolicy: "Always"
           # -- SPIRE server service account

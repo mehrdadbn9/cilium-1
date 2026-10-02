@@ -9,7 +9,7 @@
 #define ENABLE_IPV4
 #define ENABLE_IPV6
 #define ENABLE_NODEPORT
-#define ENABLE_L7_LB
+#define ENABLE_L7_LB		1
 
 #define CLIENT_IP		v4_ext_one
 #define CLIENT_PORT		__bpf_htons(111)
@@ -17,7 +17,6 @@
 #define FRONTEND_PORT		tcp_svc_one
 
 #define LB_IP			v4_node_one
-#define IPV4_DIRECT_ROUTING	LB_IP
 
 #define DEFAULT_IFACE		24
 #define CILIUM_NET_IFINDEX	10
@@ -61,6 +60,8 @@ mock_ctx_redirect(const struct __sk_buff *ctx __maybe_unused,
 
 ASSIGN_CONFIG(__u32, interface_ifindex, DEFAULT_IFACE)
 ASSIGN_CONFIG(__u32, cilium_net_ifindex, CILIUM_NET_IFINDEX)
+
+ASSIGN_CONFIG(union v4addr, ipv4_direct_routing, { .be32 = LB_IP })
 
 /* Enable redirect via cilium_net to test hairpinning when cil_from_netdev
  * is attached to a bridge device.

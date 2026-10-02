@@ -11,7 +11,6 @@ import (
 	"github.com/cilium/hive/cell"
 	"github.com/spf13/pflag"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	k8sRuntime "k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/util/workqueue"
 	policyv1alpha2 "sigs.k8s.io/network-policy-api/apis/v1alpha2"
@@ -245,15 +244,15 @@ func CiliumCIDRGroupResource(params CiliumResourceParams, opts ...func(*metav1.L
 	return resource.New[*cilium_api_v2.CiliumCIDRGroup](params.Lifecycle, lw, params.MetricsProvider, resource.WithMetric("CiliumCIDRGroup"), resource.WithCRDSync(params.CRDSyncPromise)), nil
 }
 
-func CiliumPodIPPoolResource(params CiliumResourceParams, opts ...func(*metav1.ListOptions)) (resource.Resource[*cilium_api_v2alpha1.CiliumPodIPPool], error) {
+func CiliumPodIPPoolResource(params CiliumResourceParams, opts ...func(*metav1.ListOptions)) (resource.Resource[*cilium_api_v2.CiliumPodIPPool], error) {
 	if !params.ClientSet.IsEnabled() {
 		return nil, nil
 	}
 	lw := utils.ListerWatcherWithModifiers(
-		utils.ListerWatcherFromTyped[*cilium_api_v2alpha1.CiliumPodIPPoolList](params.ClientSet.CiliumV2alpha1().CiliumPodIPPools()),
+		utils.ListerWatcherFromTyped[*cilium_api_v2.CiliumPodIPPoolList](params.ClientSet.CiliumV2().CiliumPodIPPools()),
 		opts...,
 	)
-	return resource.New[*cilium_api_v2alpha1.CiliumPodIPPool](params.Lifecycle, lw, params.MetricsProvider, resource.WithMetric("CiliumPodIPPool"), resource.WithCRDSync(params.CRDSyncPromise)), nil
+	return resource.New[*cilium_api_v2.CiliumPodIPPool](params.Lifecycle, lw, params.MetricsProvider, resource.WithMetric("CiliumPodIPPool"), resource.WithCRDSync(params.CRDSyncPromise)), nil
 }
 
 func CiliumBGPNodeConfigResource(params CiliumResourceParams, opts ...func(*metav1.ListOptions)) (resource.Resource[*cilium_api_v2.CiliumBGPNodeConfig], error) {
@@ -310,9 +309,7 @@ func CiliumSlimEndpointResource(params CiliumResourceParams, localNodeStore *nod
 		},
 	}
 	return resource.New[*types.CiliumEndpoint](params.Lifecycle, lw, params.MetricsProvider,
-		resource.WithLazyTransform(func() k8sRuntime.Object {
-			return &cilium_api_v2.CiliumEndpoint{}
-		}, TransformToCiliumEndpoint),
+		resource.WithTransform(TransformToCiliumEndpoint),
 		resource.WithMetric("CiliumEndpoint"),
 		resource.WithIndexers(indexers),
 		resource.WithCRDSync(params.CRDSyncPromise),

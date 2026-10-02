@@ -77,7 +77,6 @@ func (epd *PerSelectorPolicy) appendL7WildcardRule(policyContext PolicyContext) 
 		// Wildcarding at L7 for DNS is specified via allowing all via
 		// MatchPattern!
 		rule := api.PortRuleDNS{MatchPattern: "*"}
-		rule.Sanitize()
 		if !rule.Exists(epd.L7Rules) {
 			policyContext.PolicyTrace("   Merging DNS wildcard rule: %+v\n", rule)
 			epd.L7Rules.DNS = append(epd.L7Rules.DNS, rule)
@@ -237,15 +236,6 @@ func (existingFilter *L4Filter) mergePortProto(policyCtx PolicyContext, filterTo
 			if err := existingPolicy.mergeRedirect(newPolicy); err != nil {
 				policyCtx.PolicyTrace("   Merge conflict: %s\n", err.Error())
 				return err
-			}
-
-			if existingPolicy.Authentication == nil || newPolicy.Authentication == nil {
-				if newPolicy.Authentication != nil {
-					existingPolicy.Authentication = newPolicy.Authentication
-				}
-			} else if !newPolicy.Authentication.DeepEqual(existingPolicy.Authentication) {
-				policyCtx.PolicyTrace("   Merge conflict: mismatching auth types %s/%s\n", newPolicy.Authentication.Mode, existingPolicy.Authentication.Mode)
-				return fmt.Errorf("cannot merge conflicting authentication types (%s/%s)", newPolicy.Authentication.Mode, existingPolicy.Authentication.Mode)
 			}
 
 			if existingPolicy.TerminatingTLS == nil || newPolicy.TerminatingTLS == nil {
@@ -471,7 +461,7 @@ func (r *rule) matchesSubject(securityIdentity *identity.Identity) bool {
 	// Fall back to explicit label matching for the local node
 	// because local node has mutable labels, which are applied asynchronously to the SelectorCache.
 	if r.subjectSelector == nil || ruleSelectsNode {
-		return r.Subject.Matches(securityIdentity.LabelArray)
+		return r.Subject.Matches(securityIdentity.Labels)
 	}
 
 	return r.subjectSelector.Selects(securityIdentity.ID)

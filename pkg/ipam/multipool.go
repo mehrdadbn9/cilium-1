@@ -12,16 +12,17 @@ import (
 
 	"github.com/cilium/hive/job"
 	"github.com/cilium/statedb"
+	"k8s.io/apimachinery/pkg/util/sets"
 
 	agentK8s "github.com/cilium/cilium/daemon/k8s"
 	"github.com/cilium/cilium/pkg/annotation"
+	cmtypes "github.com/cilium/cilium/pkg/clustermesh/types"
 	"github.com/cilium/cilium/pkg/ipam/podippool"
 	"github.com/cilium/cilium/pkg/ipam/types"
 	"github.com/cilium/cilium/pkg/k8s"
 	ciliumv2 "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2"
 	cilium_v2 "github.com/cilium/cilium/pkg/k8s/client/clientset/versioned/typed/cilium.io/v2"
 	"github.com/cilium/cilium/pkg/k8s/resource"
-	"github.com/cilium/cilium/pkg/logging"
 	"github.com/cilium/cilium/pkg/logging/logfields"
 	"github.com/cilium/cilium/pkg/node"
 	"github.com/cilium/cilium/pkg/option"
@@ -68,10 +69,10 @@ type multiPoolAllocator struct {
 	family  Family
 }
 
-func newMultiPoolAllocators(p MultiPoolAllocatorParams) (Allocator, Allocator) {
+func newMultiPoolAllocators(ctx context.Context, p MultiPoolAllocatorParams) (Allocator, Allocator, error) {
 	preallocMap, err := ParseMultiPoolPreAllocMap(p.PreAllocPools)
 	if err != nil {
-		logging.Fatal(p.Logger, fmt.Sprintf("Invalid %s flag value", option.IPAMMultiPoolPreAllocation), logfields.Error, err)
+		return nil, nil, fmt.Errorf("invalid --%s flag value: %w", option.IPAMMultiPoolPreAllocation, err)
 	}
 
 	mgr := newMultiPoolManager(MultiPoolManagerParams{
@@ -92,18 +93,22 @@ func newMultiPoolAllocators(p MultiPoolAllocatorParams) (Allocator, Allocator) {
 	allocCIDRsReady := startLocalNodeAllocCIDRsSync(p.IPv4Enabled, p.IPv6Enabled, p.JobGroup, p.Node, p.LocalNodeStore)
 
 	// wait for local node to be updated to avoid propagating spurious updates.
-	waitForLocalNodeUpdate(p.Logger, mgr)
+	if err := waitForLocalNodeUpdate(ctx, p.Logger, mgr); err != nil {
+		return nil, nil, err
+	}
 	// Independently wait for the alloc-CIDR observer: it runs in its own job
 	// and is not synchronized with mgr.localNodeUpdated().
-	waitForLocalNodeAllocCIDRs(p.Logger, allocCIDRsReady)
+	if err := waitForLocalNodeAllocCIDRs(ctx, p.Logger, allocCIDRsReady); err != nil {
+		return nil, nil, err
+	}
 
 	return &multiPoolAllocator{
-			manager: mgr,
-			family:  IPv4,
-		}, &multiPoolAllocator{
-			manager: mgr,
-			family:  IPv6,
-		}
+		manager: mgr,
+		family:  IPv4,
+	}, &multiPoolAllocator{
+		manager: mgr,
+		family:  IPv6,
+	}, nil
 }
 
 func (c *multiPoolAllocator) Allocate(addr netip.Addr, owner string, pool Pool) (*AllocationResult, error) {
@@ -126,7 +131,7 @@ func (c *multiPoolAllocator) AllocateNextWithoutSyncUpstream(owner string, pool 
 	return c.manager.allocateNext(owner, pool, c.family, false)
 }
 
-func (c *multiPoolAllocator) Dump() (map[Pool]map[string]string, string) {
+func (c *multiPoolAllocator) Dump() (map[Pool]sets.Set[netip.Addr], string) {
 	return c.manager.dump(c.family)
 }
 
@@ -184,17 +189,22 @@ func waitForPool(logger *slog.Logger, db *statedb.DB, podIPPools statedb.Table[p
 			logger.Info(
 				"Waiting for pod cidr pool to become available in stateDB",
 				logfields.PoolName, pool,
-				logfields.HelpMessage, "Check if cilium-operator pod is running and does not have any warnings or error messages.",
+				logfields.HelpMessage, operatorHelpMessage,
 			)
 		}
 	}
 }
 
-func waitForLocalNodeUpdate(logger *slog.Logger, mgr *multiPoolManager) {
+// waitForLocalNodeUpdate blocks until the multi-pool manager has synchronized
+// the local node store with the CiliumNode resource. It returns an error if ctx
+// is cancelled before that.
+func waitForLocalNodeUpdate(ctx context.Context, logger *slog.Logger, mgr *multiPoolManager) error {
 	for {
 		select {
 		case <-mgr.localNodeUpdated():
-			return
+			return nil
+		case <-ctx.Done():
+			return fmt.Errorf("waiting for the local CiliumNode resource to synchronize the local node store: %w", ctx.Err())
 		case <-time.After(5 * time.Second):
 			logger.Info("Waiting for local CiliumNode resource to synchronize local node store")
 		}
@@ -207,26 +217,33 @@ func waitForLocalNodeUpdate(logger *slog.Logger, mgr *multiPoolManager) {
 // that subsequently read the local node store see state derived from at least
 // the same first event the manager saw.
 //
-// Aborts the agent with a fatal log if no CiliumNode event is received within
-// waitForLocalNodeAllocCIDRsTimeout.
-func waitForLocalNodeAllocCIDRs(logger *slog.Logger, ready <-chan struct{}) {
+// It returns an error if no such event is received within
+// waitForLocalNodeAllocCIDRsTimeout, or if ctx is cancelled before that.
+func waitForLocalNodeAllocCIDRs(ctx context.Context, logger *slog.Logger, ready <-chan struct{}) error {
 	deadline := time.After(waitForLocalNodeAllocCIDRsTimeout)
 	for {
 		select {
 		case <-ready:
-			return
+			return nil
 		case <-deadline:
-			logging.Fatal(logger,
-				"Timed out waiting for the multi-pool local node syncer to process the first CiliumNode event",
-				logfields.Duration, waitForLocalNodeAllocCIDRsTimeout,
-			)
+			return fmt.Errorf("timed out after %s waiting for the multi-pool local node syncer to process the first CiliumNode event. %s",
+				waitForLocalNodeAllocCIDRsTimeout, operatorHelpMessage)
+		case <-ctx.Done():
+			return fmt.Errorf("waiting for the multi-pool local node syncer to process the first CiliumNode event: %w", ctx.Err())
 		case <-time.After(5 * time.Second):
-			logger.Info("Waiting for the multi-pool local node syncer to process the first CiliumNode event")
+			logger.Info(
+				"Waiting for the multi-pool local node syncer to process the first CiliumNode event",
+				logfields.HelpMessage, operatorHelpMessage,
+			)
 		}
 	}
 }
 
 const waitForLocalNodeAllocCIDRsTimeout = 5 * time.Minute
+
+// operatorHelpMessage points at the operator, which is what the agent is
+// waiting on whenever one of the IPAM start-up waits above times out.
+const operatorHelpMessage = "Check if the cilium-operator pod is running and does not have any warnings or error messages."
 
 // startLocalNodeAllocCIDRsSync starts a CiliumNode observer that mirrors the
 // alloc CIDRs (Spec.IPAM.PodCIDRs / Spec.IPAM.Pools.Allocated) into the local
@@ -255,7 +272,12 @@ func startLocalNodeAllocCIDRsSync(
 					return nil
 				}
 
-				no := k8s.ParseCiliumNode(ev.Object)
+				no := k8s.ParseCiliumNode(
+					ev.Object,
+					// The rest of the function does not use the cluster name/id, so let's
+					// just pass a dummy value to avoid having to propagate a ClusterInfo
+					cmtypes.ClusterInfo{ID: 0, Name: "should-not-be-used"},
+				)
 				localNodeStore.Update(func(n *node.LocalNode) {
 					if enableIPv4 && no.IPv4AllocCIDR.IsValid() {
 						n.IPv4AllocCIDR = no.IPv4AllocCIDR

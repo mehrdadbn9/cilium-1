@@ -23,7 +23,6 @@ import (
 	"github.com/cilium/cilium/pkg/ipam"
 	"github.com/cilium/cilium/pkg/node"
 	"github.com/cilium/cilium/pkg/option"
-	cslices "github.com/cilium/cilium/pkg/slices"
 	"github.com/cilium/cilium/pkg/time"
 )
 
@@ -70,7 +69,6 @@ func (r *IpamPostIpamHandler) Handle(params ipamapi.PostIpamParams) middleware.R
 		resp.Address.IPv4 = ipv4Result.IP.String()
 		resp.Address.IPv4PoolName = ipv4Result.IPPoolName.String()
 		resp.IPv4 = &models.IPAMAddressResponse{
-			Cidrs:           cslices.Map(ipv4Result.CIDRs, iputil.PrefixFrom),
 			IP:              iputil.AddrFrom(ipv4Result.IP),
 			MasterMac:       ipv4Result.PrimaryMAC,
 			Gateway:         iputil.AddrFrom(ipv4Result.GatewayIP),
@@ -84,7 +82,6 @@ func (r *IpamPostIpamHandler) Handle(params ipamapi.PostIpamParams) middleware.R
 		resp.Address.IPv6 = ipv6Result.IP.String()
 		resp.Address.IPv6PoolName = ipv6Result.IPPoolName.String()
 		resp.IPv6 = &models.IPAMAddressResponse{
-			Cidrs:           cslices.Map(ipv6Result.CIDRs, iputil.PrefixFrom),
 			IP:              iputil.AddrFrom(ipv6Result.IP),
 			MasterMac:       ipv6Result.PrimaryMAC,
 			Gateway:         iputil.AddrFrom(ipv6Result.GatewayIP),
@@ -108,7 +105,7 @@ func (r *IpamPostIpamHandler) getNodeRouterAddressing(ctx context.Context) (*mod
 	if r.DaemonConfig.EnableIPv6 {
 		nodeRouterAddressing.IPv6 = &models.NodeAddressingElement{
 			Enabled:    r.DaemonConfig.EnableIPv6,
-			IP:         ln.GetCiliumInternalIP(true).String(),
+			IP:         ln.GetCiliumInternalIPv6().String(),
 			AllocRange: ln.IPv6AllocCIDR.String(),
 		}
 	}
@@ -116,7 +113,7 @@ func (r *IpamPostIpamHandler) getNodeRouterAddressing(ctx context.Context) (*mod
 	if r.DaemonConfig.EnableIPv4 {
 		nodeRouterAddressing.IPv4 = &models.NodeAddressingElement{
 			Enabled:    r.DaemonConfig.EnableIPv4,
-			IP:         ln.GetCiliumInternalIP(false).String(),
+			IP:         ln.GetCiliumInternalIPv4().String(),
 			AllocRange: ln.IPv4AllocCIDR.String(),
 		}
 	}

@@ -2670,7 +2670,7 @@ func init() {
         },
         "host-mac": {
           "description": "MAC address",
-          "type": "string"
+          "$ref": "#/definitions/MAC"
         },
         "id": {
           "description": "Local endpoint ID",
@@ -2706,7 +2706,7 @@ func init() {
         },
         "mac": {
           "description": "MAC address",
-          "type": "string"
+          "$ref": "#/definitions/MAC"
         },
         "netns-cookie": {
           "description": "Network namespace cookie",
@@ -2892,7 +2892,7 @@ func init() {
         },
         "host-mac": {
           "description": "MAC address",
-          "type": "string"
+          "$ref": "#/definitions/MAC"
         },
         "interface-index": {
           "description": "Index of network device in host netns",
@@ -2904,7 +2904,7 @@ func init() {
         },
         "mac": {
           "description": "MAC address",
-          "type": "string"
+          "$ref": "#/definitions/MAC"
         }
       }
     },
@@ -3239,13 +3239,6 @@ func init() {
       "description": "IPAM configuration of an individual address family",
       "type": "object",
       "properties": {
-        "cidrs": {
-          "description": "List of CIDRs out of which IPs are allocated",
-          "type": "array",
-          "items": {
-            "$ref": "#/definitions/CIDR"
-          }
-        },
         "expiration-uuid": {
           "description": "The UUID for the expiration timer. Set when expiration has been\nenabled while allocating.\n",
           "type": "string"
@@ -3264,7 +3257,7 @@ func init() {
         },
         "master-mac": {
           "description": "MAC of master interface if address is a slave/secondary of a master interface",
-          "type": "string"
+          "$ref": "#/definitions/MAC"
         },
         "skip-masquerade": {
           "description": "SkipMasquerade indicates whether the datapath should avoid masquerading connections from this IP.\n",
@@ -3873,6 +3866,20 @@ func init() {
       "type": "array",
       "items": {
         "type": "string"
+      }
+    },
+    "MAC": {
+      "description": "MAC address",
+      "type": "string",
+      "x-go-type": {
+        "hints": {
+          "kind": "primitive",
+          "noValidation": true
+        },
+        "import": {
+          "package": "github.com/cilium/cilium/pkg/mac"
+        },
+        "type": "MAC"
       }
     },
     "MapEvent": {
@@ -4746,10 +4753,6 @@ func init() {
         "attach-mode": {
           "description": "Status of core datapath attachment mode",
           "$ref": "#/definitions/AttachMode"
-        },
-        "auth-certificate-provider": {
-          "description": "Status of Mutual Authentication certificate provider",
-          "$ref": "#/definitions/Status"
         },
         "bandwidth-manager": {
           "description": "Status of bandwidth manager",
@@ -8116,7 +8119,7 @@ func init() {
         },
         "host-mac": {
           "description": "MAC address",
-          "type": "string"
+          "$ref": "#/definitions/MAC"
         },
         "id": {
           "description": "Local endpoint ID",
@@ -8152,7 +8155,7 @@ func init() {
         },
         "mac": {
           "description": "MAC address",
-          "type": "string"
+          "$ref": "#/definitions/MAC"
         },
         "netns-cookie": {
           "description": "Network namespace cookie",
@@ -8338,7 +8341,7 @@ func init() {
         },
         "host-mac": {
           "description": "MAC address",
-          "type": "string"
+          "$ref": "#/definitions/MAC"
         },
         "interface-index": {
           "description": "Index of network device in host netns",
@@ -8350,7 +8353,7 @@ func init() {
         },
         "mac": {
           "description": "MAC address",
-          "type": "string"
+          "$ref": "#/definitions/MAC"
         }
       }
     },
@@ -8708,13 +8711,6 @@ func init() {
       "description": "IPAM configuration of an individual address family",
       "type": "object",
       "properties": {
-        "cidrs": {
-          "description": "List of CIDRs out of which IPs are allocated",
-          "type": "array",
-          "items": {
-            "$ref": "#/definitions/CIDR"
-          }
-        },
         "expiration-uuid": {
           "description": "The UUID for the expiration timer. Set when expiration has been\nenabled while allocating.\n",
           "type": "string"
@@ -8733,7 +8729,7 @@ func init() {
         },
         "master-mac": {
           "description": "MAC of master interface if address is a slave/secondary of a master interface",
-          "type": "string"
+          "$ref": "#/definitions/MAC"
         },
         "skip-masquerade": {
           "description": "SkipMasquerade indicates whether the datapath should avoid masquerading connections from this IP.\n",
@@ -9674,6 +9670,20 @@ func init() {
       "type": "array",
       "items": {
         "type": "string"
+      }
+    },
+    "MAC": {
+      "description": "MAC address",
+      "type": "string",
+      "x-go-type": {
+        "hints": {
+          "kind": "primitive",
+          "noValidation": true
+        },
+        "import": {
+          "package": "github.com/cilium/cilium/pkg/mac"
+        },
+        "type": "MAC"
       }
     },
     "MapEvent": {
@@ -10629,10 +10639,6 @@ func init() {
         "attach-mode": {
           "description": "Status of core datapath attachment mode",
           "$ref": "#/definitions/AttachMode"
-        },
-        "auth-certificate-provider": {
-          "description": "Status of Mutual Authentication certificate provider",
-          "$ref": "#/definitions/Status"
         },
         "bandwidth-manager": {
           "description": "Status of bandwidth manager",

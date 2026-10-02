@@ -16,6 +16,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/cilium/cilium/api/v1/models"
+	cmtypes "github.com/cilium/cilium/pkg/clustermesh/types"
 	"github.com/cilium/cilium/pkg/identity"
 	"github.com/cilium/cilium/pkg/labels"
 	"github.com/cilium/cilium/pkg/option"
@@ -57,7 +58,7 @@ func TestEgressNamedPortToMapStateUnion(t *testing.T) {
 	epPolicy := &EndpointPolicy{
 		SelectorPolicy: &selectorPolicy{namedPortsGetter: testNamedPortsGetter{npm: namedPorts}},
 		PolicyOwner:    owner,
-		policyMapState: newMapState(logger, nil, namedPortRules),
+		policyMapState: newMapState(logger, MapStateSizes{}, namedPortRules, cmtypes.DefaultClusterInfo),
 		selectors:      types.MockSelectorSnapshot(),
 	}
 	filter := &L4Filter{
@@ -113,7 +114,7 @@ func TestEgressNamedPortWildcardOptimization(t *testing.T) {
 		epPolicy := &EndpointPolicy{
 			SelectorPolicy: &selectorPolicy{namedPortsGetter: testNamedPortsGetter{npm: namedPorts}},
 			PolicyOwner:    owner,
-			policyMapState: newMapState(logger, nil, namedPortRules),
+			policyMapState: newMapState(logger, MapStateSizes{}, namedPortRules, cmtypes.DefaultClusterInfo),
 			selectors:      types.MockSelectorSnapshot(),
 		}
 
@@ -139,7 +140,7 @@ func TestEgressNamedPortWildcardOptimization(t *testing.T) {
 		epPolicy := &EndpointPolicy{
 			SelectorPolicy: &selectorPolicy{namedPortsGetter: testNamedPortsGetter{npm: namedPorts}},
 			PolicyOwner:    owner,
-			policyMapState: newMapState(logger, nil, namedPortRules),
+			policyMapState: newMapState(logger, MapStateSizes{}, namedPortRules, cmtypes.DefaultClusterInfo),
 			selectors:      types.MockSelectorSnapshot(),
 		}
 
@@ -163,11 +164,11 @@ func TestNamedPortRulesDeleteByID(t *testing.T) {
 	logger := hivetest.Logger(t)
 	epPolicy := &EndpointPolicy{
 		PolicyOwner:    DummyOwner{logger: logger},
-		policyMapState: newMapState(logger, nil, namedPortRules),
+		policyMapState: newMapState(logger, MapStateSizes{}, namedPortRules, cmtypes.DefaultClusterInfo),
 	}
 	require.NotNil(t, epPolicy.policyMapState.byId)
 
-	entry := newMapStateEntry(0, types.HighestPriority, types.LowestPriority, NilRuleOrigin, 0, 0, types.Allow, NoAuthRequirement)
+	entry := newMapStateEntry(0, types.HighestPriority, types.LowestPriority, NilRuleOrigin, 0, 0, types.Allow)
 	for _, key := range []Key{
 		EgressKey().WithIdentity(101).WithTCPPort(8080),
 		EgressKey().WithIdentity(101).WithTCPPort(9090),
@@ -368,9 +369,6 @@ func TestCreateL4Filter(t *testing.T) {
 		require.NoError(t, err)
 		require.Len(t, filter.PerSelectorPolicies, 1)
 		for _, sp := range filter.PerSelectorPolicies {
-			explicit, authType := getAuthType(sp.Authentication)
-			require.False(t, explicit)
-			require.Equal(t, AuthTypeDisabled, authType)
 			require.Equal(t, redirectTypeEnvoy, sp.redirectType())
 		}
 
@@ -379,65 +377,6 @@ func TestCreateL4Filter(t *testing.T) {
 		require.NoError(t, err)
 		require.Len(t, filter.PerSelectorPolicies, 1)
 		for _, sp := range filter.PerSelectorPolicies {
-			explicit, authType := getAuthType(sp.Authentication)
-			require.False(t, explicit)
-			require.Equal(t, AuthTypeDisabled, authType)
-			require.Equal(t, redirectTypeEnvoy, sp.redirectType())
-		}
-	}
-}
-
-func TestCreateL4FilterAuthRequired(t *testing.T) {
-	// disable allow local host to simplify the this test
-	oldLocalhostOpt := option.Config.UnsafeDaemonConfigOption.AllowLocalhost
-	option.Config.UnsafeDaemonConfigOption.AllowLocalhost = option.AllowLocalhostPolicy
-	defer func() { option.Config.UnsafeDaemonConfigOption.AllowLocalhost = oldLocalhostOpt }()
-
-	td := newTestData(t, hivetest.Logger(t))
-	tuple := api.PortProtocol{Port: "80", Protocol: api.ProtoTCP}
-	portrule := &api.PortRule{
-		Ports: []api.PortProtocol{tuple},
-		Rules: &api.L7Rules{
-			HTTP: []api.PortRuleHTTP{
-				{Path: "/public", Method: "GET"},
-			},
-		},
-	}
-	selectors := []api.EndpointSelector{
-		api.NewESFromLabels(),
-		api.NewESFromLabels(labels.ParseSelectLabel("bar")),
-	}
-
-	for _, es := range selectors {
-		eps := types.ToSelectors(es)
-		entry := &types.PolicyEntry{
-			Verdict:        types.Allow,
-			L3:             eps,
-			Ingress:        true,
-			L4:             []api.PortRule{*portrule},
-			Authentication: &api.Authentication{Mode: api.AuthenticationModeDisabled},
-		}
-		// Regardless of ingress/egress, we should end up with
-		// a single L7 rule whether the selector is wildcarded
-		// or if it is based on specific labels.
-		filter, err := createL4Filter(td.testPolicyContext, entry, portrule, tuple)
-		require.NoError(t, err)
-		require.Len(t, filter.PerSelectorPolicies, 1)
-		for _, sp := range filter.PerSelectorPolicies {
-			explicit, authType := getAuthType(sp.Authentication)
-			require.True(t, explicit)
-			require.Equal(t, AuthTypeDisabled, authType)
-			require.Equal(t, redirectTypeEnvoy, sp.redirectType())
-		}
-
-		entry.Ingress = false
-		filter, err = createL4Filter(td.testPolicyContext, entry, portrule, tuple)
-		require.NoError(t, err)
-		require.Len(t, filter.PerSelectorPolicies, 1)
-		for _, sp := range filter.PerSelectorPolicies {
-			explicit, authType := getAuthType(sp.Authentication)
-			require.True(t, explicit)
-			require.Equal(t, AuthTypeDisabled, authType)
 			require.Equal(t, redirectTypeEnvoy, sp.redirectType())
 		}
 	}
@@ -783,7 +722,7 @@ func BenchmarkEvaluateL4PolicyMapState(b *testing.B) {
 // it is released, even after all current users have been removed.
 func TestHoldPreventsDetach(t *testing.T) {
 	logger := hivetest.Logger(t)
-	repo := NewPolicyRepository(logger, nil, nil, nil, nil, testpolicy.NewPolicyMetricsNoop())
+	repo := NewPolicyRepository(logger, cmtypes.DefaultClusterInfo, nil, nil, nil, nil, testpolicy.NewPolicyMetricsNoop())
 	repo.revision.Store(1)
 
 	ep := testutils.NewTestEndpoint(t)
@@ -824,7 +763,7 @@ func TestHoldPreventsDetach(t *testing.T) {
 // a policy that is being replaced.
 func TestAddHoldRejectsDetached(t *testing.T) {
 	logger := hivetest.Logger(t)
-	repo := NewPolicyRepository(logger, nil, nil, nil, nil, testpolicy.NewPolicyMetricsNoop())
+	repo := NewPolicyRepository(logger, cmtypes.DefaultClusterInfo, nil, nil, nil, nil, testpolicy.NewPolicyMetricsNoop())
 	repo.revision.Store(1)
 
 	ep := testutils.NewTestEndpoint(t)

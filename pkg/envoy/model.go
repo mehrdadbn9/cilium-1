@@ -26,6 +26,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 
 	"github.com/cilium/cilium/pkg/bpf"
+	"github.com/cilium/cilium/pkg/container/set"
 	"github.com/cilium/cilium/pkg/envoy/config"
 	envoypolicy "github.com/cilium/cilium/pkg/envoy/policy"
 	"github.com/cilium/cilium/pkg/identity"
@@ -63,6 +64,11 @@ const (
 	// LocalNodeID is the Envoy node ID used by the host proxy.
 	LocalNodeID = "host~127.0.0.1~no-id~localdomain"
 
+	// GetLegacyFormatNodeIDs returns the Envoy proxy IDs that need to ACK policy
+	// updates on the legacy per-type xDS server. The legacy server records ACKs by
+	// parsed node IP, not by full Envoy node ID.
+	LegacyFormatLocalNodeID = "127.0.0.1"
+
 	// direction logging
 	ingressDirection = "ingress"
 	egressDirection  = "egress"
@@ -85,7 +91,7 @@ type portState struct {
 	// Assume none of the rules have side-effects so that rule evaluation can be
 	// stopped as soon as the first allowing rule is found. Values are added to
 	// 'cantShortCircuit' for each precedence for which this is not true.
-	cantShortCircuit map[uint32]struct{}
+	cantShortCircuit set.Set[uint32]
 
 	// port-specific wildcard selector rules, if any, only for the highest
 	// precedence rules.
@@ -287,25 +293,6 @@ func namespacedNametoSyncedSDSSecretName(namespacedName types.NamespacedName, po
 	return syncnames.SyncedSDSSecretName(policySecretsNamespace, namespacedName)
 }
 
-// return the Envoy proxy node IDs that need to ACK the policy.
-func GetNodeIDs(ep endpoint.EndpointUpdater, policy *policy.L4Policy) []string {
-	nodeIDs := make([]string, 0, 1)
-
-	// Host proxy uses LocalNodeID as the nodeID
-	nodeIDs = append(nodeIDs, LocalNodeID)
-	return nodeIDs
-}
-
-// GetLegacyFormatNodeIDs returns the Envoy proxy IDs that need to ACK policy
-// updates on the legacy per-type xDS server. The legacy server records ACKs by
-// parsed node IP, not by full Envoy node ID.
-func GetLegacyFormatNodeIDs(ep endpoint.EndpointUpdater, policy *policy.L4Policy) []string {
-	nodeIDs := make([]string, 0, 1)
-
-	nodeIDs = append(nodeIDs, "127.0.0.1")
-	return nodeIDs
-}
-
 func GetNetworkPolicy(ep endpoint.EndpointUpdater, getEgressNamedPorts GetEgressNamedPorts, selectors policy.SelectorSnapshot, names []string, l4Policy *policy.L4Policy,
 	ingressPolicyEnforced, egressPolicyEnforced, useFullTLSContext, useSDS bool, policySecretsNamespace string, logger *slog.Logger, l7RulesTranslator envoypolicy.EnvoyL7RulesTranslator,
 ) *cilium.NetworkPolicy {
@@ -498,7 +485,6 @@ func GetDirectionNetworkPolicy(ep endpoint.EndpointUpdater, getEgressNamedPorts 
 		ensurePortState := func(key portKey) portState {
 			byPort, ok := rulesByPort[key]
 			if !ok {
-				byPort.cantShortCircuit = make(map[uint32]struct{})
 				ports = append(ports, key)
 			}
 			return byPort
@@ -573,7 +559,7 @@ func GetDirectionNetworkPolicy(ep endpoint.EndpointUpdater, getEgressNamedPorts 
 						portKey := portKey{port, l4.EndPort}
 						byPort := ensurePortState(portKey)
 						if !csc {
-							byPort.cantShortCircuit[rule.Precedence] = struct{}{}
+							byPort.cantShortCircuit.Insert(rule.Precedence)
 						}
 						byPort.rules = append(byPort.rules, rule)
 						rulesByPort[portKey] = byPort
@@ -609,7 +595,7 @@ func GetDirectionNetworkPolicy(ep endpoint.EndpointUpdater, getEgressNamedPorts 
 				portKey := portKey{port, l4.EndPort}
 				byPort := ensurePortState(portKey)
 				if !csc {
-					byPort.cantShortCircuit[rule.Precedence] = struct{}{}
+					byPort.cantShortCircuit.Insert(rule.Precedence)
 				}
 
 				if len(rule.RemotePolicies) == 0 {
@@ -656,7 +642,7 @@ func GetDirectionNetworkPolicy(ep endpoint.EndpointUpdater, getEgressNamedPorts 
 			if denyAllRule != nil || allowAllRule != nil {
 				nRules := len(rules)
 				rules = slices.DeleteFunc(rules, func(rule *cilium.PortNetworkPolicyRule) bool {
-					_, found := cantShortCircuit[rule.Precedence]
+					found := cantShortCircuit.Has(rule.Precedence)
 					canShortCircuit := !found
 
 					return denyAllRule != nil && rule != denyAllRule && rule.Precedence <= denyAllRule.Precedence ||
@@ -693,6 +679,14 @@ func GetDirectionNetworkPolicy(ep endpoint.EndpointUpdater, getEgressNamedPorts 
 				envoypolicy.SortPortNetworkPolicyRules(rules)
 			} else if len(rules) == 1 && isEmptyRule(rules[0]) {
 				rules = nil
+			}
+
+			// A port-specific pass also requires lower tiers to be generated. Otherwise,
+			// a wildcard port rule would incorrectly short-circuit them below.
+			if !havePassRules {
+				havePassRules = slices.ContainsFunc(rules, func(rule *cilium.PortNetworkPolicyRule) bool {
+					return rule.GetPassPrecedence() != 0
+				})
 			}
 
 			// NPDS supports port ranges.
@@ -973,22 +967,44 @@ func GetUpstreamCodecFilter() *envoy_config_http.HttpFilter {
 	}
 }
 
+// GetHTTPRetryPolicy returns the common HTTP retry policy using a timeout in seconds.
+func GetHTTPRetryPolicy(retryCount, retryTimeout uint) *envoy_config_route.RetryPolicy {
+	return &envoy_config_route.RetryPolicy{
+		RetryOn:       "5xx",
+		NumRetries:    wrapperspb.UInt32(uint32(retryCount)),
+		PerTryTimeout: &durationpb.Duration{Seconds: int64(retryTimeout)},
+	}
+}
+
 func GetHttpFilterChainProto(clusterName string, tls bool, isIngress bool, accessLogPath string, config xdsServerConfig) *envoy_config_listener.FilterChain {
 	requestTimeout := int64(config.httpRequestTimeout)       // seconds
 	idleTimeout := int64(config.httpIdleTimeout)             // seconds
 	maxGRPCTimeout := int64(config.httpMaxGRPCTimeout)       // seconds
 	streamIdleTimeout := int64(config.httpStreamIdleTimeout) // seconds
-	numRetries := uint32(config.httpRetryCount)
-	retryTimeout := int64(config.httpRetryTimeout) // seconds
 	xffNumTrustedHops := config.proxyXffNumTrustedHopsEgress
 	if isIngress {
 		xffNumTrustedHops = config.proxyXffNumTrustedHopsIngress
+	}
+
+	newHTTPRouteAction := func() *envoy_config_route.RouteAction {
+		action := &envoy_config_route.RouteAction{
+			ClusterSpecifier: &envoy_config_route.RouteAction_Cluster{
+				Cluster: clusterName,
+			},
+			Timeout:     &durationpb.Duration{Seconds: requestTimeout},
+			RetryPolicy: GetHTTPRetryPolicy(uint(config.httpRetryCount), uint(config.httpRetryTimeout)),
+		}
+		if idleTimeout > 0 {
+			action.IdleTimeout = &durationpb.Duration{Seconds: idleTimeout}
+		}
+		return action
 	}
 
 	hcmConfig := &envoy_config_http.HttpConnectionManager{
 		StatPrefix: "proxy",
 		UpgradeConfigs: []*envoy_config_http.HttpConnectionManager_UpgradeConfig{
 			{UpgradeType: "websocket"},
+			{UpgradeType: "CONNECT"},
 		},
 		UseRemoteAddress:  &wrapperspb.BoolValue{Value: true},
 		SkipXffAppend:     true,
@@ -1013,6 +1029,16 @@ func GetHttpFilterChainProto(clusterName string, tls bool, isIngress bool, acces
 					Name:    "default_route",
 					Domains: []string{"*"},
 					Routes: []*envoy_config_route.Route{{
+						// CONNECT requests have no path, so they need a dedicated route matcher.
+						Match: &envoy_config_route.RouteMatch{
+							PathSpecifier: &envoy_config_route.RouteMatch_ConnectMatcher_{
+								ConnectMatcher: &envoy_config_route.RouteMatch_ConnectMatcher{},
+							},
+						},
+						Action: &envoy_config_route.Route_Route{
+							Route: newHTTPRouteAction(),
+						},
+					}, {
 						Match: &envoy_config_route.RouteMatch{
 							PathSpecifier: &envoy_config_route.RouteMatch_Prefix{Prefix: "/"},
 							Grpc:          &envoy_config_route.RouteMatch_GrpcRouteMatchOptions{},
@@ -1026,11 +1052,7 @@ func GetHttpFilterChainProto(clusterName string, tls bool, isIngress bool, acces
 								MaxStreamDuration: &envoy_config_route.RouteAction_MaxStreamDuration{
 									GrpcTimeoutHeaderMax: &durationpb.Duration{Seconds: maxGRPCTimeout},
 								},
-								RetryPolicy: &envoy_config_route.RetryPolicy{
-									RetryOn:       "5xx",
-									NumRetries:    &wrapperspb.UInt32Value{Value: numRetries},
-									PerTryTimeout: &durationpb.Duration{Seconds: retryTimeout},
-								},
+								RetryPolicy: GetHTTPRetryPolicy(uint(config.httpRetryCount), uint(config.httpRetryTimeout)),
 							},
 						},
 					}, {
@@ -1038,18 +1060,7 @@ func GetHttpFilterChainProto(clusterName string, tls bool, isIngress bool, acces
 							PathSpecifier: &envoy_config_route.RouteMatch_Prefix{Prefix: "/"},
 						},
 						Action: &envoy_config_route.Route_Route{
-							Route: &envoy_config_route.RouteAction{
-								ClusterSpecifier: &envoy_config_route.RouteAction_Cluster{
-									Cluster: clusterName,
-								},
-								Timeout: &durationpb.Duration{Seconds: requestTimeout},
-								// IdleTimeout: &durationpb.Duration{Seconds: idleTimeout},
-								RetryPolicy: &envoy_config_route.RetryPolicy{
-									RetryOn:       "5xx",
-									NumRetries:    &wrapperspb.UInt32Value{Value: numRetries},
-									PerTryTimeout: &durationpb.Duration{Seconds: retryTimeout},
-								},
-							},
+							Route: newHTTPRouteAction(),
 						},
 					}},
 				}},
@@ -1061,11 +1072,6 @@ func GetHttpFilterChainProto(clusterName string, tls bool, isIngress bool, acces
 		hcmConfig.NormalizePath = &wrapperspb.BoolValue{Value: true}
 		hcmConfig.MergeSlashes = true
 		hcmConfig.PathWithEscapedSlashesAction = envoy_config_http.HttpConnectionManager_UNESCAPE_AND_REDIRECT
-	}
-
-	// Idle timeout can only be specified if non-zero
-	if idleTimeout > 0 {
-		hcmConfig.GetRouteConfig().VirtualHosts[0].Routes[1].GetRoute().IdleTimeout = &durationpb.Duration{Seconds: idleTimeout}
 	}
 
 	chain := &envoy_config_listener.FilterChain{

@@ -62,9 +62,23 @@ func AddAltName(linkName, altName string) error {
 func GetHardwareAddr(ifName string) (mac.MAC, error) {
 	iface, err := safenetlink.LinkByName(ifName)
 	if err != nil {
-		return nil, err
+		return mac.MAC{}, err
 	}
-	return mac.MAC(iface.Attrs().HardwareAddr), nil
+	return mac.FromHardwareAddr(iface.Attrs().HardwareAddr)
+}
+
+// SetHardwareAddr sets the MAC address of the interface with the name ifName.
+//
+// Returns nil if the interface does not exist.
+func SetHardwareAddr(ifName string, m mac.MAC) error {
+	l, err := safenetlink.LinkByName(ifName)
+	if err != nil {
+		if errors.As(err, &netlink.LinkNotFoundError{}) {
+			return nil
+		}
+		return err
+	}
+	return netlink.LinkSetHardwareAddr(l, m.HardwareAddr())
 }
 
 func GetIfIndex(ifName string) (uint32, error) {

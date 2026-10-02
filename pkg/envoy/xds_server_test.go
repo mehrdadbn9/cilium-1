@@ -7,6 +7,7 @@ import (
 	"context"
 	"iter"
 	"strconv"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -18,8 +19,10 @@ import (
 	envoy_type_matcher "github.com/envoyproxy/go-control-plane/envoy/type/matcher/v3"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/protobuf/proto"
 	k8sTypes "k8s.io/apimachinery/pkg/types"
 
+	cmtypes "github.com/cilium/cilium/pkg/clustermesh/types"
 	"github.com/cilium/cilium/pkg/completion"
 	"github.com/cilium/cilium/pkg/crypto/certificatemanager"
 	"github.com/cilium/cilium/pkg/endpoint/regeneration"
@@ -64,7 +67,9 @@ func (m *listenerProxyUpdaterMock) PolicyDebug(string, ...any) {}
 
 func (m *listenerProxyUpdaterMock) IsHost() bool { return false }
 
-func (m *listenerProxyUpdaterMock) PreviousMapState() *policy.MapState { return nil }
+func (m *listenerProxyUpdaterMock) PreviousMapStateSizes() policy.MapStateSizes {
+	return policy.MapStateSizes{}
+}
 
 func (m *listenerProxyUpdaterMock) RegenerateIfAlive(*regeneration.ExternalRegenerationMetadata) <-chan bool {
 	ch := make(chan bool)
@@ -242,15 +247,15 @@ var (
 		1001: labels.LabelArray{
 			labels.NewLabel("app", "etcd", labels.LabelSourceK8s),
 			labels.NewLabel("version", "v1", labels.LabelSourceK8s),
-		},
+		}.Labels(),
 		1002: labels.LabelArray{
 			labels.NewLabel("app", "etcd", labels.LabelSourceK8s),
 			labels.NewLabel("version", "v2", labels.LabelSourceK8s),
-		},
+		}.Labels(),
 		1003: labels.LabelArray{
 			labels.NewLabel("app", "cassandra", labels.LabelSourceK8s),
 			labels.NewLabel("version", "v1", labels.LabelSourceK8s),
-		},
+		}.Labels(),
 	}
 	// slogloggercheck: the default logger is enough for tests.
 	testSelectorCache = policy.NewSelectorCache(logging.DefaultSlogLogger, IdentityCache)
@@ -1218,6 +1223,80 @@ func TestGetDirectionNetworkPolicyWildcardPass(t *testing.T) {
 		}}, obtained)
 	})
 
+	t.Run("port_specific_pass_does_not_short_circuit_later_tiers", func(t *testing.T) {
+		passPriority := policyTypes.HighestPriority
+		denyPriority := policyTypes.Priority(1)
+		baselinePriority := policyTypes.Priority(0x100)
+		l4DirectionPolicy := &policy.L4DirectionPolicy{}
+		*l4DirectionPolicy = policy.NewL4DirectionPolicyForTest(policy.NewL4PolicyMapWithValues(map[string]*policy.L4Filter{
+			"normal-deny/TCP": {
+				Tier:     0,
+				Port:     0,
+				Protocol: api.ProtoTCP, U8Proto: u8proto.TCP,
+				PerSelectorPolicies: policy.L7DataMap{
+					wildcardCachedSelector: {
+						Priority: denyPriority,
+						Verdict:  types.Deny,
+					},
+				},
+			},
+			"normal-pass-8080/TCP": {
+				Tier:     0,
+				Port:     8080,
+				Protocol: api.ProtoTCP, U8Proto: u8proto.TCP,
+				PerSelectorPolicies: policy.L7DataMap{
+					cachedSelector1: {
+						Priority: passPriority,
+						Verdict:  types.Pass,
+						L7Parser: policy.ParserTypeHTTP,
+						L7Rules:  api.L7Rules{HTTP: []api.PortRuleHTTP{*PortRuleHTTP1}},
+					},
+				},
+			},
+			"baseline-allow-8080/TCP": {
+				Tier:     1,
+				Port:     8080,
+				Protocol: api.ProtoTCP, U8Proto: u8proto.TCP,
+				PerSelectorPolicies: policy.L7DataMap{
+					cachedSelector1: {
+						Priority: baselinePriority,
+						L7Parser: policy.ParserTypeHTTP,
+						L7Rules:  api.L7Rules{HTTP: []api.PortRuleHTTP{*PortRuleHTTP1}},
+					},
+				},
+			},
+		}), []types.Priority{0, baselinePriority})
+
+		obtained := GetDirectionNetworkPolicy(ep, nil, selectors, l4DirectionPolicy, true, false, false, "ingress", "", xds.logger, xds.l7RulesTranslator)
+		require.Equal(t, []*cilium.PortNetworkPolicy{{
+			Port:     0,
+			Protocol: envoy_config_core.SocketAddress_TCP,
+			Rules: []*cilium.PortNetworkPolicyRule{{
+				Precedence: uint32(denyPriority.ToDenyPrecedence()),
+				Verdict:    DenyVerdict,
+			}},
+		}, {
+			Port:     8080,
+			Protocol: envoy_config_core.SocketAddress_TCP,
+			Rules: []*cilium.PortNetworkPolicyRule{{
+				Precedence: uint32(passPriority.ToPassPrecedence()),
+				Verdict: &cilium.PortNetworkPolicyRule_PassPrecedence{
+					PassPrecedence: uint32(policyTypes.Priority(0xff).ToPassPrecedence()),
+				},
+				RemotePolicies: []uint32{1001, 1002},
+				L7:             ExpectedHttpRule1,
+			}},
+		}, {
+			Port:     8080,
+			Protocol: envoy_config_core.SocketAddress_TCP,
+			Rules: []*cilium.PortNetworkPolicyRule{{
+				Precedence:     uint32(baselinePriority.ToAllowPrecedence() + 1),
+				RemotePolicies: []uint32{1001, 1002},
+				L7:             ExpectedHttpRule1,
+			}},
+		}}, obtained)
+	})
+
 	t.Run("wildcard_pass_keeps_same_priority_port_rules", func(t *testing.T) {
 		passPriority := policyTypes.HighestPriority
 		l4DirectionPolicy := &policy.L4DirectionPolicy{}
@@ -1452,7 +1531,8 @@ func TestCNPWildcardPortListenerRedirectToEnvoy(t *testing.T) {
 	idMgr := identitymanager.NewIDManager(logger)
 	repo := policy.NewPolicyRepository(
 		logger,
-		identity.IdentityMap{localIdentity.ID: localIdentity.LabelArray},
+		cmtypes.DefaultClusterInfo,
+		identity.IdentityMap{localIdentity.ID: localIdentity.Labels},
 		nil,
 		envoypolicy.NewEnvoyL7RulesTranslator(logger, certificatemanager.NewMockSecretManagerInline()),
 		idMgr,
@@ -1485,7 +1565,7 @@ func TestCNPWildcardPortListenerRedirectToEnvoy(t *testing.T) {
 			}},
 		}},
 	}
-	require.NoError(t, cnpRule.Sanitize())
+	require.NoError(t, cnpRule.ValidateAndSanitize())
 	repo.MustAddList(api.Rules{cnpRule})
 
 	selPolicy, _, err := repo.ComputeSelectorPolicy(localIdentity)
@@ -2462,6 +2542,192 @@ func Test_GetLocalListenerAddresses(t *testing.T) {
 	}
 }
 
+func testListenerWithPorts(ports ...uint32) *envoy_config_listener.Listener {
+	listener := &envoy_config_listener.Listener{Name: "listener"}
+	for i, port := range ports {
+		address := &envoy_config_core.Address{
+			Address: &envoy_config_core.Address_SocketAddress{
+				SocketAddress: &envoy_config_core.SocketAddress{
+					Protocol: envoy_config_core.SocketAddress_TCP,
+					Address:  "0.0.0.0",
+					PortSpecifier: &envoy_config_core.SocketAddress_PortValue{
+						PortValue: port,
+					},
+				},
+			},
+		}
+		if i == 0 {
+			listener.Address = address
+		} else {
+			listener.AdditionalAddresses = append(listener.AdditionalAddresses,
+				&envoy_config_listener.AdditionalAddress{Address: address})
+		}
+	}
+	return listener
+}
+
+func TestListenerAddressesEqual(t *testing.T) {
+	tests := []struct {
+		name string
+		old  *envoy_config_listener.Listener
+		new  *envoy_config_listener.Listener
+		want bool
+	}{
+		{
+			name: "unchanged addresses",
+			old:  testListenerWithPorts(80, 443),
+			new:  testListenerWithPorts(80, 443),
+			want: true,
+		},
+		{
+			name: "changed primary port",
+			old:  testListenerWithPorts(80, 443),
+			new:  testListenerWithPorts(8080, 443),
+		},
+		{
+			name: "changed additional port",
+			old:  testListenerWithPorts(80, 443),
+			new:  testListenerWithPorts(80, 8443),
+		},
+		{
+			name: "added additional address",
+			old:  testListenerWithPorts(80),
+			new:  testListenerWithPorts(80, 443),
+		},
+		{
+			name: "removed additional address",
+			old:  testListenerWithPorts(80, 443),
+			new:  testListenerWithPorts(80),
+		},
+		{
+			name: "reordered additional addresses",
+			old:  testListenerWithPorts(80, 443, 8443),
+			new:  testListenerWithPorts(80, 8443, 443),
+			want: true,
+		},
+		{
+			name: "different duplicate additional addresses",
+			old:  testListenerWithPorts(80, 443, 443),
+			new:  testListenerWithPorts(80, 443, 8443),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, listenerAddressesEqual(tt.old, tt.new))
+		})
+	}
+}
+
+type recordingAckingResourceMutator struct {
+	operations []string
+	upsertErrs []error
+	upserts    int
+}
+
+func (m *recordingAckingResourceMutator) Upsert(
+	_ string,
+	resourceName string,
+	_ proto.Message,
+	_ []string,
+	wg *completion.WaitGroup,
+	callback func(error),
+) xds.AckingResourceMutatorRevertFunc {
+	m.operations = append(m.operations, "upsert "+resourceName)
+	var err error
+	if m.upserts < len(m.upsertErrs) {
+		err = m.upsertErrs[m.upserts]
+	}
+	m.upserts++
+	if wg != nil {
+		wg.AddCompletionWithCallback(nil, callback).Complete(err)
+	}
+	return func() { m.operations = append(m.operations, "revert upsert "+resourceName) }
+}
+
+func (m *recordingAckingResourceMutator) Delete(
+	_ string,
+	resourceName string,
+	_ []string,
+	wg *completion.WaitGroup,
+	callback func(error),
+) xds.AckingResourceMutatorRevertFunc {
+	m.operations = append(m.operations, "delete "+resourceName)
+	if wg != nil {
+		wg.AddCompletionWithCallback(nil, callback).Complete(nil)
+	}
+	return func() {}
+}
+
+func (*recordingAckingResourceMutator) CancelCompletions(string) {}
+
+func TestUpdateEnvoyResourcesRecreatesListenerOnAddressChange(t *testing.T) {
+	tests := []struct {
+		name              string
+		oldPorts          []uint32
+		newPorts          []uint32
+		operations        []string
+		upsertErrs        []error
+		wantCallbackCount uint64
+	}{
+		{
+			name:       "unchanged addresses are updated in place",
+			oldPorts:   []uint32{80, 443},
+			newPorts:   []uint32{80, 443},
+			operations: []string{"upsert listener"},
+		},
+		{
+			name:              "changed primary port preserves delete before update",
+			oldPorts:          []uint32{80, 443},
+			newPorts:          []uint32{8080, 443},
+			operations:        []string{"delete listener", "upsert listener"},
+			wantCallbackCount: 1,
+		},
+		{
+			name:       "changed additional address is deleted before update",
+			oldPorts:   []uint32{80, 443},
+			newPorts:   []uint32{80, 8443},
+			operations: []string{"delete listener", "upsert listener"},
+		},
+		{
+			name:       "transient bind failure is retried after address change",
+			oldPorts:   []uint32{80, 443},
+			newPorts:   []uint32{80, 8443},
+			operations: []string{"delete listener", "upsert listener", "revert upsert listener", "upsert listener"},
+			upsertErrs: []error{&xds.ProxyError{
+				Err: xds.ErrNackReceived, Detail: "cannot bind '0.0.0.0:80': Address already in use",
+			}},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mutator := &recordingAckingResourceMutator{upsertErrs: tt.upsertErrs}
+			server := &xdsServer{
+				logger:               hivetest.Logger(t),
+				listenerMutator:      mutator,
+				networkPolicyMutator: mutator,
+				npdsListeners:        make(npdsListenersTracker),
+			}
+			oldResources := xds.NewResources()
+			oldResources.Listeners["listener"] = testListenerWithPorts(tt.oldPorts...)
+			newResources := xds.NewResources()
+			newResources.Listeners["listener"] = testListenerWithPorts(tt.newPorts...)
+			var callbackCount atomic.Uint64
+			newResources.PortAllocationCallbacks["listener"] = func(context.Context) error {
+				callbackCount.Add(1)
+				return nil
+			}
+
+			ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+			defer cancel()
+			require.NoError(t, server.UpdateEnvoyResources(ctx, oldResources, newResources, nil))
+			assert.Equal(t, tt.operations, mutator.operations)
+			assert.Equal(t, tt.wantCallbackCount, callbackCount.Load())
+		})
+	}
+}
+
 func testXdsServer(t *testing.T) *xdsServer {
 	logger := hivetest.Logger(t)
 	return &xdsServer{
@@ -2491,11 +2757,10 @@ func TestUpdateNetworkPolicyRevertKeepsLocalEndpointStoreAfterStaleDuplicateRemo
 	repo, localIdentity, currentEPP := newTestEndpointPolicy(t, currentEP)
 	xds := newTestXDSServer(t)
 
-	err, revert, finalize := xds.UpdateNetworkPolicy(t.Context(), currentEP, currentEPP, nil)
+	err, revertible := xds.UpdateNetworkPolicy(t.Context(), currentEP, currentEPP, nil)
 	require.NoError(t, err)
-	require.NotNil(t, revert)
-	require.NotNil(t, finalize)
-	finalize()
+	require.NotNil(t, revertible)
+	revertible.Finalize()
 
 	staleEP := &listenerProxyUpdaterMock{ProxyUpdaterMock: &test.ProxyUpdaterMock{
 		Id:   500,
@@ -2505,18 +2770,17 @@ func TestUpdateNetworkPolicyRevertKeepsLocalEndpointStoreAfterStaleDuplicateRemo
 	staleResourceName := strconv.FormatUint(staleEP.GetID(), 10)
 	_, updated, _ := xds.networkPolicyCache.Upsert(NetworkPolicyTypeURL, staleResourceName, &cilium.NetworkPolicy{})
 	require.True(t, updated)
-	xds.localEndpointStore.setLocalEndpoint(staleEP)
-	xds.localEndpointStore.setLocalEndpoint(staleEP)
+	stalePolicyNames := staleEP.GetPolicyNames()
+	xds.localEndpointStore.setLocalEndpoint(staleEP, stalePolicyNames)
+	xds.localEndpointStore.setLocalEndpoint(staleEP, stalePolicyNames)
 	localEP := xds.localEndpointStore.getLocalEndpoint(staleEP.Ipv6)
 	require.NotNil(t, localEP)
 	require.Equal(t, staleEP.GetID(), localEP.GetID())
 
 	refreshedCurrentEPP := distillEndpointPolicy(t, repo, localIdentity, currentEP)
-	err, revert, finalize = xds.UpdateNetworkPolicy(t.Context(), currentEP, refreshedCurrentEPP, nil)
+	err, revertible = xds.UpdateNetworkPolicy(t.Context(), currentEP, refreshedCurrentEPP, nil)
 	require.NoError(t, err)
-	require.NotNil(t, revert)
-	require.NotNil(t, finalize)
-	finalize()
+	require.NotNil(t, revertible)
 
 	localEP = xds.localEndpointStore.getLocalEndpoint(currentEP.Ipv4)
 	require.NotNil(t, localEP)
@@ -2526,7 +2790,7 @@ func TestUpdateNetworkPolicyRevertKeepsLocalEndpointStoreAfterStaleDuplicateRemo
 	require.Equal(t, currentEP.GetID(), localEP.GetID())
 	require.Nil(t, xds.localEndpointStore.getLocalEndpoint(staleEP.Ipv6))
 
-	require.NoError(t, revert())
+	require.NoError(t, revertible.Revert())
 
 	localEP = xds.localEndpointStore.getLocalEndpoint(currentEP.Ipv4)
 	require.NotNil(t, localEP)
@@ -2554,10 +2818,9 @@ func TestUpdateNetworkPolicyLegacyACKUsesNodeIP(t *testing.T) {
 	defer cancel()
 	wg := completion.NewWaitGroup(ctx)
 
-	err, revert, finalize := xdsServer.UpdateNetworkPolicy(ctx, currentEP, currentEPP, wg)
+	err, revertible := xdsServer.UpdateNetworkPolicy(ctx, currentEP, currentEPP, wg)
 	require.NoError(t, err)
-	require.NotNil(t, revert)
-	require.NotNil(t, finalize)
+	require.NotNil(t, revertible)
 
 	acker, ok := xdsServer.networkPolicyMutator.(*xds.AckingResourceMutatorWrapper)
 	require.True(t, ok)
@@ -2566,8 +2829,7 @@ func TestUpdateNetworkPolicyLegacyACKUsesNodeIP(t *testing.T) {
 	acker.HandleResourceVersionAck("127.0.0.1", resources.Version, resources.Version, false, "", NetworkPolicyTypeURL, []string{resourceName})
 
 	require.NoError(t, wg.Wait())
-	finalize()
-	require.NoError(t, revert())
+	revertible.Finalize()
 }
 
 func newTestEndpointPolicy(t *testing.T, ep *listenerProxyUpdaterMock) (*policy.Repository, *identity.Identity, *policy.EndpointPolicy) {
@@ -2580,7 +2842,8 @@ func newTestEndpointPolicy(t *testing.T, ep *listenerProxyUpdaterMock) (*policy.
 	idMgr := identitymanager.NewIDManager(logger)
 	repo := policy.NewPolicyRepository(
 		logger,
-		identity.IdentityMap{localIdentity.ID: localIdentity.LabelArray},
+		cmtypes.DefaultClusterInfo,
+		identity.IdentityMap{localIdentity.ID: localIdentity.Labels},
 		nil,
 		envoypolicy.NewEnvoyL7RulesTranslator(logger, certificatemanager.NewMockSecretManagerInline()),
 		idMgr,
@@ -2600,7 +2863,7 @@ func newTestEndpointPolicy(t *testing.T, ep *listenerProxyUpdaterMock) (*policy.
 			},
 		}},
 	}
-	require.NoError(t, rule.Sanitize())
+	require.NoError(t, rule.ValidateAndSanitize())
 	repo.MustAddList(api.Rules{rule})
 
 	return repo, localIdentity, distillEndpointPolicy(t, repo, localIdentity, ep)

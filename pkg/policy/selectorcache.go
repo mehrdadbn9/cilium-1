@@ -28,7 +28,7 @@ var (
 // scIdentity is the information we need about a an identity that rules can select
 type scIdentity struct {
 	NID       identity.NumericIdentity
-	lbls      labels.LabelArray
+	lbls      labels.Labels
 	namespace string // value of the namespace label, or ""
 }
 
@@ -55,7 +55,7 @@ func (c *scIdentityCache) Len() int {
 	return len(c.ids)
 }
 
-func (c *scIdentityCache) insert(nid identity.NumericIdentity, lbls labels.LabelArray) *scIdentity {
+func (c *scIdentityCache) insert(nid identity.NumericIdentity, lbls labels.Labels) *scIdentity {
 	namespace, _ := lbls.LookupLabel(&podNamespaceLabel)
 	id := &scIdentity{
 		NID:       nid,
@@ -273,6 +273,9 @@ type SelectorCache struct {
 
 	// userHandlerDone is initialized only in tests to allow termination of the handler
 	userHandlerDone chan struct{}
+
+	// lastSelectorId contains the last used selector cache id and is protected by the selector cache mutex
+	lastSelectorId types.SelectorId
 }
 
 // GetSelectorSnapshot returns a read-only state of the current selectors in the selector cache.

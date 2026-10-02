@@ -14,10 +14,12 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/utils/ptr"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 	mcsapiv1beta1 "sigs.k8s.io/mcs-api/pkg/apis/v1beta1"
 
+	"github.com/cilium/cilium/operator/pkg/gateway-api/helpers"
 	"github.com/cilium/cilium/operator/pkg/model"
 	"github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2alpha1"
 )
@@ -25,6 +27,48 @@ import (
 const (
 	basedGatewayTestdataDir = "testdata/gateway"
 )
+
+func setTestMergedListeners(input *Input, namespaces []corev1.Namespace) {
+	source := model.FullyQualifiedResource{
+		Name:      input.Gateway.GetName(),
+		Namespace: input.Gateway.GetNamespace(),
+		Group:     gatewayv1.GroupVersion.Group,
+		Version:   gatewayv1.GroupVersion.Version,
+		Kind:      "Gateway",
+		UID:       string(input.Gateway.GetUID()),
+	}
+
+	namespaceLabels := helpers.NewNamespaceLabelIndex(namespaces)
+
+	candidateNamespaces := sets.New[string](source.Namespace)
+	for _, namespace := range namespaces {
+		candidateNamespaces.Insert(namespace.GetName())
+	}
+
+	for _, listener := range input.Gateway.Spec.Listeners {
+		var allowedNamespaces map[string]struct{}
+		allowedRoutes := listener.AllowedRoutes
+
+		if allowedRoutes == nil || allowedRoutes.Namespaces == nil ||
+			allowedRoutes.Namespaces.From == nil ||
+			*allowedRoutes.Namespaces.From != gatewayv1.NamespacesFromAll {
+
+			allowedNamespaces = make(map[string]struct{})
+			for namespace := range candidateNamespaces {
+				if helpers.IsListenerNamespaceAllowed(listener, namespace, source.Namespace, namespaceLabels) {
+					allowedNamespaces[namespace] = struct{}{}
+				}
+			}
+
+		}
+
+		input.MergedListeners = append(input.MergedListeners, ListenerWithContext{
+			Listener:          listener,
+			Source:            source,
+			AllowedNamespaces: allowedNamespaces,
+		})
+	}
+}
 
 func TestHTTPGatewayAPI(t *testing.T) {
 	tests := map[string]struct{}{
@@ -61,6 +105,15 @@ func TestHTTPGatewayAPI(t *testing.T) {
 		"http external auth http tls":                             {},
 		"http external auth grpc tls":                             {},
 		"http external auth shared and no auth":                   {},
+		"http request mirror cross namespace no grant":            {},
+		"http request mirror cross namespace with grant":          {},
+		"grpc request mirror cross namespace no grant":            {},
+		"grpc request mirror cross namespace with grant":          {},
+		"http skips backends missing port":                        {},
+		"http cross namespace backend no grant":                   {},
+		"http cross namespace backend with grant":                 {},
+		"grpc cross namespace backend no grant":                   {},
+		"grpc cross namespace backend with grant":                 {},
 	}
 
 	for name := range tests {
@@ -120,8 +173,16 @@ func TestExtractRoutesSetsHTTPRouteRuleSource(t *testing.T) {
 func TestHTTPGatewayAPIFiltersSelectorNamespacesPerListener(t *testing.T) {
 	selector := gatewayv1.NamespacesFromSelector
 	logger := hivetest.Logger(t, hivetest.LogLevel(slog.LevelDebug))
+	namespaces := []corev1.Namespace{
+		{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:   "backend-a",
+				Labels: map[string]string{"expose": "true"},
+			},
+		},
+	}
 
-	m := GatewayAPI(logger, Input{
+	input := Input{
 		Gateway: gatewayv1.Gateway{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      "selector-listener-conflict-gateway",
@@ -194,14 +255,6 @@ func TestHTTPGatewayAPIFiltersSelectorNamespacesPerListener(t *testing.T) {
 				},
 			},
 		},
-		Namespaces: []corev1.Namespace{
-			{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:   "backend-a",
-					Labels: map[string]string{"expose": "true"},
-				},
-			},
-		},
 		Services: []corev1.Service{
 			{
 				ObjectMeta: metav1.ObjectMeta{
@@ -213,7 +266,9 @@ func TestHTTPGatewayAPIFiltersSelectorNamespacesPerListener(t *testing.T) {
 				},
 			},
 		},
-	})
+	}
+	setTestMergedListeners(&input, namespaces)
+	m := GatewayAPI(logger, input)
 
 	require.Len(t, m.HTTP, 2)
 	require.Equal(t, "http-selected", m.HTTP[0].Name)
@@ -233,7 +288,7 @@ func TestHTTPAndGRPCGatewayAPIFiltersRoutesByListenerAllowedNamespaces(t *testin
 	grpcMethod := "Get"
 	logger := hivetest.Logger(t, hivetest.LogLevel(slog.LevelDebug))
 
-	m := GatewayAPI(logger, Input{
+	input := Input{
 		Gateway: gatewayv1.Gateway{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      "platform",
@@ -392,7 +447,9 @@ func TestHTTPAndGRPCGatewayAPIFiltersRoutesByListenerAllowedNamespaces(t *testin
 				},
 			},
 		},
-	})
+	}
+	setTestMergedListeners(&input, nil)
+	m := GatewayAPI(logger, input)
 
 	require.Len(t, m.HTTP, 2)
 	require.Equal(t, "http", m.HTTP[0].Name)
@@ -416,7 +473,7 @@ func TestTLSGatewayAPIFiltersRoutesByListenerAllowedNamespaces(t *testing.T) {
 	allNamespaces := gatewayv1.NamespacesFromAll
 	logger := hivetest.Logger(t, hivetest.LogLevel(slog.LevelDebug))
 
-	m := GatewayAPI(logger, Input{
+	input := Input{
 		Gateway: gatewayv1.Gateway{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      "platform",
@@ -495,7 +552,9 @@ func TestTLSGatewayAPIFiltersRoutesByListenerAllowedNamespaces(t *testing.T) {
 				},
 			},
 		},
-	})
+	}
+	setTestMergedListeners(&input, nil)
+	m := GatewayAPI(logger, input)
 
 	require.Len(t, m.TLSPassthrough, 2)
 	require.Equal(t, "tls-same", m.TLSPassthrough[0].Name)
@@ -622,6 +681,8 @@ func TestTLSGatewayAPI(t *testing.T) {
 		"mixed protocol listeners TLSRoute":        {},
 		"tls weighted backends":                    {},
 		"tls route parent ref filter":              {},
+		"tls route filters by parent ref port":     {},
+		"tls skips backends missing port":          {},
 	}
 
 	for name := range tests {
@@ -640,7 +701,8 @@ func TestTLSGatewayAPI(t *testing.T) {
 
 func TestGRPCGatewayAPI(t *testing.T) {
 	tests := map[string]struct{}{
-		"basic grpc": {},
+		"basic grpc":                            {},
+		"grpc route filters by parent ref port": {},
 	}
 
 	for name := range tests {
@@ -660,7 +722,8 @@ func TestGRPCGatewayAPI(t *testing.T) {
 
 func TestL4GatewayAPI(t *testing.T) {
 	tests := map[string]struct{}{
-		"basic l4": {},
+		"basic l4":                       {},
+		"l4 skips backends missing port": {},
 	}
 
 	for name := range tests {
@@ -683,7 +746,7 @@ func TestL4GatewayAPIFiltersRoutesByListenerAllowedNamespaces(t *testing.T) {
 	allNamespaces := gatewayv1.NamespacesFromAll
 	logger := hivetest.Logger(t, hivetest.LogLevel(slog.LevelDebug))
 
-	m := GatewayAPI(logger, Input{
+	input := Input{
 		Gateway: gatewayv1.Gateway{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      "platform",
@@ -874,7 +937,9 @@ func TestL4GatewayAPIFiltersRoutesByListenerAllowedNamespaces(t *testing.T) {
 				},
 			},
 		},
-	})
+	}
+	setTestMergedListeners(&input, nil)
+	m := GatewayAPI(logger, input)
 
 	require.Len(t, m.L4, 4)
 	require.Equal(t, "tcp-same", m.L4[0].Name)
@@ -1210,6 +1275,148 @@ func TestHTTPRequestMirrorServiceImportIsResolved(t *testing.T) {
 	assert.Equal(t, "default", routes[0].RequestMirrors[0].Backend.Namespace)
 }
 
+func TestHTTPRequestExternalAuthCrossNamespaceWithoutReferenceGrantFailsClosed(t *testing.T) {
+	logger := hivetest.Logger(t, hivetest.LogLevel(slog.LevelDebug))
+
+	routes := extractRoutes(logger, 80, nil, gatewayv1.HTTPRoute{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "cross-namespace-external-auth",
+			Namespace: "default",
+		},
+		Spec: gatewayv1.HTTPRouteSpec{
+			Rules: []gatewayv1.HTTPRouteRule{
+				{
+					BackendRefs: []gatewayv1.HTTPBackendRef{
+						{
+							BackendRef: gatewayv1.BackendRef{
+								BackendObjectReference: gatewayv1.BackendObjectReference{
+									Name: gatewayv1.ObjectName("backend"),
+									Port: ptr.To(gatewayv1.PortNumber(8080)),
+								},
+							},
+						},
+					},
+					Filters: []gatewayv1.HTTPRouteFilter{
+						{
+							Type: gatewayv1.HTTPRouteFilterExternalAuth,
+							ExternalAuth: &gatewayv1.HTTPExternalAuthFilter{
+								BackendRef: gatewayv1.BackendObjectReference{
+									Name:      gatewayv1.ObjectName("auth-backend"),
+									Namespace: ptr.To(gatewayv1.Namespace("other-ns")),
+									Port:      ptr.To(gatewayv1.PortNumber(8080)),
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}, []corev1.Service{
+		testService("default", "backend", 8080),
+		testService("other-ns", "auth-backend", 8080),
+	}, nil, nil, nil)
+
+	require.Len(t, routes, 1)
+	require.NotNil(t, routes[0].DirectResponse)
+	assert.Equal(t, 500, routes[0].DirectResponse.StatusCode)
+	assert.Nil(t, routes[0].ExternalAuth)
+}
+
+func TestHTTPRequestExternalAuthCrossNamespaceWithReferenceGrantIsKept(t *testing.T) {
+	logger := hivetest.Logger(t, hivetest.LogLevel(slog.LevelDebug))
+
+	routes := extractRoutes(logger, 80, nil, gatewayv1.HTTPRoute{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "cross-namespace-external-auth",
+			Namespace: "default",
+		},
+		Spec: gatewayv1.HTTPRouteSpec{
+			Rules: []gatewayv1.HTTPRouteRule{
+				{
+					BackendRefs: []gatewayv1.HTTPBackendRef{
+						{
+							BackendRef: gatewayv1.BackendRef{
+								BackendObjectReference: gatewayv1.BackendObjectReference{
+									Name: gatewayv1.ObjectName("backend"),
+									Port: ptr.To(gatewayv1.PortNumber(8080)),
+								},
+							},
+						},
+					},
+					Filters: []gatewayv1.HTTPRouteFilter{
+						{
+							Type: gatewayv1.HTTPRouteFilterExternalAuth,
+							ExternalAuth: &gatewayv1.HTTPExternalAuthFilter{
+								BackendRef: gatewayv1.BackendObjectReference{
+									Name:      gatewayv1.ObjectName("auth-backend"),
+									Namespace: ptr.To(gatewayv1.Namespace("other-ns")),
+									Port:      ptr.To(gatewayv1.PortNumber(8080)),
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}, []corev1.Service{
+		testService("default", "backend", 8080),
+		testService("other-ns", "auth-backend", 8080),
+	}, nil, []gatewayv1.ReferenceGrant{
+		testReferenceGrant("other-ns", "default", "HTTPRoute"),
+	}, nil)
+
+	require.Len(t, routes, 1)
+	assert.Nil(t, routes[0].DirectResponse)
+	require.NotNil(t, routes[0].ExternalAuth)
+	assert.Equal(t, "auth-backend", routes[0].ExternalAuth.Backend.Name)
+	assert.Equal(t, "other-ns", routes[0].ExternalAuth.Backend.Namespace)
+}
+
+func TestHTTPRequestExternalAuthMissingBackendFailsClosed(t *testing.T) {
+	logger := hivetest.Logger(t, hivetest.LogLevel(slog.LevelDebug))
+
+	routes := extractRoutes(logger, 80, nil, gatewayv1.HTTPRoute{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "missing-external-auth",
+			Namespace: "default",
+		},
+		Spec: gatewayv1.HTTPRouteSpec{
+			Rules: []gatewayv1.HTTPRouteRule{
+				{
+					BackendRefs: []gatewayv1.HTTPBackendRef{
+						{
+							BackendRef: gatewayv1.BackendRef{
+								BackendObjectReference: gatewayv1.BackendObjectReference{
+									Name: gatewayv1.ObjectName("backend"),
+									Port: ptr.To(gatewayv1.PortNumber(8080)),
+								},
+							},
+						},
+					},
+					Filters: []gatewayv1.HTTPRouteFilter{
+						{
+							Type: gatewayv1.HTTPRouteFilterExternalAuth,
+							ExternalAuth: &gatewayv1.HTTPExternalAuthFilter{
+								BackendRef: gatewayv1.BackendObjectReference{
+									Name: gatewayv1.ObjectName("missing-auth"),
+									Port: ptr.To(gatewayv1.PortNumber(8080)),
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}, []corev1.Service{
+		testService("default", "backend", 8080),
+	}, nil, nil, nil)
+
+	require.Len(t, routes, 1)
+	require.NotNil(t, routes[0].DirectResponse)
+	assert.Equal(t, 500, routes[0].DirectResponse.StatusCode)
+	assert.Nil(t, routes[0].ExternalAuth)
+}
+
 func TestGRPCRequestMirrorNilFilterDoesNotPanic(t *testing.T) {
 	routes := extractGRPCRoutes(nil, gatewayv1.GRPCRoute{
 		ObjectMeta: metav1.ObjectMeta{
@@ -1472,7 +1679,7 @@ func TestGatewayAPI_GatewayClassConfig(t *testing.T) {
 		}, m.Telemetry)
 	})
 	t.Run("sets server header transformation from GatewayClassConfig envoy config", func(t *testing.T) {
-		m := GatewayAPI(logger, Input{
+		input := Input{
 			Gateway: gatewayv1.Gateway{
 				ObjectMeta: metav1.ObjectMeta{
 					Namespace: "default",
@@ -1495,7 +1702,9 @@ func TestGatewayAPI_GatewayClassConfig(t *testing.T) {
 					},
 				},
 			},
-		})
+		}
+		setTestMergedListeners(&input, nil)
+		m := GatewayAPI(logger, input)
 
 		require.Len(t, m.HTTP, 1)
 		assert.Equal(t, model.ServerHeaderTransformationPassThrough, m.HTTP[0].ServerHeaderTransformation)
@@ -1692,11 +1901,15 @@ func readGatewayInput(t *testing.T, testName string) Input {
 	readInput(t, fmt.Sprintf("%s/%s/%s", basedGatewayTestdataDir, rewriteTestName(testName), "input-httproute.yaml"), &input.HTTPRoutes)
 	readInput(t, fmt.Sprintf("%s/%s/%s", basedGatewayTestdataDir, rewriteTestName(testName), "input-tlsroute.yaml"), &input.TLSRoutes)
 	readInput(t, fmt.Sprintf("%s/%s/%s", basedGatewayTestdataDir, rewriteTestName(testName), "input-grpcroute.yaml"), &input.GRPCRoutes)
-	readInput(t, fmt.Sprintf("%s/%s/%s", basedGatewayTestdataDir, rewriteTestName(testName), "input-namespace.yaml"), &input.Namespaces)
+	readInput(t, fmt.Sprintf("%s/%s/%s", basedGatewayTestdataDir, rewriteTestName(testName), "input-referencegrant.yaml"), &input.ReferenceGrants)
 	readInput(t, fmt.Sprintf("%s/%s/%s", basedGatewayTestdataDir, rewriteTestName(testName), "input-tcproute.yaml"), &input.TCPRoutes)
 	readInput(t, fmt.Sprintf("%s/%s/%s", basedGatewayTestdataDir, rewriteTestName(testName), "input-udproute.yaml"), &input.UDPRoutes)
 	readInput(t, fmt.Sprintf("%s/%s/%s", basedGatewayTestdataDir, rewriteTestName(testName), "input-service.yaml"), &input.Services)
 	readInput(t, fmt.Sprintf("%s/%s/%s", basedGatewayTestdataDir, rewriteTestName(testName), "input-serviceimport.yaml"), &input.ServiceImports)
+
+	// namespaces are used to construct mergedListeners
+	var namespaces []corev1.Namespace
+	readInput(t, fmt.Sprintf("%s/%s/%s", basedGatewayTestdataDir, rewriteTestName(testName), "input-namespace.yaml"), &namespaces)
 
 	btlspMapFixture := &BackendTLSPolicyMapFixture{}
 	readInput(t, fmt.Sprintf("%s/%s/%s", basedGatewayTestdataDir, rewriteTestName(testName), "input-backendtlspolicy.yaml"), btlspMapFixture)
@@ -1705,6 +1918,73 @@ func readGatewayInput(t *testing.T, testName string) Input {
 		t.Fatal("Failed reading a BackendTLSPolicy fixture", err)
 	}
 	input.BackendTLSPolicyMap = btlspMap
+	setTestMergedListeners(&input, namespaces)
 
 	return input
+}
+
+func TestToHTTPSessionPersistence(t *testing.T) {
+	wantPersistence := func(name, path string) *model.HTTPSessionPersistence {
+		return &model.HTTPSessionPersistence{
+			Cookie: &model.HTTPCookieSessionPersistence{
+				Name:     name,
+				Path:     path,
+				Secure:   true,
+				HTTPOnly: true,
+				SameSite: "Strict",
+			},
+		}
+	}
+
+	ns := "default"
+	name := "route"
+	index := 0
+	generatedName := defaultSessionName(helpers.HTTPRouteKind, ns, name, index)
+
+	tests := []struct {
+		name  string
+		input *gatewayv1.SessionPersistence
+		path  model.StringMatch
+		want  *model.HTTPSessionPersistence
+	}{
+		{
+			name:  "no persistence",
+			input: nil,
+			want:  nil,
+		},
+		{
+			name: "explicit name and exact path",
+			input: &gatewayv1.SessionPersistence{
+				SessionName: ptr.To("custom-session"),
+			},
+			path: model.StringMatch{Exact: "/exact"},
+			want: wantPersistence("custom-session", "/exact"),
+		},
+		{
+			name:  "generated name and prefix path",
+			input: &gatewayv1.SessionPersistence{},
+			path:  model.StringMatch{Prefix: "/prefix"},
+			want:  wantPersistence(generatedName, "/prefix"),
+		},
+		{
+			name:  "regex path falls back to root",
+			input: &gatewayv1.SessionPersistence{},
+			path:  model.StringMatch{Regex: "/items/[0-9]+"},
+			want:  wantPersistence(generatedName, "/"),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := toHTTPSessionPersistence(
+				tt.input,
+				helpers.HTTPRouteKind,
+				ns,
+				name,
+				index,
+				tt.path,
+			)
+			assert.Equal(t, tt.want, got)
+		})
+	}
 }

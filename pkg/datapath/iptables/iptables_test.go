@@ -4,15 +4,19 @@
 package iptables
 
 import (
+	"errors"
 	"fmt"
 	"net"
+	"net/netip"
 	"strings"
 	"testing"
 
+	"github.com/cilium/hive/hivetest"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/vishvananda/netlink"
 
+	"github.com/cilium/cilium/pkg/loadbalancer"
 	wgTypes "github.com/cilium/cilium/pkg/wireguard/types"
 )
 
@@ -998,27 +1002,27 @@ func TestNoTrackHostPorts(t *testing.T) {
 		assert.NoError(t, mockIp6tables.checkExpectations())
 	})
 
-	t.Run("test changing the port", func(t *testing.T) {
+	t.Run("test changing the protocol installs before deleting", func(t *testing.T) {
 		mockIp4tables.expectations = []expectation{
 			{args: "-t raw -A CILIUM_PRE_raw -p tcp --match multiport --dports 443 -m comment --comment cilium no-track-host-ports -j CT --notrack"},
 			{args: "-t raw -A CILIUM_OUTPUT_raw -p tcp --match multiport --sports 443 -m comment --comment cilium no-track-host-ports return traffic -j CT --notrack"},
 
-			{args: "-t raw -D CILIUM_PRE_raw -p tcp --match multiport --dports 443,999 -m comment --comment cilium no-track-host-ports -j CT --notrack"},
-			{args: "-t raw -D CILIUM_OUTPUT_raw -p tcp --match multiport --sports 443,999 -m comment --comment cilium no-track-host-ports return traffic -j CT --notrack"},
-
 			{args: "-t raw -A CILIUM_PRE_raw -p udp --match multiport --dports 443 -m comment --comment cilium no-track-host-ports -j CT --notrack"},
 			{args: "-t raw -A CILIUM_OUTPUT_raw -p udp --match multiport --sports 443 -m comment --comment cilium no-track-host-ports return traffic -j CT --notrack"},
+
+			{args: "-t raw -D CILIUM_PRE_raw -p tcp --match multiport --dports 443,999 -m comment --comment cilium no-track-host-ports -j CT --notrack"},
+			{args: "-t raw -D CILIUM_OUTPUT_raw -p tcp --match multiport --sports 443,999 -m comment --comment cilium no-track-host-ports return traffic -j CT --notrack"},
 		}
 
 		mockIp6tables.expectations = []expectation{
 			{args: "-t raw -A CILIUM_PRE_raw -p tcp --match multiport --dports 443 -m comment --comment cilium no-track-host-ports -j CT --notrack"},
 			{args: "-t raw -A CILIUM_OUTPUT_raw -p tcp --match multiport --sports 443 -m comment --comment cilium no-track-host-ports return traffic -j CT --notrack"},
 
-			{args: "-t raw -D CILIUM_PRE_raw -p tcp --match multiport --dports 443,999 -m comment --comment cilium no-track-host-ports -j CT --notrack"},
-			{args: "-t raw -D CILIUM_OUTPUT_raw -p tcp --match multiport --sports 443,999 -m comment --comment cilium no-track-host-ports return traffic -j CT --notrack"},
-
 			{args: "-t raw -A CILIUM_PRE_raw -p udp --match multiport --dports 443 -m comment --comment cilium no-track-host-ports -j CT --notrack"},
 			{args: "-t raw -A CILIUM_OUTPUT_raw -p udp --match multiport --sports 443 -m comment --comment cilium no-track-host-ports return traffic -j CT --notrack"},
+
+			{args: "-t raw -D CILIUM_PRE_raw -p tcp --match multiport --dports 443,999 -m comment --comment cilium no-track-host-ports -j CT --notrack"},
+			{args: "-t raw -D CILIUM_OUTPUT_raw -p tcp --match multiport --sports 443,999 -m comment --comment cilium no-track-host-ports return traffic -j CT --notrack"},
 		}
 
 		assert.NoError(t, testMgr.setNoTrackHostPorts(testState, testPod2, []string{"443/udp"}))
@@ -1099,6 +1103,34 @@ func TestNoTrackHostPorts(t *testing.T) {
 		assert.NoError(t, mockIp6tables.checkExpectations())
 		assert.Empty(t, testState)
 	})
+}
+
+func TestReplaceNoTrackHostPortRulesDoesNotCleanupOnInstallFailure(t *testing.T) {
+	installErr := errors.New("install failed")
+	mockIp4tables := &mockIptables{
+		t:    t,
+		prog: "iptables",
+		expectations: []expectation{
+			{args: "-t raw -A CILIUM_PRE_raw -p udp --match multiport --dports 53 -m comment --comment cilium no-track-host-ports -j CT --notrack"},
+			{
+				args: "-t raw -A CILIUM_OUTPUT_raw -p udp --match multiport --sports 53 -m comment --comment cilium no-track-host-ports return traffic -j CT --notrack",
+				err:  installErr,
+			},
+		},
+	}
+	testMgr := &manager{
+		sharedCfg: SharedConfig{EnableIPv4: true},
+		ip4tables: mockIp4tables,
+	}
+
+	// No delete commands are expected: failed installation must leave the old
+	// TCP rules in place for full reconciliation.
+	err := testMgr.replaceNoTrackHostPortRules(
+		map[loadbalancer.L4Type][]uint16{loadbalancer.TCP: {80}},
+		map[loadbalancer.L4Type][]uint16{loadbalancer.UDP: {53}},
+	)
+	require.ErrorIs(t, err, installErr)
+	require.NoError(t, mockIp4tables.checkExpectations())
 }
 
 func TestEncryptionRules(t *testing.T) {
@@ -1238,6 +1270,189 @@ func TestAddNoTrackPodTrafficRules(t *testing.T) {
 	assert.NoError(t, mockIp4.checkExpectations())
 }
 
+func endpointNoTrackExpectations(cmd, ip, proto, port string) []expectation {
+	// Spelled out rather than built with formatComment: deriving the expected
+	// value from the helper under test would assert nothing.
+	const (
+		notrack = "cilium: NOTRACK for node-local-dns"
+		accept  = "cilium: ACCEPT for node-local-dns"
+	)
+	return []expectation{
+		{args: fmt.Sprintf("-t raw %s CILIUM_PRE_raw -p %s -d %s --dport %s -m comment --comment %s -j CT --notrack", cmd, proto, ip, port, notrack)},
+		{args: fmt.Sprintf("-t filter %s CILIUM_FORWARD -p %s -d %s --dport %s -m comment --comment %s -j ACCEPT", cmd, proto, ip, port, accept)},
+		{args: fmt.Sprintf("-t raw %s CILIUM_PRE_raw -p %s -s %s --sport %s -m comment --comment %s -j CT --notrack", cmd, proto, ip, port, notrack)},
+		{args: fmt.Sprintf("-t filter %s CILIUM_FORWARD -p %s -s %s --sport %s -m comment --comment %s -j ACCEPT", cmd, proto, ip, port, accept)},
+		{args: fmt.Sprintf("-t raw %s CILIUM_OUTPUT_raw -p %s -d %s --dport %s -m comment --comment %s -j CT --notrack", cmd, proto, ip, port, notrack)},
+		{args: fmt.Sprintf("-t filter %s CILIUM_OUTPUT -p %s -d %s --dport %s -m comment --comment %s -j ACCEPT", cmd, proto, ip, port, accept)},
+		{args: fmt.Sprintf("-t filter %s CILIUM_INPUT -p %s -s %s --sport %s -m comment --comment %s -j ACCEPT", cmd, proto, ip, port, accept)},
+		{args: fmt.Sprintf("-t raw %s CILIUM_OUTPUT_raw -p %s -s %s --sport %s -m comment --comment %s -j CT --notrack", cmd, proto, ip, port, notrack)},
+		{args: fmt.Sprintf("-t filter %s CILIUM_OUTPUT -p %s -s %s --sport %s -m comment --comment %s -j ACCEPT", cmd, proto, ip, port, accept)},
+		{args: fmt.Sprintf("-t filter %s CILIUM_INPUT -p %s -d %s --dport %s -m comment --comment %s -j ACCEPT", cmd, proto, ip, port, accept)},
+	}
+}
+
+// TestEndpointNoTrackRules covers the exact rule set emitted for one address,
+// protocol and port.
+func TestEndpointNoTrackRules(t *testing.T) {
+	tests := []struct {
+		name      string
+		prog      string
+		cmd       string
+		ip        string
+		port      *loadbalancer.L4Addr
+		wantProto string
+		wantPort  string
+		failAt    []int
+	}{
+		{
+			name:      "add rules for a non-default port",
+			prog:      "iptables",
+			cmd:       "-A",
+			ip:        "10.0.0.1",
+			port:      &loadbalancer.L4Addr{Protocol: loadbalancer.TCP, Port: 5353},
+			wantProto: "tcp",
+			wantPort:  "5353",
+		},
+		{
+			name:      "delete rules matching the comment used to add them",
+			prog:      "iptables",
+			cmd:       "-D",
+			ip:        "10.0.0.1",
+			port:      &loadbalancer.L4Addr{Protocol: loadbalancer.UDP, Port: 53},
+			wantProto: "udp",
+			wantPort:  "53",
+		},
+		{
+			name:      "every failure is reported",
+			prog:      "iptables",
+			cmd:       "-A",
+			ip:        "10.0.0.1",
+			port:      &loadbalancer.L4Addr{Protocol: loadbalancer.TCP, Port: 53},
+			wantProto: "tcp",
+			wantPort:  "53",
+			failAt:    []int{0, 4},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			exp := endpointNoTrackExpectations(tt.cmd, tt.ip, tt.wantProto, tt.wantPort)
+			wantErrs := make([]error, 0, len(tt.failAt))
+			for _, i := range tt.failAt {
+				e := fmt.Errorf("rule %d failed", i)
+				exp[i].err = e
+				wantErrs = append(wantErrs, e)
+			}
+
+			mockProg := &mockIptables{t: t, prog: tt.prog, expectations: exp}
+			testMgr := &manager{logger: hivetest.Logger(t)}
+
+			err := testMgr.endpointNoTrackRules(mockProg, tt.cmd, tt.ip, tt.port)
+			if len(wantErrs) == 0 {
+				require.NoError(t, err)
+			}
+			for _, wantErr := range wantErrs {
+				require.ErrorIs(t, err, wantErr)
+			}
+			require.NoError(t, mockProg.checkExpectations())
+		})
+	}
+}
+
+// TestInstallRemoveNoTrackRules covers the paths driven by the
+// "policy.cilium.io/no-track-port" annotation.
+func TestInstallRemoveNoTrackRules(t *testing.T) {
+	const port = 53
+
+	v4Rules := func(cmd string) []expectation {
+		return append(
+			endpointNoTrackExpectations(cmd, "10.0.0.1", "tcp", "53"),
+			endpointNoTrackExpectations(cmd, "10.0.0.1", "udp", "53")...,
+		)
+	}
+	v6Rules := func(cmd string) []expectation {
+		return append(
+			endpointNoTrackExpectations(cmd, "fd00::1", "tcp", "53"),
+			endpointNoTrackExpectations(cmd, "fd00::1", "udp", "53")...,
+		)
+	}
+
+	t.Run("install and remove", func(t *testing.T) {
+		mockIp4tables := &mockIptables{t: t, prog: "iptables", expectations: append(v4Rules("-A"), v4Rules("-D")...)}
+		mockIp6tables := &mockIptables{t: t, prog: "ip6tables", expectations: append(v6Rules("-A"), v6Rules("-D")...)}
+
+		testMgr := &manager{
+			logger: hivetest.Logger(t),
+			sharedCfg: SharedConfig{
+				InstallIptRules: true,
+				EnableIPv4:      true,
+				EnableIPv6:      true,
+			},
+			ip4tables: mockIp4tables,
+			ip6tables: mockIp6tables,
+		}
+
+		require.NoError(t, testMgr.installNoTrackRules(netip.MustParseAddr("10.0.0.1"), port))
+		require.NoError(t, testMgr.removeNoTrackRules(netip.MustParseAddr("10.0.0.1"), port))
+		require.NoError(t, mockIp4tables.checkExpectations())
+
+		require.NoError(t, testMgr.installNoTrackRules(netip.MustParseAddr("fd00::1"), port))
+		require.NoError(t, testMgr.removeNoTrackRules(netip.MustParseAddr("fd00::1"), port))
+		require.NoError(t, mockIp6tables.checkExpectations())
+	})
+
+	t.Run("skipped for ipv4 when conntrack is already skipped for all pod traffic", func(t *testing.T) {
+		mockIp4tables := &mockIptables{t: t, prog: "iptables"}
+
+		testMgr := &manager{
+			logger: hivetest.Logger(t),
+			sharedCfg: SharedConfig{
+				InstallIptRules:            true,
+				InstallNoConntrackIptRules: true,
+				EnableIPv4:                 true,
+			},
+			ip4tables: mockIp4tables,
+		}
+
+		require.NoError(t, testMgr.installNoTrackRules(netip.MustParseAddr("10.0.0.1"), port))
+		require.NoError(t, testMgr.removeNoTrackRules(netip.MustParseAddr("10.0.0.1"), port))
+		require.NoError(t, mockIp4tables.checkExpectations())
+	})
+
+	t.Run("not skipped for ipv6 when conntrack is already skipped for all pod traffic", func(t *testing.T) {
+		mockIp6tables := &mockIptables{t: t, prog: "ip6tables", expectations: append(v6Rules("-A"), v6Rules("-D")...)}
+
+		testMgr := &manager{
+			logger: hivetest.Logger(t),
+			sharedCfg: SharedConfig{
+				InstallIptRules:            true,
+				InstallNoConntrackIptRules: true,
+				EnableIPv4:                 true,
+				EnableIPv6:                 true,
+			},
+			ip6tables: mockIp6tables,
+		}
+
+		require.NoError(t, testMgr.installNoTrackRules(netip.MustParseAddr("fd00::1"), port))
+		require.NoError(t, testMgr.removeNoTrackRules(netip.MustParseAddr("fd00::1"), port))
+		require.NoError(t, mockIp6tables.checkExpectations())
+	})
+
+	t.Run("skipped when iptables rules are disabled", func(t *testing.T) {
+		mockIp4tables := &mockIptables{t: t, prog: "iptables"}
+
+		testMgr := &manager{
+			logger:    hivetest.Logger(t),
+			sharedCfg: SharedConfig{EnableIPv4: true},
+			ip4tables: mockIp4tables,
+		}
+
+		require.NoError(t, testMgr.installNoTrackRules(netip.MustParseAddr("10.0.0.1"), port))
+		require.NoError(t, testMgr.removeNoTrackRules(netip.MustParseAddr("10.0.0.1"), port))
+		require.NoError(t, mockIp4tables.checkExpectations())
+	})
+}
+
 // TestAllEgressMasqueradeCmdsRandomFully specifically tests the --random-fully
 // flag in masquerade rules, covering the iptables masquerading scenario
 // previously tested by K8sDatapathConfig Encapsulation context.
@@ -1289,7 +1504,7 @@ func TestInstallMasqueradeRouteSourceRules(t *testing.T) {
 	mgr := &manager{}
 	err := mgr.installMasqueradeRouteSourceRules(
 		mockProg, routes, linkByIndex,
-		[]string{"eth0"}, "11.0.0.0/24", "11.0.0.0/24",
+		[]string{"eth0"}, netip.MustParsePrefix("11.0.0.0/24"), "11.0.0.0/24",
 	)
 	require.NoError(t, err)
 	require.NoError(t, mockProg.checkExpectations())

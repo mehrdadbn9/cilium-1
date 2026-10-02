@@ -9,10 +9,10 @@ import (
 
 	"github.com/cilium/hive/cell"
 	"github.com/cilium/hive/hivetest"
+	"github.com/cilium/statedb"
 	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
 	resourceapi "k8s.io/api/resource/v1"
-	v1 "k8s.io/api/resource/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	kubetypes "k8s.io/apimachinery/pkg/types"
@@ -71,8 +71,7 @@ func TestSerializeDevice(t *testing.T) {
 func TestDeviceClaimConfigs(t *testing.T) {
 	tlog := hivetest.Logger(t)
 	driver := &Driver{
-		logger:      tlog,
-		allocations: make(map[kubetypes.UID]map[kubetypes.UID][]allocation),
+		logger: tlog,
 	}
 
 	t.Run("invalid JSON", func(t *testing.T) {
@@ -179,6 +178,21 @@ func TestPrepareResourceClaim(t *testing.T) {
 
 		require.NotNil(t, pods, "pod resource must be wired by hive")
 
+		db := statedb.New()
+		deviceTable, err := newDeviceTable(db)
+		require.NoError(t, err)
+		allocationTable, err := newAllocationTable(db)
+		require.NoError(t, err)
+
+		dev := &trackedDevice{name: "mydevice"}
+		wtxn := db.WriteTxn(deviceTable)
+		deviceTable.Insert(wtxn, &DRADevice{
+			Name:    dev.IfName(),
+			Manager: types.DeviceManagerTypeMock,
+			Dev:     dev,
+		})
+		wtxn.Commit()
+
 		driver := &Driver{
 			logger:     tlog,
 			kubeClient: cs,
@@ -186,10 +200,12 @@ func TestPrepareResourceClaim(t *testing.T) {
 			config: &v2alpha1.CiliumNetworkDriverNodeConfigSpec{
 				DriverName: "testdriver",
 			},
-			devices: map[types.DeviceManagerType][]types.Device{
-				types.DeviceManagerTypeMock: {&trackedDevice{name: "mydevice"}},
+			deviceManagers: map[types.DeviceManagerType]types.DeviceManager{
+				types.DeviceManagerTypeMock: &mockDeviceManager{devices: []types.Device{dev}},
 			},
-			allocations: make(map[kubetypes.UID]map[kubetypes.UID][]allocation),
+			db:              db,
+			deviceTable:     deviceTable,
+			allocationTable: allocationTable,
 		}
 
 		claim := &resourceapi.ResourceClaim{
@@ -201,8 +217,8 @@ func TestPrepareResourceClaim(t *testing.T) {
 			Status: resourceapi.ResourceClaimStatus{
 				ReservedFor: []resourceapi.ResourceClaimConsumerReference{{Resource: "pods", UID: prepTestPodUID}},
 				Allocation: &resourceapi.AllocationResult{
-					Devices: v1.DeviceAllocationResult{
-						Results: []v1.DeviceRequestAllocationResult{
+					Devices: resourceapi.DeviceAllocationResult{
+						Results: []resourceapi.DeviceRequestAllocationResult{
 							{
 								Request: prepTestRequest,
 								Driver:  "testdriver",
@@ -227,9 +243,17 @@ func TestPrepareResourceClaim(t *testing.T) {
 		claimUID := kubetypes.UID("existing-claim-uid")
 
 		driver := buildPrepDriver(t, cs)
-		driver.allocations = map[kubetypes.UID]map[kubetypes.UID][]allocation{
-			podUID: {claimUID: {}},
-		}
+		// Pre-populate statedb to simulate an already-prepared claim.
+		wtxn := driver.db.WriteTxn(driver.allocationTable)
+		driver.allocationTable.Insert(wtxn, &DRAAllocation{
+			DeviceName:     "existing-device",
+			Pool:           prepTestPool,
+			Manager:        types.DeviceManagerTypeMock,
+			PreparedDevice: &trackedDevice{name: "existing-device"},
+			PodUID:         podUID,
+			ClaimUID:       claimUID,
+		})
+		wtxn.Commit()
 
 		claim := &resourceapi.ResourceClaim{
 			ObjectMeta: metav1.ObjectMeta{UID: claimUID},

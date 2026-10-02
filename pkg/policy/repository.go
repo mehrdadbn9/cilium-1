@@ -21,6 +21,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/sets"
 
 	"github.com/cilium/cilium/api/v1/models"
+	cmtypes "github.com/cilium/cilium/pkg/clustermesh/types"
 	"github.com/cilium/cilium/pkg/container/set"
 	"github.com/cilium/cilium/pkg/crypto/certificatemanager"
 	envoypolicy "github.com/cilium/cilium/pkg/envoy/policy"
@@ -52,6 +53,7 @@ type PolicyRepository interface {
 
 	GetRevision() uint64
 	GetRulesList() *models.Policy
+	GetClusterInfo() cmtypes.ClusterInfo
 	GetSelectorCache() *SelectorCache
 	GetSubjectSelectorCache() *SelectorCache
 	Iterate(f func(rule *types.PolicyEntry))
@@ -68,7 +70,8 @@ type PolicyRepository interface {
 // Repository is a list of policy rules which in combination form the security
 // policy. A policy repository can be
 type Repository struct {
-	logger *slog.Logger
+	logger      *slog.Logger
+	clusterInfo cmtypes.ClusterInfo
 	// mutex protects the whole policy tree
 	mutex lock.RWMutex
 
@@ -111,6 +114,11 @@ func (p *Repository) GetSelectorCache() *SelectorCache {
 	return p.selectorCache
 }
 
+// GetClusterInfo returns the local cluster configuration used by the repository.
+func (p *Repository) GetClusterInfo() cmtypes.ClusterInfo {
+	return p.clusterInfo
+}
+
 // GetSubjectSelectorCache returns the selector cache used by the Repository for indexing policies
 func (p *Repository) GetSubjectSelectorCache() *SelectorCache {
 	return p.subjectSelectorCache
@@ -119,6 +127,7 @@ func (p *Repository) GetSubjectSelectorCache() *SelectorCache {
 // NewPolicyRepository creates a new policy repository.
 func NewPolicyRepository(
 	logger *slog.Logger,
+	clusterInfo cmtypes.ClusterInfo,
 	initialIDs identity.IdentityMap,
 	certManager certificatemanager.CertificateManager,
 	l7RulesTranslator envoypolicy.EnvoyL7RulesTranslator,
@@ -130,6 +139,7 @@ func NewPolicyRepository(
 	repo := &Repository{
 		logger:               logger,
 		rules:                make(map[ruleKey]*rule),
+		clusterInfo:          clusterInfo,
 		rulesByNamespace:     make(map[string]sets.Set[ruleKey]),
 		rulesByResource:      make(map[ipcachetypes.ResourceID]map[ruleKey]*rule),
 		selectorCache:        selectorCache,
@@ -258,8 +268,7 @@ func (p *Repository) releaseRule(r *rule) {
 // unit-testing purposes only. Panics if the rule is invalid
 func (p *Repository) MustAddList(rules api.Rules) (ruleSlice, uint64) {
 	for i := range rules {
-		err := rules[i].Sanitize()
-		if err != nil {
+		if err := rules[i].ValidateAndSanitize(); err != nil {
 			panic(err)
 		}
 	}
@@ -339,6 +348,7 @@ func (p *Repository) resolvePolicyLocked(securityIdentity *identity.Identity) (*
 
 	calculatedPolicy := &selectorPolicy{
 		Revision:             p.GetRevision(),
+		clusterInfo:          p.clusterInfo,
 		SelectorCache:        sc,
 		namedPortsGetter:     p.namedPortsGetter,
 		L4Policy:             NewL4Policy(p.GetRevision()),
@@ -395,7 +405,7 @@ func (p *Repository) computePolicyEnforcementAndRules(securityIdentity *identity
 	lbls := securityIdentity.LabelArray
 
 	// Check if policy enforcement should be enabled at the daemon level.
-	if lbls.Has(labels.IDNameHost) && !option.Config.EnableHostFirewall {
+	if securityIdentity.ID == identity.ReservedIdentityHost && !option.Config.EnableHostFirewall {
 		return false, false, false, false, nil, nil
 	}
 
@@ -715,6 +725,7 @@ func (p *Repository) Snapshot(logger *slog.Logger, cm certificatemanager.Certifi
 
 	out := NewPolicyRepository(
 		logger,
+		p.clusterInfo,
 		ids,
 		cm,
 		rt,

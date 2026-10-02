@@ -143,7 +143,7 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - name: Set initial commit status
-        uses: cilium/actions/set-commit-status@fe0702f5df0d8e44d48f1baa226c023b73ff6b5e # main
+        uses: cilium/actions/set-commit-status@687b48a0547e534dd7270d5069a5ab7967c0e907 # main
         with:
           sha: ${{ inputs.SHA || github.sha }}
 
@@ -153,6 +153,8 @@ jobs:
     runs-on: ubuntu-24.04
     name: Build Ginkgo E2E
     timeout-minutes: 30
+    outputs:
+      ginkgo-cache-key: ${{ steps.cache-key.outputs.key }}
     steps:
       # If any of these steps are modified, please update the copy of these
       # steps further down under the 'setup-and-test' jobs.
@@ -167,20 +169,26 @@ jobs:
           # Required by checkout v7+ to fetch fork PR code; see the NOT TRUSTED warning above.
           allow-unsafe-pr-checkout: true
 
+      - name: Compute Ginkgo build cache key
+        id: cache-key
+        shell: bash
+        run: |
+          echo "key=${{ runner.os }}-ginkgo-e2e-${{ hashFiles('**/*.go') }}" >> $GITHUB_OUTPUT
+
       # Load Ginkgo build from GitHub
       - name: Load ginkgo E2E from GH cache
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         id: cache
         with:
           path: /tmp/.ginkgo-build/
-          key: ${{ runner.os }}-ginkgo-e2e-${{ hashFiles('**/*.go') }}
+          key: ${{ steps.cache-key.outputs.key }}
 
       - name: Install Go
         if: ${{ steps.cache.outputs.cache-hit != 'true' }}
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           # renovate: datasource=golang-version depName=go
-          go-version: 1.26.5
+          go-version: 1.27.1
 
       - name: Build Ginkgo
         if: ${{ steps.cache.outputs.cache-hit != 'true' }}
@@ -303,9 +311,25 @@ jobs:
           cat /tmp/merged.json
           echo "matrix=$(jq -c . < /tmp/merged.json)" >> $GITHUB_OUTPUT
 
+  lvh-cache-key:
+    name: LVH Cache Key
+    # Same runner as the legs, so the key describes the packages they install.
+    runs-on: ${{ vars.UBUNTU_2404_4CPU_16GB || 'ubuntu-24.04' }}
+    timeout-minutes: 20
+    outputs:
+      dependency-list-sha: ${{ steps.key.outputs.dependency_list_sha }}
+    steps:
+      - name: Derive the LVH package cache key
+        id: key
+        timeout-minutes: 10
+        continue-on-error: true
+        uses: cilium/little-vm-helper@f86d344aca812dda5aef167867a9a0a90ca6cca5 # v0.0.31
+        with:
+          derive-dependency-list-sha: 'true'
+
   setup-and-test:
-    needs: [setup-vars, build-ginkgo-binary, generate-matrix, wait-for-images]
-    runs-on: ${{ vars.GH_RUNNER_EXTRA_POWER_UBUNTU_LATEST || 'ubuntu-24.04' }}
+    needs: [setup-vars, build-ginkgo-binary, generate-matrix, wait-for-images, lvh-cache-key]
+    runs-on: ${{ vars.UBUNTU_2404_4CPU_16GB || 'ubuntu-24.04' }}
     timeout-minutes: 45
     name: "E2E Test (${{ matrix.k8s-version }}, ${{matrix.focus}})"
     env:
@@ -317,7 +341,7 @@ jobs:
 
     steps:
       - name: Set commit status to pending
-        uses: cilium/actions/set-commit-status@fe0702f5df0d8e44d48f1baa226c023b73ff6b5e # main
+        uses: cilium/actions/set-commit-status@687b48a0547e534dd7270d5069a5ab7967c0e907 # main
         with:
           sha: ${{ inputs.SHA || github.sha }}
 
@@ -340,7 +364,7 @@ jobs:
 
       - name: Login to docker registry for CI image pull
         if: ${{ vars.DOCKER_AUTH_REQUIRED == 'true' }}
-        uses: docker/login-action@371161bbe7024a29a25c5e19bfcbc0804fe9ad2c # v4.5.2
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           registry: ${{ vars.DOCKER_READ_HOST }}
           username: ${{ vars.DOCKER_READ_USERNAME }}
@@ -358,7 +382,7 @@ jobs:
           path: untrusted
 
       - name: Install cilium-cli
-        uses: cilium/cilium-cli@7ca7fc53c20275f5c10ef5f3557076691fd1d720 # v0.19.7
+        uses: cilium/cilium-cli@c5e42236c7d90bd50e7975ac587f77782666a0aa # v0.20.0
         with:
           skip-build: ${{ env.CILIUM_CLI_SKIP_BUILD }}
           image-repo: ${{ env.CILIUM_CLI_IMAGE_REPO }}
@@ -391,17 +415,18 @@ jobs:
 
       - name: Provision LVH VMs
         id: provision-vh-vms
-        uses: cilium/little-vm-helper@5ae749011735fd77f30f38add52f1a53a5568671 # v0.0.30
+        uses: cilium/little-vm-helper@f86d344aca812dda5aef167867a9a0a90ca6cca5 # v0.0.31
         with:
           test-name: datapath-conformance
           install-dependencies: true
+          dependency-list-sha: ${{ needs.lvh-cache-key.outputs.dependency-list-sha }}
           image-version: ${{ matrix.kernel }}
           images-folder-parent: "/tmp"
           host-mount: untrusted/
           cpu: 4
           mem: 12G
           # renovate: datasource=github-tags depName=cilium/little-vm-helper
-          lvh-version: "v0.0.30"
+          lvh-version: "v0.0.31"
           cmd: |
             git config --global --add safe.directory /host
             mv /host/helm /usr/bin
@@ -409,7 +434,7 @@ jobs:
 
       - name: Provision kind
         timeout-minutes: 5
-        uses: cilium/little-vm-helper@5ae749011735fd77f30f38add52f1a53a5568671 # v0.0.30
+        uses: cilium/little-vm-helper@f86d344aca812dda5aef167867a9a0a90ca6cca5 # v0.0.31
         with:
           provision: 'false'
           cmd: |
@@ -426,7 +451,7 @@ jobs:
 
       - name: Create imagePullSecret for ginkgo image pull
         if: ${{ vars.DOCKER_AUTH_REQUIRED == 'true' }}
-        uses: cilium/little-vm-helper@5ae749011735fd77f30f38add52f1a53a5568671 # v0.0.30
+        uses: cilium/little-vm-helper@f86d344aca812dda5aef167867a9a0a90ca6cca5 # v0.0.31
         with:
           provision: 'false'
           cmd: |
@@ -442,7 +467,7 @@ jobs:
         id: cache
         with:
           path: /tmp/.ginkgo-build/
-          key: ${{ runner.os }}-ginkgo-e2e-${{ hashFiles('**/*.go') }}
+          key: ${{ needs.build-ginkgo-binary.outputs.ginkgo-cache-key }}
 
       # Re-build the tests if it was a cache miss.
       - name: Install Go
@@ -450,7 +475,7 @@ jobs:
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           # renovate: datasource=golang-version depName=go
-          go-version: 1.26.5
+          go-version: 1.27.1
 
       - name: Build Ginkgo
         if: ${{ steps.cache.outputs.cache-hit != 'true' }}
@@ -487,7 +512,7 @@ jobs:
       - name: Run tests
         id: run-tests
         timeout-minutes: 40
-        uses: cilium/little-vm-helper@5ae749011735fd77f30f38add52f1a53a5568671 # v0.0.30
+        uses: cilium/little-vm-helper@f86d344aca812dda5aef167867a9a0a90ca6cca5 # v0.0.31
         with:
           provision: 'false'
           cmd: |
@@ -519,8 +544,8 @@ jobs:
             HELM_OVERRIDES="${{ env.HELM_OVERRIDES }}"
             # Only pass the imagePullSecrets helm override when registry auth is required.
             if [[ "${{ vars.DOCKER_AUTH_REQUIRED }}" == "true" ]]; then
-              if [[ -n "${HELM_OVERRIDES}" ]]; then
-                HELM_OVERRIDES="${HELM_OVERRIDES},imagePullSecrets[0].name=cilium-registry"
+              if [[ -n "\${HELM_OVERRIDES}" ]]; then
+                HELM_OVERRIDES="\${HELM_OVERRIDES},imagePullSecrets[0].name=cilium-registry"
               else
                 HELM_OVERRIDES="-cilium.install-helm-overrides=imagePullSecrets[0].name=cilium-registry"
               fi
@@ -537,7 +562,7 @@ jobs:
              -cilium.hubble-relay-image=${{ env.REGISTRY_DEV }}/${{ env.ORGANIZATION_DEV }}/hubble-relay-ci \
              -cilium.hubble-relay-tag=${{ needs.setup-vars.outputs.SHA }}${{ needs.setup-vars.outputs.image_tag_suffix }} \
              -cilium.kubeconfig=/root/.kube/config \
-             ${HELM_OVERRIDES} \
+             \${HELM_OVERRIDES} \
              -cilium.operator-suffix=-ci"
 
               ./test.test \
@@ -552,12 +577,12 @@ jobs:
                -cilium.hubble-relay-image=${{ env.REGISTRY_DEV }}/${{ env.ORGANIZATION_DEV }}/hubble-relay-ci \
                -cilium.hubble-relay-tag=${{ needs.setup-vars.outputs.SHA }}${{ needs.setup-vars.outputs.image_tag_suffix }} \
                -cilium.kubeconfig=/root/.kube/config \
-               ${HELM_OVERRIDES} \
+               \${HELM_OVERRIDES} \
                -cilium.operator-suffix=-ci
 
       - name: Fetch artifacts
         if: ${{ !success() && steps.provision-vh-vms.outcome == 'success' }}
-        uses: cilium/little-vm-helper@5ae749011735fd77f30f38add52f1a53a5568671 # v0.0.30
+        uses: cilium/little-vm-helper@f86d344aca812dda5aef167867a9a0a90ca6cca5 # v0.0.31
         with:
           provision: 'false'
           cmd: |

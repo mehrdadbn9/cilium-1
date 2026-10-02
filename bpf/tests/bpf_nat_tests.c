@@ -6,7 +6,6 @@
 #include "common.h"
 #include "pktgen.h"
 
-#define ENABLE_SCTP
 #define ENABLE_IPV4
 #define ENABLE_NODEPORT
 #define ENABLE_MASQUERADE_IPV4
@@ -36,6 +35,8 @@ static char pkt[100];
 #include <lib/nodeport.h>
 
 ASSIGN_CONFIG(__u16, device_mtu, 1500);
+
+ASSIGN_CONFIG(bool, enable_sctp, true)
 
 __always_inline int mk_icmp4_error_pkt(void *dst, __u8 error_hdr, bool egress, bool rfc4884)
 {
@@ -228,7 +229,7 @@ int test_nat4_icmp_error_tcp(__maybe_unused struct __ctx_buff *ctx)
 	/* This is the entry-point of the test, calling
 	 * snat_v4_rev_nat().
 	 */
-	ret = snat_v4_rev_nat(ctx, &target, &trace, NULL);
+	ret = snat_v4_rev_nat(ctx, &target, &trace);
 	assert(ret == 0);
 
 	__be16 proto;
@@ -348,7 +349,7 @@ int test_nat4_icmp_error_tcp_rfc1191(__maybe_unused struct __ctx_buff *ctx)
 	/* This is the entry-point of the test, calling
 	 * snat_v4_rev_nat().
 	 */
-	ret = snat_v4_rev_nat(ctx, &target, &trace, NULL);
+	ret = snat_v4_rev_nat(ctx, &target, &trace);
 	assert(ret == 0);
 
 	__be16 proto;
@@ -466,7 +467,7 @@ int test_nat4_icmp_error_udp(__maybe_unused struct __ctx_buff *ctx)
 	/* This is the entry-point of the test, calling
 	 * snat_v4_rev_nat().
 	 */
-	ret = snat_v4_rev_nat(ctx, &target, &trace, NULL);
+	ret = snat_v4_rev_nat(ctx, &target, &trace);
 	assert(ret == 0);
 
 	__be16 proto;
@@ -579,7 +580,7 @@ int test_nat4_icmp_error_icmp(__maybe_unused struct __ctx_buff *ctx)
 	/* This is the entry-point of the test, calling
 	 * snat_v4_rev_nat().
 	 */
-	ret = snat_v4_rev_nat(ctx, &target, &trace, NULL);
+	ret = snat_v4_rev_nat(ctx, &target, &trace);
 	assert(ret == 0);
 
 	__be16 proto;
@@ -681,7 +682,7 @@ int test_nat4_icmp_error_sctp(__maybe_unused struct __ctx_buff *ctx)
 	/* This is the entry-point of the test, calling
 	 * snat_v4_rev_nat().
 	 */
-	ret = snat_v4_rev_nat(ctx, &target, &trace, NULL);
+	ret = snat_v4_rev_nat(ctx, &target, &trace);
 	assert(ret == DROP_CSUM_L4);
 
 	/* nothing really change with udp/tcp */

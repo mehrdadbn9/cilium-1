@@ -16,6 +16,7 @@ import (
 	"github.com/stretchr/testify/require"
 	k8sTypes "k8s.io/apimachinery/pkg/types"
 
+	cmtypes "github.com/cilium/cilium/pkg/clustermesh/types"
 	"github.com/cilium/cilium/pkg/container/set"
 	"github.com/cilium/cilium/pkg/crypto/certificatemanager"
 	envoypolicy "github.com/cilium/cilium/pkg/envoy/policy"
@@ -79,7 +80,7 @@ func newTestData(tb testing.TB, logger *slog.Logger) *testData {
 		identityManager:   idMgr,
 		sc:                testNewSelectorCache(tb, logger, nil),
 		subjectSc:         testNewSelectorCache(tb, logger, nil),
-		repo:              NewPolicyRepository(logger, nil, &testcertificatemanager.Fake{}, envoypolicy.NewEnvoyL7RulesTranslator(logger, certificatemanager.NewMockSecretManagerInline()), idMgr, testpolicy.NewPolicyMetricsNoop()),
+		repo:              NewPolicyRepository(logger, cmtypes.DefaultClusterInfo, nil, &testcertificatemanager.Fake{}, envoypolicy.NewEnvoyL7RulesTranslator(logger, certificatemanager.NewMockSecretManagerInline()), idMgr, testpolicy.NewPolicyMetricsNoop()),
 		idSet:             set.NewSet[identity.NumericIdentity](),
 		testPolicyContext: &testPolicyContextType{logger: logger},
 	}
@@ -149,7 +150,7 @@ func (td *testData) withIDs(initIDs ...identity.IdentityMap) *testData {
 		maps.Copy(initial, im)
 	}
 	for id, lbls := range initial {
-		td.identityManager.Add(&identity.Identity{ID: id, Labels: lbls.Labels(), LabelArray: lbls})
+		td.identityManager.Add(&identity.Identity{ID: id, Labels: lbls, LabelArray: lbls.LabelArray()})
 	}
 	wg := &sync.WaitGroup{}
 	td.sc.UpdateIdentities(initial, nil, wg)
@@ -166,11 +167,11 @@ func (td *testData) addIdentity(id *identity.Identity) {
 	wg := &sync.WaitGroup{}
 	td.subjectSc.UpdateIdentities(
 		identity.IdentityMap{
-			id.ID: id.LabelArray,
+			id.ID: id.Labels,
 		}, nil, wg)
 	td.sc.UpdateIdentities(
 		identity.IdentityMap{
-			id.ID: id.LabelArray,
+			id.ID: id.Labels,
 		}, nil, wg)
 	wg.Wait()
 	td.idSet.Insert(id.ID)
@@ -181,12 +182,12 @@ func (td *testData) removeIdentity(id *identity.Identity) {
 	td.subjectSc.UpdateIdentities(
 		nil,
 		identity.IdentityMap{
-			id.ID: id.LabelArray,
+			id.ID: id.Labels,
 		}, wg)
 	td.sc.UpdateIdentities(
 		nil,
 		identity.IdentityMap{
-			id.ID: id.LabelArray,
+			id.ID: id.Labels,
 		}, wg)
 	wg.Wait()
 	td.idSet.Remove(id.ID)
@@ -371,7 +372,7 @@ func (td *testData) policyInvalid(t *testing.T, errStr string, rules ...*api.Rul
 		if r.EndpointSelector.LabelSelector == nil {
 			r.EndpointSelector = endpointSelectorA
 		}
-		require.NoError(t, r.Sanitize())
+		require.NoError(t, r.ValidateAndSanitize())
 	}
 	td.repo.ReplaceByResource(utils.RulesToPolicyEntries(rules), "dummy-resource")
 
@@ -388,7 +389,7 @@ func (td *testData) policyValid(t *testing.T, rules ...*api.Rule) {
 		if r.EndpointSelector.LabelSelector == nil {
 			r.EndpointSelector = endpointSelectorA
 		}
-		require.NoError(t, r.Sanitize())
+		require.NoError(t, r.ValidateAndSanitize())
 	}
 	td.repo.ReplaceByResource(utils.RulesToPolicyEntries(rules), "dummy-resource")
 
@@ -1408,7 +1409,7 @@ func TestMergeListenerPolicy(t *testing.T) {
 	option.Config.EnableHostFirewall = true
 
 	idHost := identity.NewIdentity(identity.ReservedIdentityHost, labels.NewFrom(labels.LabelHost))
-	td.withIDs(identity.IdentityMap{idHost.ID: idHost.LabelArray})
+	td.withIDs(identity.IdentityMap{idHost.ID: idHost.Labels})
 	td.repo.mustAdd(egressRule)
 	_, err := td.repo.resolvePolicyLocked(idHost)
 	require.ErrorContains(t, err, `Listener "test" in CCNP can not use Kind CiliumEnvoyConfig`)

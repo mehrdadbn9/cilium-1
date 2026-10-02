@@ -172,9 +172,6 @@ const (
 	// L4PolicyID is the identifier of a L4 Policy
 	L4PolicyID = "PolicyID.L4"
 
-	// AuthType is an enum for the type of authentication required, if any.
-	AuthType = "AuthType"
-
 	// IsRedirect is a boolean for if the entry is a redirect or not
 	IsRedirect = "IsRedirect"
 
@@ -1701,6 +1698,10 @@ const (
 
 	PolicyRevisionRepo = "policyRevisionRepo"
 
+	// PolicyRevisionCurrentAt is the highest repository revision a computed
+	// policy is known to be correct for.
+	PolicyRevisionCurrentAt = "policyRevisionCurrentAt"
+
 	PolicyChanged = "policyChanged"
 
 	CEPUIDOld = "old-" + CEPUID
@@ -1945,4 +1946,8 @@ const (
 	PodUID = "podUID"
 
 	ClaimUID = "claimUID"
+
+	PendingInitializers = "pendingInitializers"
+
+	VFCount = "vFCount"
 )

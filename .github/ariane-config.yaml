@@ -2,6 +2,7 @@ allowed-teams:
   - organization-members
 
 triggers:
+  # These workflows should be duplicated between /default and /test triggers.
   /default:
     workflows:
     - tests-smoke-conformance.yaml
@@ -12,6 +13,8 @@ triggers:
   # This trigger needs to be kept in sync with ariane-scheduled.yaml workflow
   /test\s*:
     workflows:
+    - lint-ariane-config.yaml
+    - lint-images-base.yaml
     - conformance-aws-cni.yaml
     - conformance-clustermesh.yaml
     - conformance-delegated-ipam.yaml
@@ -33,8 +36,11 @@ triggers:
     - conformance-race.yaml
     - conformance-runtime.yaml
     - integration-test.yaml
+    - tests-cifuzz.yaml
     - tests-clustermesh-upgrade.yaml
     - tests-datapath-verifier.yaml
+    - tests-smoke-conformance.yaml
+    - tests-smoke-ipv6.yaml
     - hubble-cli-integration-test.yaml
     - k8s-kind-network-e2e.yaml
     - k8s-kind-network-policies-e2e.yaml
@@ -179,6 +185,9 @@ triggers:
   /ci-ces-migrate:
     workflows:
     - tests-ces-migrate.yaml
+  /ci-e2e-upgrade:
+    workflows:
+    - tests-e2e-upgrade.yaml
   /l7-perf(\s+(?:\s*version=[-+.0-9a-z]+)?(?:\s*sha=[a-f0-9]+)?)?:
     workflows:
     - l7-perf.yaml
@@ -255,7 +264,7 @@ workflows:
   cilium-cli.yaml:
     paths-ignore-regex: (Documentation/|test/)
   conformance-kind-proxy-embedded.yaml:
-    paths-ignore-regex: (Documentation/|test/)
+    paths-ignore-regex: ((bpf/complexity-tests|bpf/tests|test|Documentation|hubble|.github/actions/cl2-modules|.github/actions/e2e|.github/actions/ginkgo)/|(.github/renovate\.json5|README.rst|CODEOWNERS|stable.txt|.*\.md|.*_test\.go)$)
   tests-cifuzz.yaml:
     paths-regex: (\.github/workflows/tests-cifuzz\.yaml|fuzz_test.go|test/fuzzing/)
   k8s-kind-network-policies-e2e.yaml:

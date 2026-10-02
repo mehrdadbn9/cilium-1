@@ -13,6 +13,7 @@ import (
 	"github.com/cilium/hive/hivetest"
 	"github.com/stretchr/testify/require"
 
+	cmtypes "github.com/cilium/cilium/pkg/clustermesh/types"
 	"github.com/cilium/cilium/pkg/completion"
 	"github.com/cilium/cilium/pkg/crypto/certificatemanager"
 	fakeipsec "github.com/cilium/cilium/pkg/datapath/linux/ipsec/fake"
@@ -148,7 +149,25 @@ func (p *recordingEndpointProxy) CreateOrUpdateRedirect(ctx context.Context, l4 
 
 func (p *recordingEndpointProxy) RemoveRedirect(id string) {}
 
-func (p *recordingEndpointProxy) UpdateNetworkPolicy(ctx context.Context, ep proxyendpoint.EndpointUpdater, epp *policy.EndpointPolicy, wg *completion.WaitGroup) (error, revert.RevertFunc, revert.FinalizeFunc) {
+type recordingPolicyRevertible struct {
+	proxy      *recordingEndpointProxy
+	endpointID uint64
+}
+
+func (r recordingPolicyRevertible) Revert() error {
+	r.proxy.mu.Lock()
+	defer r.proxy.mu.Unlock()
+	r.proxy.revertCalls[r.endpointID]++
+	return nil
+}
+
+func (r recordingPolicyRevertible) Finalize() {
+	r.proxy.mu.Lock()
+	defer r.proxy.mu.Unlock()
+	r.proxy.finalizeCalls[r.endpointID]++
+}
+
+func (p *recordingEndpointProxy) UpdateNetworkPolicy(ctx context.Context, ep proxyendpoint.EndpointUpdater, epp *policy.EndpointPolicy, wg *completion.WaitGroup) (error, revert.Revertible) {
 	endpointID := ep.GetID()
 
 	p.mu.Lock()
@@ -166,19 +185,10 @@ func (p *recordingEndpointProxy) UpdateNetworkPolicy(ctx context.Context, ep pro
 	p.mu.Unlock()
 
 	if err != nil {
-		return err, nil, nil
+		return err, nil
 	}
 
-	return nil, func() error {
-			p.mu.Lock()
-			defer p.mu.Unlock()
-			p.revertCalls[endpointID]++
-			return nil
-		}, func() {
-			p.mu.Lock()
-			defer p.mu.Unlock()
-			p.finalizeCalls[endpointID]++
-		}
+	return nil, recordingPolicyRevertible{proxy: p, endpointID: endpointID}
 }
 
 func (p *recordingEndpointProxy) RemoveNetworkPolicy(ctx context.Context, ep proxyendpoint.EndpointInfoSource) {
@@ -208,6 +218,7 @@ func newUpdatePolicyMapsTestRepo(t *testing.T, withL7Rules bool) (*policy.Reposi
 	idmgr := identitymanager.NewIDManager(logger)
 	repo := policy.NewPolicyRepository(
 		logger,
+		cmtypes.DefaultClusterInfo,
 		nil,
 		nil,
 		envoypolicy.NewEnvoyL7RulesTranslator(logger, certificatemanager.NewMockSecretManagerInline()),

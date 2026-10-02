@@ -78,6 +78,11 @@ Users (Alphabetically)
       U: L3/L4/L7 policies
       L: https://youtu.be/39FLsSc2P-Y
 
+    * N: Aether
+      D: Aether uses Cilium as the CNI for every tenant cluster of its managed Kubernetes platform
+      U: Networking, NetworkPolicy, Host Firewall, LoadBalancer IPAM, kube-proxy replacement, Service Mesh
+      L: https://aetherplatform.cloud/
+
     * N: AirQo
       D: AirQo uses Cilium as the CNI plugin
       U: CNI, Networking, NetworkPolicy, Cluster Mesh, Hubble, Kubernetes services
@@ -641,6 +646,12 @@ Users (Alphabetically)
       L: https://www.nutanix.com/products/kubernetes-management-platform
       Q: @tuxtof
 
+    * N: OpenChoreo
+      D: OpenChoreo uses Cilium to enforce zero-trust network security through CiliumNetworkPolicies and provide advanced network observability with Hubble.
+      U: CNI, CiliumNetworkPolicy, Hubble, Layer 7 visibility via Cilium Envoy
+      L: https://openchoreo.dev/ecosystem/item/networking-cilium/
+      Q: @akila-i
+
     * N: Outscale Kubernetes as a Service (OKS)
       D: Cilium is the default Container Network Interface (CNI) used by OUTSCALE on all clusters provisioned through its Kubernetes offering, OKS.
       U: CNI, Hubble, CiliumNetworkPolicy, kube-proxy replacement, eBPF 
@@ -971,6 +982,11 @@ Users (Alphabetically)
       D: Veepee is using Cilium on their on-premise Kubernetes clusters, hosting majority of their applications.
       U. CNI, BGP, eBPF, Hubble, DirectRouting (via kube-router)
       Q: @nerzhul
+
+    * N: Verbano Tech
+      D: Verbano Tech runs Cilium as the CNI for a production K3s deployment on a node that coexists with Docker Compose services.
+      U: CNI, Hubble, Kubernetes Services with eBPF per-packet ClusterIP load-balancing
+      L: https://verbano.tech/en/engineering/k3s-cilium-docker-compose-clusterip-timeouts/
 
     * N: Vietnam Post Cloud
       D: Vietnnam Post Cloud is using Cilium in their production, staging, and development clusters

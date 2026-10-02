@@ -491,7 +491,7 @@ var quarantineTestCases = []testCase{
 			"SVC: ID=0 ADDR=<auto>/ANY SLOT=0 LBALG=undef AFFTimeout=0 COUNT=0 QCOUNT=0 FLAGS=ClusterIP+non-routable",
 			"SVC: ID=1 ADDR=<auto>/TCP SLOT=0 LBALG=undef AFFTimeout=0 COUNT=1 QCOUNT=1 FLAGS=ClusterIP+Local+InternalLocal+non-routable",
 			"SVC: ID=1 ADDR=<auto>/TCP SLOT=1 BEID=2 COUNT=0 QCOUNT=0 FLAGS=ClusterIP+Local+InternalLocal+non-routable",
-			"SVC: ID=1 ADDR=<auto>/TCP SLOT=2 BEID=1 COUNT=0 QCOUNT=0 FLAGS=ClusterIP+Local+InternalLocal+non-routable",
+			"SVC: ID=1 ADDR=<auto>/TCP SLOT=2 BEID=1 COUNT=0 QCOUNT=0 FLAGS=ClusterIP+Local+InternalLocal+non-routable+quarantined",
 		},
 		nil,
 		false,
@@ -1006,10 +1006,10 @@ var sessionAffinityTestCases = []testCase{
 			"REV: ID=2 ADDR=<nodePort>",
 			"SVC: ID=1 ADDR=<zero>/TCP SLOT=0 LBALG=undef AFFTimeout=1 COUNT=1 QCOUNT=1 FLAGS=NodePort+Local+InternalLocal+sessionAffinity+non-routable",
 			"SVC: ID=1 ADDR=<zero>/TCP SLOT=1 BEID=2 COUNT=0 QCOUNT=0 FLAGS=NodePort+Local+InternalLocal+sessionAffinity+non-routable",
-			"SVC: ID=1 ADDR=<zero>/TCP SLOT=2 BEID=1 COUNT=0 QCOUNT=0 FLAGS=NodePort+Local+InternalLocal+sessionAffinity+non-routable",
+			"SVC: ID=1 ADDR=<zero>/TCP SLOT=2 BEID=1 COUNT=0 QCOUNT=0 FLAGS=NodePort+Local+InternalLocal+sessionAffinity+non-routable+quarantined",
 			"SVC: ID=2 ADDR=<nodePort>/TCP SLOT=0 LBALG=undef AFFTimeout=1 COUNT=1 QCOUNT=1 FLAGS=NodePort+Local+InternalLocal+sessionAffinity",
 			"SVC: ID=2 ADDR=<nodePort>/TCP SLOT=1 BEID=2 COUNT=0 QCOUNT=0 FLAGS=NodePort+Local+InternalLocal+sessionAffinity",
-			"SVC: ID=2 ADDR=<nodePort>/TCP SLOT=2 BEID=1 COUNT=0 QCOUNT=0 FLAGS=NodePort+Local+InternalLocal+sessionAffinity",
+			"SVC: ID=2 ADDR=<nodePort>/TCP SLOT=2 BEID=1 COUNT=0 QCOUNT=0 FLAGS=NodePort+Local+InternalLocal+sessionAffinity+quarantined",
 		},
 		[]maps.MapDump{
 			"MAGLEV: ID=2 INNER=[2(1021)]",
@@ -1404,6 +1404,7 @@ func TestBPFOps(t *testing.T) {
 			DB:             db,
 			NodeAddresses:  nodeAddrs,
 			Frontends:      frontends,
+			Metrics:        newReconcilerMetrics(),
 		})
 
 		svc := baseService
@@ -1586,6 +1587,7 @@ func TestBPFOps(t *testing.T) {
 					DB:             db,
 					NodeAddresses:  nodeAddrs,
 					Frontends:      frontends,
+					Metrics:        newReconcilerMetrics(),
 				}
 
 				ops := newBPFOps(p)
@@ -1613,11 +1615,35 @@ func TestBPFOps(t *testing.T) {
 				DB:             db,
 				NodeAddresses:  nodeAddrs,
 				Frontends:      frontends,
+				Metrics:        newReconcilerMetrics(),
 			}
 			ops := newBPFOps(p)
 			runTests(ops, setWithAlgo.testCaseSet, setWithAlgo.algo, addr, true)
 		}
 	}
+}
+
+func TestIDMappingsPendingRestoreMetric(t *testing.T) {
+	metrics := newReconcilerMetrics()
+	ops := &BPFOps{
+		metrics: metrics,
+		restoredServiceIDs: map[loadbalancer.L3n4Addr]loadbalancer.ServiceID{
+			frontendAddrs[0]: 1,
+		},
+		restoredBackendIDs: map[loadbalancer.L3n4Addr]loadbalancer.BackendID{
+			backend1: 1,
+			backend2: 2,
+		},
+	}
+
+	metrics.setIDMappingsPendingRestore(idAllocTypeService, len(ops.restoredServiceIDs))
+	metrics.setIDMappingsPendingRestore(idAllocTypeBackend, len(ops.restoredBackendIDs))
+	require.Equal(t, float64(1), metrics.IDMappingsPendingRestore.WithLabelValues(idAllocTypeService).Get())
+	require.Equal(t, float64(2), metrics.IDMappingsPendingRestore.WithLabelValues(idAllocTypeBackend).Get())
+
+	require.NoError(t, ops.pruneRestoredIDs())
+	require.Zero(t, metrics.IDMappingsPendingRestore.WithLabelValues(idAllocTypeService).Get())
+	require.Zero(t, metrics.IDMappingsPendingRestore.WithLabelValues(idAllocTypeBackend).Get())
 }
 
 // showMaps formats the map dumps as the Go code expected in the test cases.

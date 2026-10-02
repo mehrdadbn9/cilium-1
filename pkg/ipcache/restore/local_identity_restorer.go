@@ -15,6 +15,7 @@ import (
 	cmtypes "github.com/cilium/cilium/pkg/clustermesh/types"
 	"github.com/cilium/cilium/pkg/identity"
 	identitycell "github.com/cilium/cilium/pkg/identity/cache/cell"
+	iputil "github.com/cilium/cilium/pkg/ip"
 	"github.com/cilium/cilium/pkg/ipcache"
 	ipcachetypes "github.com/cilium/cilium/pkg/ipcache/types"
 	"github.com/cilium/cilium/pkg/labels"
@@ -153,8 +154,10 @@ func (d *LocalIdentityRestorer) dumpOldIPCache() (map[netip.Prefix]identity.Nume
 // identities. Specifically, if a prefix in the ipcache has a CIDR label, this re-creates
 // that metadata entry.
 //
-// For ingress IPs, it will add those to the ipcache and configure the local node
-// accordingly.
+// For ingress IPs, it adds them to the ipcache and overwrites any addresses
+// restored from Kubernetes on the local node. The BPF map reflects the
+// addresses used by the previous datapath and therefore has highest restoration
+// precedence.
 func (d *LocalIdentityRestorer) restoreIPCache(ipCache *ipcache.IPCache, localPrefixes map[netip.Prefix]identity.NumericIdentity, restoredIdentities map[identity.NumericIdentity]*identity.Identity) {
 	if len(localPrefixes) == 0 {
 		return
@@ -192,13 +195,14 @@ func (d *LocalIdentityRestorer) restoreIPCache(ipCache *ipcache.IPCache, localPr
 				Metadata: []ipcache.IPMetadata{labels.LabelIngress},
 			})
 
-			// Set any restored ingress IPs back on the LocalNode object
+			// BPF ipcache state takes precedence over the Kubernetes Node and
+			// CiliumNode fallbacks restored on the local node earlier.
 			d.params.NodeLocalStore.Update(func(n *node.LocalNode) {
 				addr := prefix.Addr()
 				if addr.Is4() {
-					n.IPv4IngressIP = addr.AsSlice()
+					n.IPv4IngressIP = iputil.AddrFrom(addr)
 				} else {
-					n.IPv6IngressIP = addr.AsSlice()
+					n.IPv6IngressIP = iputil.AddrFrom(addr)
 				}
 			})
 			d.params.Logger.Info("Restored ingress IP", logfields.Ingress, prefix)

@@ -26,7 +26,7 @@ type HTTPRouteInput struct {
 	Ctx            context.Context
 	Logger         *slog.Logger
 	Client         client.Client
-	Grants         *gatewayv1.ReferenceGrantList
+	Grants         []gatewayv1.ReferenceGrant
 	HTTPRoute      *gatewayv1.HTTPRoute
 	ControllerName string
 
@@ -64,7 +64,7 @@ func (h *HTTPRouteInput) mergeStatusConditions(parentRef gatewayv1.ParentReferen
 }
 
 func (h *HTTPRouteInput) GetGrants() []gatewayv1.ReferenceGrant {
-	return h.Grants.Items
+	return h.Grants
 }
 
 func (h *HTTPRouteInput) GetNamespace() string {
@@ -172,6 +172,10 @@ func (t *HTTPRouteRule) GetBackendRefs() []gatewayv1.BackendRef {
 		}
 	}
 	return refs
+}
+
+func (t *HTTPRouteRule) GetSessionPersistence() *gatewayv1.SessionPersistence {
+	return t.Rule.SessionPersistence
 }
 
 func invalidHeaderModifierCondition(headerName gatewayv1.HTTPHeaderName) metav1.Condition {

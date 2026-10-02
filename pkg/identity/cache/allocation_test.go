@@ -86,6 +86,7 @@ func testAllocateIdentityReserved(t *testing.T, testConfig testConfig, client kv
 
 	mgr := NewCachingIdentityAllocator(logger, newDummyOwner(logger), testConfig.allocatorConfig)
 	<-mgr.InitIdentityAllocator(nil, client)
+	defer mgr.Close()
 
 	require.True(t, identity.IdentityAllocationIsLocal(lbls))
 	i, isNew, err = mgr.AllocateIdentity(context.Background(), lbls, false, identity.InvalidIdentity)
@@ -159,7 +160,7 @@ func (d *dummyOwner) UpdateIdentities(added, deleted identity.IdentityMap) <-cha
 	return out
 }
 
-func (d *dummyOwner) GetIdentity(id identity.NumericIdentity) labels.LabelArray {
+func (d *dummyOwner) GetIdentity(id identity.NumericIdentity) labels.Labels {
 	d.mutex.Lock()
 	defer d.mutex.Unlock()
 	return d.cache[id]
@@ -211,7 +212,7 @@ func testEventWatcherBatching(t *testing.T) {
 	watcher.watch(events)
 
 	lbls := labels.NewLabelsFromSortedList("id=foo")
-	key := &cacheKey.GlobalIdentity{LabelArray: lbls.LabelArray()}
+	key := cacheKey.NewGlobalIdentity(lbls)
 
 	for i := 1024; i < 1034; i++ {
 		events <- allocator.AllocatorEvent{
@@ -221,7 +222,7 @@ func testEventWatcherBatching(t *testing.T) {
 		}
 	}
 	require.NotEqual(t, 0, owner.WaitUntilID(1033))
-	require.Equal(t, lbls.LabelArray(), owner.GetIdentity(identity.NumericIdentity(1033)))
+	require.Equal(t, lbls, owner.GetIdentity(identity.NumericIdentity(1033)))
 	for i := 1024; i < 1034; i++ {
 		events <- allocator.AllocatorEvent{
 			Typ: allocator.AllocatorChangeDelete,
@@ -281,7 +282,7 @@ func testAllocator(t *testing.T, client kvstore.Client) {
 	require.True(t, isNew)
 	// Wait for the update event from the KV-store
 	require.NotEqual(t, 0, owner.WaitUntilID(id1a.ID))
-	require.Equal(t, lbls1.LabelArray(), owner.GetIdentity(id1a.ID))
+	require.Equal(t, lbls1, owner.GetIdentity(id1a.ID))
 
 	// reuse the same identity
 	id1b, isNew, err := mgr.AllocateIdentity(context.Background(), lbls1, false, identity.InvalidIdentity)
@@ -300,7 +301,7 @@ func testAllocator(t *testing.T, client kvstore.Client) {
 	// This also means that we should have not received an event from the
 	// KV-store for the deletion of the identity, so it should still be in
 	// owner's cache.
-	require.Equal(t, lbls1.LabelArray(), owner.GetIdentity(id1a.ID))
+	require.Equal(t, lbls1, owner.GetIdentity(id1a.ID))
 
 	id1b, isNew, err = mgr.AllocateIdentity(context.Background(), lbls1, false, identity.InvalidIdentity)
 	require.NotNil(t, id1b)
@@ -310,7 +311,7 @@ func testAllocator(t *testing.T, client kvstore.Client) {
 	require.False(t, isNew)
 	require.Equal(t, id1b.ID, id1a.ID)
 	// Should still be cached, no new events should have been received.
-	require.Equal(t, lbls1.LabelArray(), owner.GetIdentity(id1a.ID))
+	require.Equal(t, lbls1, owner.GetIdentity(id1a.ID))
 
 	ident := mgr.LookupIdentityByID(context.TODO(), id1b.ID)
 	require.NotNil(t, ident)
@@ -323,7 +324,7 @@ func testAllocator(t *testing.T, client kvstore.Client) {
 	require.NotEqual(t, id2.ID, id1a.ID)
 	// Wait for the update event from the KV-store
 	require.NotEqual(t, 0, owner.WaitUntilID(id2.ID))
-	require.Equal(t, lbls2.LabelArray(), owner.GetIdentity(id2.ID))
+	require.Equal(t, lbls2, owner.GetIdentity(id2.ID))
 
 	id3, isNew, err := mgr.AllocateIdentity(context.Background(), lbls3, false, identity.InvalidIdentity)
 	require.NotNil(t, id3)
@@ -333,7 +334,7 @@ func testAllocator(t *testing.T, client kvstore.Client) {
 	require.NotEqual(t, id3.ID, id2.ID)
 	// Wait for the update event from the KV-store
 	require.NotEqual(t, 0, owner.WaitUntilID(id3.ID))
-	require.Equal(t, lbls3.LabelArray(), owner.GetIdentity(id3.ID))
+	require.Equal(t, lbls3, owner.GetIdentity(id3.ID))
 
 	released, err = mgr.Release(context.Background(), id1b, false)
 	require.NoError(t, err)
@@ -350,7 +351,7 @@ func testAllocator(t *testing.T, client kvstore.Client) {
 }
 
 func createCIDObj(id string, lbls labels.Labels) *capi_v2.CiliumIdentity {
-	k := &cacheKey.GlobalIdentity{LabelArray: lbls.LabelArray()}
+	k := cacheKey.NewGlobalIdentity(lbls)
 	selectedLabels := identitybackend.SelectK8sLabels(k.GetAsMap())
 	return &capi_v2.CiliumIdentity{
 		ObjectMeta: metav1.ObjectMeta{
@@ -485,7 +486,7 @@ func testAllocatorOperatorIDManagement(t *testing.T, cl kvstoreClient) {
 type kvstoreClient struct{ kvstore.Client }
 
 func (c *kvstoreClient) addIDKVStore(ctx context.Context, id string, lbls labels.Labels) error {
-	key := &cacheKey.GlobalIdentity{LabelArray: lbls.LabelArray()}
+	key := cacheKey.NewGlobalIdentity(lbls)
 	idPrefix := kvstore.JoinKey(IdentitiesPath, "id")
 	keyPath := kvstore.JoinKey(idPrefix, id)
 	success, err := c.CreateOnly(ctx, keyPath, []byte(key.GetKey()), false)
@@ -530,7 +531,7 @@ func testLocalAllocation(t *testing.T, testConfig testConfig, client kvstore.Cli
 	require.True(t, id.ID.HasLocalScope())
 	// Wait for the update event from the KV-store
 	require.NotEqual(t, 0, owner.WaitUntilID(id.ID))
-	require.Equal(t, lbls1.LabelArray(), owner.GetIdentity(id.ID))
+	require.Equal(t, lbls1, owner.GetIdentity(id.ID))
 
 	// reuse the same identity
 	id, isNew, err = mgr.AllocateIdentity(context.Background(), lbls1, true, identity.InvalidIdentity)
@@ -547,7 +548,7 @@ func testLocalAllocation(t *testing.T, testConfig testConfig, client kvstore.Cli
 	require.False(t, released)
 
 	// Identity still exists
-	require.Equal(t, lbls1.LabelArray(), owner.GetIdentity(id.ID))
+	require.Equal(t, lbls1, owner.GetIdentity(id.ID))
 
 	// 2nd Release, released
 	released, err = mgr.Release(context.Background(), id, true)
@@ -713,7 +714,7 @@ func TestClusterIDValidator(t *testing.T) {
 	)
 
 	var (
-		validator = clusterIDValidator(cid)
+		validator = clusterIDValidator(cmtypes.ClusterInfo{ID: cid, MaxConnectedClusters: 255}, cid)
 		key       = &cacheKey.GlobalIdentity{}
 	)
 
@@ -746,9 +747,6 @@ func TestClusterNameValidator(t *testing.T) {
 	assert.EqualError(t, validator(allocator.AllocatorChangeUpsert, id, key), "unexpected cluster name: got bar, expected foo")
 
 	key = generator.PutKey("k8s:foo=bar;k8s:bar=baz;qux:io.cilium.k8s.policy.cluster=bar")
-	assert.EqualError(t, validator(allocator.AllocatorChangeUpsert, id, key), "unexpected source for cluster label: got qux, expected k8s")
-
-	key = generator.PutKey("k8s:foo=bar;k8s:bar=baz;qux:io.cilium.k8s.policy.cluster=bar;k8s:io.cilium.k8s.policy.cluster=bar")
 	assert.EqualError(t, validator(allocator.AllocatorChangeUpsert, id, key), "unexpected source for cluster label: got qux, expected k8s")
 
 	assert.EqualError(t, validator(allocator.AllocatorChangeUpsert, id, nil), "unsupported key type <nil>")

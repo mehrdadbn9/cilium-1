@@ -76,7 +76,7 @@ jobs:
     runs-on: ${{ vars.UBUNTU_2404_AMD64_4CPU_16GB }}
     steps:
       - name: Set initial commit status
-        uses: cilium/actions/set-commit-status@fe0702f5df0d8e44d48f1baa226c023b73ff6b5e # main
+        uses: cilium/actions/set-commit-status@687b48a0547e534dd7270d5069a5ab7967c0e907 # main
         with:
           sha: ${{ inputs.SHA || github.sha }}
 
@@ -94,7 +94,7 @@ jobs:
     timeout-minutes: 45
     steps:
       - name: Set commit status to pending
-        uses: cilium/actions/set-commit-status@fe0702f5df0d8e44d48f1baa226c023b73ff6b5e # main
+        uses: cilium/actions/set-commit-status@687b48a0547e534dd7270d5069a5ab7967c0e907 # main
         with:
           sha: ${{ inputs.SHA || github.sha }}
 
@@ -102,6 +102,11 @@ jobs:
         uses: cilium/workflow-telemetry-action@b1a318f80a08acede58027afe1455d037379966f # v2.2.0
         with:
           comment_on_pr: false
+
+      - name: Install Dependencies
+        shell: bash
+        run: |
+          sudo apt update && sudo apt install -y --no-install-recommends build-essential make libtinfo6
 
       - name: Checkout context ref (trusted)
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -125,6 +130,11 @@ jobs:
           fi
           echo sha=${SHA} >> $GITHUB_OUTPUT
 
+      - name: Install LLVM and Clang
+        uses: ./.github/actions/install-llvm
+        with:
+          version: "21.1.8"
+
       # Warning: since this is a privileged workflow, subsequent workflow job
       # steps must take care not to execute untrusted code.
       - name: Checkout pull request branch (NOT TRUSTED)
@@ -140,7 +150,7 @@ jobs:
         with:
           cache: false
           # renovate: datasource=golang-version depName=go
-          go-version: 1.26.5
+          go-version: 1.27.1
 
       # Load Golang cache build from GitHub
       - name: Load Golang cache build from GitHub
@@ -183,6 +193,7 @@ jobs:
         run: |
           export V=0
           export DOCKER_BUILD_FLAGS=--quiet
+          export CFLAGS="-Werror"
           make integration-tests LOG_CODEOWNERS=1 JUNIT_PATH="test/${{ env.job_name }}.xml"
 
       - name: Fetch JUnits
@@ -228,6 +239,7 @@ jobs:
           name: cilium-junits
           pattern: cilium-junits-*
           token: ${{ secrets.GITHUB_TOKEN }}
+          separate-directories: true
 
   commit-status-final:
     if: ${{ always() }}
@@ -236,7 +248,7 @@ jobs:
     runs-on: ${{ vars.UBUNTU_2404_AMD64_4CPU_16GB }}
     steps:
       - name: Set final commit status
-        uses: cilium/actions/set-commit-status@fe0702f5df0d8e44d48f1baa226c023b73ff6b5e # main
+        uses: cilium/actions/set-commit-status@687b48a0547e534dd7270d5069a5ab7967c0e907 # main
         with:
           sha: ${{ inputs.SHA || github.sha }}
           status: ${{ needs.integration-test.result }}

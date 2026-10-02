@@ -97,20 +97,8 @@
     },
     "authentication": {
       "properties": {
-        "enabled": {
-          "type": "boolean"
-        },
-        "gcInterval": {
-          "type": "string"
-        },
         "mutual": {
           "properties": {
-            "connectTimeout": {
-              "type": "string"
-            },
-            "port": {
-              "type": "integer"
-            },
             "spire": {
               "properties": {
                 "adminSocketPath": {
@@ -441,12 +429,6 @@
             }
           },
           "type": "object"
-        },
-        "queueSize": {
-          "type": "integer"
-        },
-        "rotatedIdentitiesQueueSize": {
-          "type": "integer"
         }
       },
       "type": "object"
@@ -535,12 +517,6 @@
     },
     "bpf": {
       "properties": {
-        "authMapMax": {
-          "type": [
-            "null",
-            "integer"
-          ]
-        },
         "autoMount": {
           "properties": {
             "enabled": {
@@ -722,6 +698,14 @@
         },
         "root": {
           "type": "string"
+        },
+        "stats": {
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            }
+          },
+          "type": "object"
         },
         "tproxy": {
           "type": [
@@ -1072,9 +1056,6 @@
             },
             "kvstoremesh": {
               "properties": {
-                "enabled": {
-                  "type": "boolean"
-                },
                 "etcdQPS": {
                   "type": "integer"
                 },
@@ -1149,6 +1130,9 @@
                     },
                     "port": {
                       "type": "integer"
+                    },
+                    "portName": {
+                      "type": "string"
                     }
                   },
                   "type": "object"
@@ -1160,12 +1144,18 @@
                     },
                     "port": {
                       "type": "integer"
+                    },
+                    "portName": {
+                      "type": "string"
                     }
                   },
                   "type": "object"
                 },
                 "port": {
                   "type": "integer"
+                },
+                "portName": {
+                  "type": "string"
                 },
                 "serviceMonitor": {
                   "properties": {
@@ -1911,7 +1901,10 @@
       "type": "boolean"
     },
     "enableIPv6Masquerade": {
-      "type": "boolean"
+      "type": [
+        "null",
+        "boolean"
+      ]
     },
     "enableInternalTrafficPolicy": {
       "type": "boolean"
@@ -2204,7 +2197,7 @@
       "type": "boolean"
     },
     "endpointPolicyUpdateTimeoutDuration": {
-      "type": "null"
+      "type": "string"
     },
     "endpointRoutes": {
       "properties": {
@@ -2502,8 +2495,14 @@
         "httpRetryCount": {
           "type": "integer"
         },
+        "httpRetryTimeout": {
+          "type": "integer"
+        },
         "httpUpstreamLingerTimeout": {
-          "type": "null"
+          "type": [
+            "null",
+            "integer"
+          ]
         },
         "idleTimeoutDurationSeconds": {
           "type": "integer"
@@ -2676,6 +2675,9 @@
               "type": "boolean"
             },
             "port": {
+              "type": "string"
+            },
+            "portName": {
               "type": "string"
             },
             "serviceMonitor": {
@@ -3085,9 +3087,6 @@
                 "anyOf": [
                   {
                     "type": "string"
-                  },
-                  {
-                    "type": "string"
                   }
                 ]
               },
@@ -3275,6 +3274,9 @@
             },
             "port": {
               "type": "integer"
+            },
+            "portName": {
+              "type": "string"
             },
             "serviceAnnotations": {
               "type": "object"
@@ -3660,6 +3662,9 @@
                 },
                 "port": {
                   "type": "integer"
+                },
+                "portName": {
+                  "type": "string"
                 },
                 "serviceMonitor": {
                   "properties": {
@@ -4989,6 +4994,9 @@
         },
         "enableHealthCheckLoadBalancerIP": {
           "type": "boolean"
+        },
+        "extendedNATPortRange": {
+          "type": "string"
         }
       },
       "type": "object"
@@ -5446,6 +5454,9 @@
             },
             "port": {
               "type": "integer"
+            },
+            "portName": {
+              "type": "string"
             },
             "serviceMonitor": {
               "properties": {
@@ -5982,6 +5993,9 @@
         },
         "port": {
           "type": "integer"
+        },
+        "portName": {
+          "type": "string"
         },
         "serviceMonitor": {
           "properties": {

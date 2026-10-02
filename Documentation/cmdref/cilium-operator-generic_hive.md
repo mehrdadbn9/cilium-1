@@ -12,6 +12,9 @@ cilium-operator-generic hive [flags]
 
 ```
       --auto-create-cilium-pod-ip-pools stringToString             Automatically create CiliumPodIPPool resources on startup. Specify pools in the form of <pool>=ipv4-cidrs:<cidr>,[<cidr>...];ipv4-mask-size:<size>[;allow-first-ip:<bool>][;allow-last-ip:<bool>] (multiple pools can also be passed by repeating the CLI flag) (default [])
+      --bgp-router-id-allocation-ip-pool string                    IP pool to allocate the BGP router-id from when the mode is 'ip-pool'
+      --bgp-router-id-allocation-mode string                       BGP router-id allocation mode. Currently supported values: 'default' or 'ip-pool' (default "default")
+      --bgp-secrets-namespace string                               Kubernetes namespace to get BGP control plane secrets from
       --ces-max-ciliumendpoints-per-ces int                        Maximum number of CiliumEndpoints allowed in a CES (default 100)
       --ces-rate-limits string                                     Configure rate limits for the CES controller. Accepts a list of rate limit configurations, must be a JSON formatted string. (default "[{\"nodes\":0,\"limit\":10,\"burst\":20}]")
       --cilium-endpoint-gc-interval duration                       GC interval for cilium endpoints (default 5m0s)
@@ -36,6 +39,9 @@ cilium-operator-generic hive [flags]
       --controller-group-metrics strings                           List of controller group names for which to enable metrics. Accepts 'all' and 'none'. The set of controller group names available is not guaranteed to be stable between Cilium versions.
       --default-lb-service-ipam string                             Indicates the default LoadBalancer Service IPAM when no LoadBalancer class is set.Applicable values: lbipam, nodeipam, none (default "lbipam")
       --double-write-metric-reporter-interval duration             Refresh interval for the Double Write Metric Reporter (default 1m0s)
+      --enable-bgp-control-plane                                   Enable the BGP control plane
+      --enable-bgp-control-plane-status-report                     Enable the BGP control plane status reporting (default true)
+      --enable-bgp-legacy-origin-attribute                         Enable LoadBalancerIP routes to be advertised with BGP Origin Attribute set to INCOMPLETE
       --enable-cilium-operator-server-access strings               List of cilium operator APIs which are administratively enabled. Supports '*'. (default [*])
       --enable-cluster-pool-to-multi-pool-migration                Enable the migration of all nodes from cluster-pool IPAM to multi-pool IPAM
       --enable-gateway-api-alpn                                    Enables exposing ALPN with HTTP2 and HTTP/1.1 support for Gateway API
@@ -51,6 +57,7 @@ cilium-operator-generic hive [flags]
       --enable-k8s-api-discovery                                   Enable discovery of Kubernetes API groups and resources with the discovery API
       --enable-lb-ipam                                             Enable LB IPAM (default true)
       --enable-metrics                                             Enable Prometheus metrics
+      --enable-network-driver                                      enable network driver to assign interfaces via Dynamic Resource Allocation
       --enable-node-ipam                                           Enable Node IPAM
       --enable-policy-secrets-sync                                 Enables fan-in TLS secrets sync from multiple namespaces to singular namespace (specified by policy-secrets-namespace flag)
       --enable-wireguard                                           Enable WireGuard
@@ -64,6 +71,8 @@ cilium-operator-generic hive [flags]
       --gateway-api-xff-num-trusted-hops uint32                    The number of additional GatewayAPI proxy hops from the right side of the HTTP header to trust when determining the origin client's IP address.
       --gops-port uint16                                           Port for gops server to listen on (default 9891)
   -h, --help                                                       help for hive
+      --http-retry-count uint                                      Number of retries performed after a forwarded request attempt fails (default 3)
+      --http-retry-timeout uint                                    Time after which a forwarded but uncompleted request is retried (connection failures are retried immediately); defaults to 0 (never)
       --identity-gc-interval duration                              GC interval for security identities (default 15m0s)
       --identity-gc-rate-interval duration                         Interval used for rate limiting the GC of security identities (default 1m0s)
       --identity-gc-rate-limit int                                 Maximum number of security identities that will be deleted within the identity-gc-rate-interval (default 2500)
@@ -131,6 +140,7 @@ cilium-operator-generic hive [flags]
       --policy-external-group-sync-interval duration               Period between refreshing the CIDRs for a given policy external group. (default 10m0s)
       --policy-secrets-namespace string                            Namespace where secrets used in TLS Interception will be synced to. (default "cilium-secrets")
       --proxy-idle-timeout-seconds int                             Set Envoy upstream HTTP idle connection timeout in seconds. Does not apply to connections with pending requests. (default 60)
+      --proxy-max-requests-per-connection int                      Set Envoy HTTP option max_requests_per_connection. Default 0 (disable)
       --proxy-stream-idle-timeout-seconds int                      Set Envoy HTTP stream idle timeout in seconds. A stream is considered idle when there is no upstream or downstream activity. (default 300)
       --remove-cilium-node-taints                                  Remove node taint "node.cilium.io/agent-not-ready" from Kubernetes nodes once Cilium is up and running (default true)
       --set-cilium-is-up-condition                                 Set CiliumIsUp Node condition to mark a Kubernetes Node that a Cilium pod is up and running in that node (default true)

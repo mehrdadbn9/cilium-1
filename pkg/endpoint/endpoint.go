@@ -117,6 +117,20 @@ const (
 // compile time interface check
 var _ notifications.RegenNotificationInfo = (*Endpoint)(nil)
 
+// endpointPolicyNames holds the immutable policy names derived from an
+// endpoint's addresses. Valid names are packed at the beginning of the array.
+type endpointPolicyNames [2]string
+
+func (names *endpointPolicyNames) slice() []string {
+	if names[1] != "" {
+		return names[:2:2]
+	}
+	if names[0] != "" {
+		return names[:1:1]
+	}
+	return nil
+}
+
 // Endpoint represents a container or similar which can be individually
 // addresses on L3 with its own IP addresses. This structured is managed by the
 // endpoint manager in pkg/endpointmanager.
@@ -216,6 +230,11 @@ type Endpoint struct {
 	// IPv4 is the IPv4 address of the endpoint.
 	// Constant after endpoint creation / restoration.
 	IPv4 netip.Addr
+
+	// policyNames caches the string forms of the endpoint addresses. The
+	// addresses are immutable once endpoint creation or restoration completes,
+	// so generated proxy policies may safely share this immutable storage.
+	policyNames atomic.Pointer[endpointPolicyNames]
 
 	// IPv4IPAMPool is the IPAM address pool from which the IPv4 address has been allocated from.
 	// Constant after endpoint creation / restoration.
@@ -400,10 +419,9 @@ type Endpoint struct {
 	// skipped regeneration levels.
 	skippedRegenerationLevel regeneration.DatapathRegenerationLevel
 
-	// skippedPolicyRevision is the highest PolicyRevisionToWaitFor from a regeneration
-	// event that was skipped because the endpoint was already in StateWaitingToRegenerate.
-	// The queued regeneration is bumped to wait for this revision so it doesn't complete
-	// at an older one.
+	// skippedPolicyRevision is the highest PolicyRevisionToWaitFor deferred to an already
+	// queued or upcoming regeneration. The regeneration is bumped to wait for this revision
+	// so it doesn't complete at an older one.
 	skippedPolicyRevision uint64
 
 	// DatapathConfiguration is the endpoint's datapath configuration as
@@ -439,17 +457,28 @@ type Endpoint struct {
 	ctMapGC ctmap.GCRunner
 }
 
-// GetPolicyNames returns the policy names for this endpoint.
+// GetPolicyNames returns the immutable policy names for this endpoint.
 // For Endpoint, the policy names are the IP addresses of the endpoint.
+// Callers must not modify the returned slice.
 func (e *Endpoint) GetPolicyNames() []string {
-	var ips []string
+	if names := e.policyNames.Load(); names != nil {
+		return names.slice()
+	}
+
+	names := &endpointPolicyNames{}
+	n := 0
 	if ipv6 := e.GetIPv6Address(); ipv6 != "" {
-		ips = append(ips, ipv6)
+		names[n] = ipv6
+		n++
 	}
 	if ipv4 := e.GetIPv4Address(); ipv4 != "" {
-		ips = append(ips, ipv4)
+		names[n] = ipv4
 	}
-	return ips
+
+	if e.policyNames.CompareAndSwap(nil, names) {
+		return names.slice()
+	}
+	return e.policyNames.Load().slice()
 }
 
 func (e *Endpoint) GetReporter(name string) cell.Health {
@@ -710,10 +739,15 @@ func CreateHostEndpoint(p EndpointParams,
 		return nil, err
 	}
 
+	hostMAC, err := mac.FromHardwareAddr(iface.Attrs().HardwareAddr)
+	if err != nil {
+		return nil, fmt.Errorf("invalid MAC address for %s: %w", defaults.HostDevice, err)
+	}
+
 	ep := createEndpoint(p, dnsRulesAPI, proxy, 0, defaults.HostDevice, policyDebugLog)
 	ep.isHost = true
-	ep.mac = mac.MAC(iface.Attrs().HardwareAddr)
-	ep.nodeMAC = mac.MAC(iface.Attrs().HardwareAddr)
+	ep.mac = hostMAC
+	ep.nodeMAC = hostMAC
 	ep.ifIndex = iface.Attrs().Index
 	ep.DatapathConfiguration = NewDatapathConfiguration()
 
@@ -919,7 +953,8 @@ func FilterEPDir(dirFiles []os.DirEntry) []string {
 // caller must call `SetIdentity()` to make the returned endpoint's identity useful.
 func ParseEndpoint(p EndpointParams,
 	dnsRulesAPI DNSRulesAPI,
-	proxy EndpointProxy, epJSON []byte) (*Endpoint, error) {
+	proxy EndpointProxy, epJSON []byte,
+	policyDebugLog io.Writer) (*Endpoint, error) {
 	ep := Endpoint{
 		dnsRulesAPI:      dnsRulesAPI,
 		epBuildQueue:     p.EPBuildQueue,
@@ -937,10 +972,12 @@ func ParseEndpoint(p EndpointParams,
 		policyMapFactory: p.PolicyMapFactory,
 		policyRepo:       p.PolicyRepo,
 		policyFetcher:    p.PolicyFetcher,
+		ipcache:          p.IPCache,
 		proxy:            proxy,
 		allocator:        p.Allocator,
 		ctMapGC:          p.CTMapGC,
 		kvstoreSyncher:   p.KVStoreSynchronizer,
+		policyDebugLog:   policyDebugLog,
 	}
 
 	if err := ep.UnmarshalJSON(epJSON); err != nil {
@@ -1320,9 +1357,7 @@ func (e *Endpoint) leaveLocked(conf DeleteConfig) []error {
 	e.controllers.RemoveAll()
 	e.cleanPolicySignals()
 
-	if !e.isPropertyLocked(endpoint.PropertyFakeEndpoint) {
-		e.scrubIPsInConntrackTableLocked()
-	}
+	e.scrubIPsInConntrackTableLocked()
 
 	e.setState(StateDisconnected, "Endpoint removed")
 
@@ -1341,12 +1376,16 @@ func (e *Endpoint) GetK8sNamespace() string {
 	return ns
 }
 
-// GetK8sUID returns the UID of the pod if the endpoint represents a Kubernetes
-// pod.
-func (e *Endpoint) GetK8sUID() string {
-	// const after creation
-	uid := e.K8sUID
-	return uid
+// GetK8sPodUID returns the UID of the Pod represented by the endpoint.
+func (e *Endpoint) GetK8sPodUID() string {
+	// K8sUID is immutable and identifies the Pod generation supplied by CNI.
+	if e.K8sUID != "" {
+		return e.K8sUID
+	}
+	if pod := e.GetPod(); pod != nil {
+		return string(pod.UID)
+	}
+	return ""
 }
 
 // SetPod sets the pod related to this endpoint.
@@ -1758,7 +1797,7 @@ func (e *Endpoint) APICanModifyConfig(n models.ConfigurationMap) error {
 			if config != option.Debug && config != option.DebugLB &&
 				config != option.TraceNotify && config != option.PolicyVerdictNotify &&
 				config != option.PolicyAuditMode && config != option.MonitorAggregation &&
-				config != option.PolicyTracing {
+				config != option.PolicyTracing && config != option.DropNotify {
 				return fmt.Errorf("%s cannot be modified for endpoints with reserved labels", config)
 			}
 		}

@@ -11,6 +11,7 @@ import (
 
 	"github.com/hashicorp/go-hclog"
 
+	cmtypes "github.com/cilium/cilium/pkg/clustermesh/types"
 	"github.com/cilium/cilium/pkg/container/bitlpm"
 	"github.com/cilium/cilium/pkg/identity"
 	"github.com/cilium/cilium/pkg/labels"
@@ -31,8 +32,6 @@ type Keys = types.Keys
 type LPMKeys = types.LPMKeys
 type MapStateEntry = types.MapStateEntry
 type MapStateMap = types.MapStateMap
-
-const NoAuthRequirement = types.NoAuthRequirement
 
 type mapStateMap map[Key]mapStateEntry
 
@@ -87,7 +86,8 @@ var (
 // greatly enhances the usefuleness of the Trie and improves lookup,
 // deletion, and insertion times.
 type mapState struct {
-	logger *slog.Logger
+	logger      *slog.Logger
+	clusterInfo cmtypes.ClusterInfo
 	// entries is the map containing the MapStateEntries
 	entries mapStateMap
 	// trie is a Trie that indexes policy Keys without their identity
@@ -195,7 +195,7 @@ func (ms *mapState) forKey(k Key, f func(Key, mapStateEntry) bool) bool {
 // forCoveredIDs calls 'f' for each covered non-aggregate ID in 'idSet' with port/proto from 'k'.
 func (ms *mapState) forCoveredIDs(agg identity.NumericIdentity, k Key, idSet IDSet, f func(Key, mapStateEntry) bool) bool {
 	for id := range idSet {
-		if aggregates(agg, id) {
+		if aggregates(agg, id, ms.clusterInfo) {
 			k.Identity = id
 			if !ms.forKey(k, f) {
 				return false
@@ -220,7 +220,7 @@ func (ms *mapState) forID(k Key, idSet IDSet, f func(Key, mapStateEntry) bool) b
 //
 // All yielded keys will have either the specified ID or the aggregate ID.
 func (ms *mapState) CoveringBroaderOrEqualKeys(key Key) iter.Seq2[Key, mapStateEntry] {
-	agg := aggregateFor(key.Identity)
+	agg := aggregateFor(key.Identity, ms.clusterInfo)
 	return func(yield func(Key, mapStateEntry) bool) {
 		iter := ms.trie.AncestorIterator(key.PrefixLength(), key.LPMKey)
 		for ok, lpmKey, idSet := iter.Next(); ok; ok, lpmKey, idSet = iter.Next() {
@@ -249,7 +249,7 @@ func (ms *mapState) CoveringBroaderOrEqualKeys(key Key) iter.Seq2[Key, mapStateE
 // The difference is when the aggregate key is supplied - this yields *all* keys
 // with shorter-or-equal prefix length.
 func (ms *mapState) BroaderOrEqualKeys(key Key) iter.Seq2[Key, mapStateEntry] {
-	agg := aggregateFor(key.Identity)
+	agg := aggregateFor(key.Identity, ms.clusterInfo)
 	return func(yield func(Key, mapStateEntry) bool) {
 		iter := ms.trie.AncestorIterator(key.PrefixLength(), key.LPMKey)
 		for ok, lpmKey, idSet := iter.Next(); ok; ok, lpmKey, idSet = iter.Next() {
@@ -284,7 +284,7 @@ func (ms *mapState) BroaderOrEqualKeys(key Key) iter.Seq2[Key, mapStateEntry] {
 // If a non-aggregate key is supplied, all keys yielded will have that identity.
 // If an aggregate key is supplied, all longer-prefix keys will be yielded.
 func (ms *mapState) CoveredNarrowerOrEqualKeys(key Key) iter.Seq2[Key, mapStateEntry] {
-	agg := aggregateFor(key.Identity)
+	agg := aggregateFor(key.Identity, ms.clusterInfo)
 	return func(yield func(Key, mapStateEntry) bool) {
 		iter := ms.trie.DescendantIterator(key.PrefixLength(), key.LPMKey)
 		for ok, lpmKey, idSet := iter.Next(); ok; ok, lpmKey, idSet = iter.Next() {
@@ -318,7 +318,7 @@ func (ms *mapState) CoveredNarrowerOrEqualKeys(key Key) iter.Seq2[Key, mapStateE
 //
 // If a aggregate key is supplied, this will yield all longer-prefix keys.
 func (ms *mapState) NarrowerOrEqualKeys(key Key) iter.Seq2[Key, mapStateEntry] {
-	wc := aggregateFor(key.Identity)
+	wc := aggregateFor(key.Identity, ms.clusterInfo)
 	return func(yield func(Key, mapStateEntry) bool) {
 		iter := ms.trie.DescendantIterator(key.PrefixLength(), key.LPMKey)
 		for ok, lpmKey, idSet := iter.Next(); ok; ok, lpmKey, idSet = iter.Next() {
@@ -381,7 +381,7 @@ func (ms *mapState) SubsetKeysWithSameID(key Key) iter.Seq2[Key, mapStateEntry] 
 // LPMAncestors iterates over broader or equal port/proto entries in the trie in LPM order,
 // with most specific match with the same ID as in 'key' being returned first.
 func (ms *mapState) LPMAncestors(key Key) iter.Seq2[Key, mapStateEntry] {
-	agg := aggregateFor(key.Identity)
+	agg := aggregateFor(key.Identity, ms.clusterInfo)
 	return func(yield func(Key, mapStateEntry) bool) {
 		iter := ms.trie.AncestorLongestPrefixFirstIterator(key.PrefixLength(), key.LPMKey)
 		for ok, lpmKey, idSet := iter.Next(); ok; ok, lpmKey, idSet = iter.Next() {
@@ -417,7 +417,7 @@ func (ms *mapState) lookup(key Key) (mapStateEntry, bool) {
 	}
 
 	// The aggregate identity to retrieve
-	agg := aggregateFor(key.Identity)
+	agg := aggregateFor(key.Identity, ms.clusterInfo)
 
 	// two entries: aggregate and specific.
 	// Must retrieve both.
@@ -442,18 +442,6 @@ func (ms *mapState) lookup(key Key) (mapStateEntry, bool) {
 		}
 	}
 
-	authOverride := func(entry, other mapStateEntry) mapStateEntry {
-		// This logic needs to be the same as in authPreferredInsert() where the newEntry's
-		// auth type may be overridden by a covering key.
-		// This also needs to reflect the logic in bpf/lib/policy.h __account_and_check().
-		if !entry.AuthRequirement.IsExplicit() &&
-			other.AuthRequirement.AuthType() > entry.AuthRequirement.AuthType() &&
-			other.Precedence.AllowPrecedence() >= entry.Precedence.AllowPrecedence() {
-			entry.AuthRequirement = other.AuthRequirement.AsDerived()
-		}
-		return entry
-	}
-
 	// only one entry found
 	if haveID != haveAgg {
 		if haveID {
@@ -465,19 +453,21 @@ func (ms *mapState) lookup(key Key) (mapStateEntry, bool) {
 	// both specific and aggregate matches found
 	if haveID && haveAgg {
 		// Precedence rules of the bpf datapath between two policy entries:
-		// 1. higher precedence level entry wins, but auth may need to be propagated.
-		// 2. if Deny at same precedence level, no further processing is needed
-		// 3. if both entries are allows at the same precedence level, the one with more
-		//    specific L4 is selected
-		// 4. If the two allows on the same precedence level have equal port/proto, then
+		// 1. specific-id-entry with the highest possible precedence (a priority 0 deny) wins
+		//    without looking at the aggregate entry.
+		// 2. higher precedence level entry wins.
+		// 3. if both entries are on the same precedence level (then both are denies or both
+		//    are allows), the one with more specific L4 is selected
+		// 4. If the two entries on the same precedence level have equal port/proto, then
 		//    the policy for a specific L3 is selected (rather than the L4-only entry)
-		//
-		// If the selected entry has non-explicit auth type, it gets the auth type from the
-		// other entry, if the other entry's auth type is numerically higher.
 
-		// 1. Entry with higher precedence level is selected.
-		//    Auth requirement does not propagate from a lower precedence rule to a
-		//    higher precedence rule!
+		// 1. The datapath does not look up the aggregate entry at all if the
+		// specific-id-entry has the highest possible precedence.
+		if idEntry.Precedence == types.MaxPrecedence {
+			return idEntry, true
+		}
+
+		// 2. Entry with higher precedence level is selected.
 		if idEntry.Precedence > aggEntry.Precedence {
 			return idEntry, true
 		}
@@ -485,19 +475,13 @@ func (ms *mapState) lookup(key Key) (mapStateEntry, bool) {
 			return aggEntry, true
 		}
 
-		// 2. Entries at the same precedence,
-		// Check for the specific deny first to match the datapath behavior
-		if idEntry.IsDeny() {
-			return idEntry, true
-		}
-
-		// 3. Two allow entries, select the one with more specific L4
+		// 3. Two entries at the same precedence, select the one with more specific L4
 		// specific-id-entry must be selected if prefix lengths are the same!
-		if idKey.PrefixLength() > aggKey.PrefixLength() {
-			return authOverride(aggEntry, idEntry), true
+		if aggKey.PrefixLength() > idKey.PrefixLength() {
+			return aggEntry, true
 		}
-		// 4. Two allow entries are equally specific port/proto or L3-entry is more specific
-		return authOverride(idEntry, aggEntry), true
+		// 4. Two entries are equally specific port/proto or specific-id-entry is more specific
+		return idEntry, true
 	}
 
 	// Deny by default if no matches are found
@@ -673,13 +657,12 @@ func newMapStateEntry(
 	proxyPort uint16,
 	listenerPriority ListenerPriority,
 	verdict types.Verdict,
-	authReq AuthRequirement,
 ) mapStateEntry {
 	if verdict == types.Pass {
 		return PassEntry(priority, tierPriority, nextTierPriority, derivedFrom)
 	}
 	return mapStateEntry{
-		MapStateEntry:    types.NewMapStateEntry(priority, verdict == types.Deny, proxyPort, listenerPriority, authReq),
+		MapStateEntry:    types.NewMapStateEntry(priority, verdict == types.Deny, proxyPort, listenerPriority),
 		derivedFromRules: derivedFrom,
 	}
 }
@@ -693,7 +676,7 @@ func makeInvalidEntry() mapStateEntry {
 // newAllowEntryWithLabels creates an allow entry with the specified labels.
 // Used for adding allow-all entries when policy enforcement is not wanted.
 func newAllowEntryWithLabels(lbls labels.LabelArray) mapStateEntry {
-	return newMapStateEntry(0, types.HighestPriority, types.LowestPriority, makeSingleRuleOrigin(lbls, ""), 0, 0, types.Allow, NoAuthRequirement)
+	return newMapStateEntry(0, types.HighestPriority, types.LowestPriority, makeSingleRuleOrigin(lbls, ""), 0, 0, types.Allow)
 }
 
 func NewMapStateEntry(e MapStateEntry) mapStateEntry {
@@ -703,34 +686,51 @@ func NewMapStateEntry(e MapStateEntry) mapStateEntry {
 	}
 }
 
-func emptyMapState(logger *slog.Logger) mapState {
-	return newMapState(logger, nil, 0)
+// MapStateSizes are the map sizes of a mapState, taken as a value snapshot so that a new mapState
+// can be sized after an existing one without keeping a reference to it. Such a reference would be
+// read without synchronization against the incremental updates applied to the referenced mapState.
+type MapStateSizes struct {
+	// entries is the number of entries.
+	entries int
+	// byId is the number of keys of each identity in the id index. It is only populated when
+	// the id index is in use; consumers must not distinguish nil from empty.
+	byId map[identity.NumericIdentity]int
 }
 
-// newMapState returns a new mapState with capacities from the given old mapState (if non-nil),
-// according to the given policy features.
-func newMapState(logger *slog.Logger, old *mapState, features policyFeatures) mapState {
-	var nEntries int
-
-	if old != nil {
-		nEntries = len(old.entries)
+// Sizes returns the map sizes of 'ms'. The caller must synchronize against any concurrent
+// modification of 'ms'.
+func (ms *mapState) Sizes() MapStateSizes {
+	if ms == nil {
+		return MapStateSizes{}
 	}
 
+	sizes := MapStateSizes{
+		entries: ms.Len(),
+	}
+	if ms.byId != nil {
+		sizes.byId = make(map[identity.NumericIdentity]int, len(ms.byId))
+		for id, keys := range ms.byId {
+			sizes.byId[id] = len(keys)
+		}
+	}
+	return sizes
+}
+
+// newMapState returns a new mapState with capacities from the given map sizes, according to the
+// given policy features.
+func newMapState(logger *slog.Logger, sizes MapStateSizes, features policyFeatures, clusterInfo cmtypes.ClusterInfo) mapState {
 	ms := mapState{
-		logger:  logger,
-		entries: make(mapStateMap, nEntries),
-		trie:    bitlpm.NewTrie[types.LPMKey, IDSet](types.MapStatePrefixLen),
+		logger:      logger,
+		clusterInfo: clusterInfo,
+		entries:     make(mapStateMap, sizes.entries),
+		trie:        bitlpm.NewTrie[types.LPMKey, IDSet](types.MapStatePrefixLen),
 	}
 
 	if features&(passRules|namedPortRules) != 0 {
-		if old == nil {
-			ms.byId = make(map[identity.NumericIdentity]LPMKeys)
-		} else {
-			ms.byId = make(map[identity.NumericIdentity]LPMKeys, len(old.byId))
-			// preallocate id index keysets to their current sizes, if any
-			for k, v := range old.byId {
-				ms.byId[k] = make(LPMKeys, len(v))
-			}
+		ms.byId = make(map[identity.NumericIdentity]LPMKeys, len(sizes.byId))
+		// preallocate id index keysets to their previous sizes, if any
+		for id, n := range sizes.byId {
+			ms.byId[id] = make(LPMKeys, n)
 		}
 	}
 	return ms
@@ -1041,7 +1041,7 @@ func (ms *mapState) pruneCoveredNarrowerKey(k Key, v mapStateEntry, key Key, ent
 
 	// If k is a direct child of key, and k's entry is equivalent to key,
 	// then delete k as it is redundant.
-	deleteEntry = deleteEntry || (key.LPMKey == k.LPMKey && aggregates(key.Identity, k.Identity) && v.equivalent(entry))
+	deleteEntry = deleteEntry || (key.LPMKey == k.LPMKey && aggregates(key.Identity, k.Identity, ms.clusterInfo) && v.equivalent(entry))
 
 	// Delete whole entry?
 	if deletePassMeta && deleteEntry {
@@ -1079,9 +1079,9 @@ func (sp *keySlice) addNewKeys(l34Keys, doneKeys *Keys) {
 
 // collectNarrowerPasses adds the narrower key 'k' (with identity from 'key' if narrower) to 'm' if
 // 'v' has a higher precedence pass.
-func (sp *keySlice) collectNarrowerPasses(tierMaxPrecedence types.Precedence, k Key, v mapStateEntry, key Key, doneKeys *Keys) {
+func (sp *keySlice) collectNarrowerPasses(tierMaxPrecedence types.Precedence, k Key, v mapStateEntry, key Key, doneKeys *Keys, clusterInfo cmtypes.ClusterInfo) {
 	// k has narrower L4, but the narrower identity may be on 'key'
-	if k.Identity == aggregateFor(key.Identity) {
+	if k.Identity == aggregateFor(key.Identity, clusterInfo) {
 		k.Identity = key.Identity
 	}
 	if k != key {
@@ -1214,7 +1214,7 @@ func (ms *mapState) insertWithPasses(tierMaxPrecedence types.Precedence, key Key
 	var l34Keys, doneKeys Keys
 	var bailPrecedence types.Precedence
 	var keys keySlice
-	aggregateID := aggregateFor(key.Identity)
+	aggregateID := aggregateFor(key.Identity, ms.clusterInfo)
 
 	// Find the covering pass and bail entries and pass if the found
 	// passPrecedence is higher than the bailPrecedence, else bail if found.
@@ -1280,7 +1280,7 @@ func (ms *mapState) insertWithPasses(tierMaxPrecedence types.Precedence, key Key
 		if !bail && isCoveringKey {
 			ms.pruneCoveredNarrowerKey(k, v, key, entry, entry.Precedence, changes)
 		}
-		keys.collectNarrowerPasses(tierMaxPrecedence, k, v, key, &doneKeys)
+		keys.collectNarrowerPasses(tierMaxPrecedence, k, v, key, &doneKeys, ms.clusterInfo)
 	}
 
 	// Pass to a higher tier?
@@ -1425,9 +1425,6 @@ func (ms *mapState) insertWithChanges(tierMaxPrecedence types.Precedence, newKey
 	}
 
 	if features.contains(passRules) {
-		if features.contains(authRules) {
-			ms.logger.Error("Pass rules are not supported with auth rules")
-		}
 		ms.insertWithPasses(tierMaxPrecedence, newKey, newEntry, changes)
 		return
 	}
@@ -1452,13 +1449,6 @@ func (ms *mapState) insertWithChanges(tierMaxPrecedence types.Precedence, newKey
 			}
 		}
 	} else {
-		// authPreferredInsert takes care for precedence and auth
-		if features.contains(authRules) {
-			ms.authPreferredInsert(newKey, newEntry, changes)
-			ms.pruneAggregated(newKey, newEntry, changes)
-			return
-		}
-
 		// No pruning of allow rules if all rules have the same precedence level.
 		if features.contains(precedenceFeatures) {
 			for _, v := range ms.CoveringBroaderOrEqualKeys(newKey) {
@@ -1486,7 +1476,7 @@ func (ms *mapState) insertWithChanges(tierMaxPrecedence types.Precedence, newKey
 // aggregateIsEquivalent returns true if an entry has an aggregate (wildcard)
 // on the same level. If so, inserting `newKey` can be skipped entirely.
 func (ms *mapState) aggregateIsEquivalent(newKey Key, newEntry mapStateEntry) bool {
-	agg := aggregateFor(newKey.Identity)
+	agg := aggregateFor(newKey.Identity, ms.clusterInfo)
 	// if newKey is already aggregate, then we can bail.
 	if agg == newKey.Identity {
 		return false
@@ -1509,7 +1499,7 @@ func (ms *mapState) aggregateIsEquivalent(newKey Key, newEntry mapStateEntry) bo
 // of another entry appearing between the aggregated and specific entry.
 func (ms *mapState) pruneAggregated(newKey Key, newEntry mapStateEntry, changes ChangeState) {
 	// newKey must be capable of aggregating.
-	if !isAggregate(newKey.Identity) {
+	if !isAggregate(newKey.Identity, ms.clusterInfo) {
 		return
 	}
 
@@ -1520,7 +1510,7 @@ func (ms *mapState) pruneAggregated(newKey Key, newEntry mapStateEntry, changes 
 	}
 
 	for id := range idSet {
-		if !aggregates(newKey.Identity, id) {
+		if !aggregates(newKey.Identity, id, ms.clusterInfo) {
 			// skip if this ID is not aggregated by newKey
 			continue
 		}
@@ -1534,113 +1524,6 @@ func (ms *mapState) pruneAggregated(newKey Key, newEntry mapStateEntry, changes 
 			ms.deleteExistingWithChanges(k, v, changes)
 		}
 	}
-}
-
-// overrideProxyPortForAuth sets the proxy port and priority of 'v' to that of 'newKey', saving the
-// old entry in 'changes'.
-// Returns 'true' if changes were made.
-func (ms *mapState) overrideProxyPortForAuth(newEntry mapStateEntry, k Key, v mapStateEntry, changes ChangeState) bool {
-	if v.AuthRequirement.IsExplicit() {
-		// Save the old value first
-		changes.insertOldIfNotExists(k, v)
-
-		// Proxy port can be changed in-place, trie is not affected
-		v.ProxyPort = newEntry.ProxyPort
-		v.Precedence = newEntry.Precedence
-
-		ms.entries[k] = v
-		return true
-	}
-	return false
-}
-
-// overrideAuthRequirement sets the AuthRequirement of 'v' to that of 'newKey', saving the old entry
-// in 'changes'.
-func (ms *mapState) overrideAuthRequirement(newEntry mapStateEntry, k Key, v mapStateEntry, changes ChangeState) {
-	if v.AuthRequirement.AuthType() != newEntry.AuthRequirement.AuthType() {
-		// Save the old value first
-		changes.insertOldIfNotExists(k, v)
-
-		// Auth type can be changed in-place, trie is not affected
-		// Only derived auth type is ever overridden, so the explicit flag is not copied
-		v.AuthRequirement = newEntry.AuthRequirement.AsDerived()
-		ms.entries[k] = v
-	}
-}
-
-// authPreferredInsert applies AuthRequirement of a more generic entry to more specific entries, if
-// not explicitly specified.
-//
-// This function is expected to be called for a map insertion after deny
-// entry evaluation. If there is a covering map key for 'newKey'
-// which denies traffic matching 'newKey', then this function should not be called.
-func (ms *mapState) authPreferredInsert(newKey Key, newEntry mapStateEntry, changes ChangeState) {
-	// Bail if covered by a key with a higher precedence and current
-	// entry has no explicit auth.
-	var derived bool
-	newEntryHasExplicitAuth := newEntry.AuthRequirement.IsExplicit()
-
-	for k, v := range ms.CoveringKeysWithSameID(newKey) {
-		if v.Precedence > newEntry.Precedence {
-			if v.IsDeny() || !newEntryHasExplicitAuth {
-				// Covering entry has higher precedence and newEntry has a default
-				// auth type => MUST bail out
-				return
-			}
-
-			// newEnry has (a different) explicit auth requirement, must propagate
-			// proxy port and precedence and keep it
-			newEntry.ProxyPort = v.ProxyPort
-			newEntry.Precedence = v.Precedence
-
-			// Can break out:
-			// - if there were covering denies the allow 'v' would
-			//   not have existed, and
-			// - since the new entry has explicit auth it does not need to be
-			//   derived.
-			break
-		}
-		// Fill in the AuthType from the most specific covering key with the same ID and an
-		// explicit auth type, ignoring any difference in proxy port precedence
-		if !derived && !newEntryHasExplicitAuth &&
-			!k.PortProtoIsEqual(newKey) &&
-			v.AuthRequirement.IsExplicit() &&
-			v.Precedence.AllowPrecedence() >= newEntry.Precedence.AllowPrecedence() {
-			// AuthType from the most specific covering key is applied to 'newEntry' as
-			// derived auth type.
-			newEntry.AuthRequirement = v.AuthRequirement.AsDerived()
-			derived = true
-		}
-	}
-
-	// Delete covered allow entries with lower precedence, but keep
-	// entries with different "auth" and propagate proxy port and priority to them.
-	//
-	// Check if the new key is the most specific covering key of any other key
-	// with the same ID and default auth type, and propagate the auth type from the new
-	// entry to such entries.
-	var propagated bool
-	for k, v := range ms.SubsetKeysWithSameID(newKey) {
-		if v.Precedence < newEntry.Precedence {
-			if !ms.overrideProxyPortForAuth(newEntry, k, v, changes) {
-				ms.deleteExistingWithChanges(k, v, changes)
-				continue
-			}
-		}
-		if !propagated && newEntryHasExplicitAuth && !k.PortProtoIsEqual(newKey) {
-			// New entry has an explicit auth type
-			if v.IsDeny() || v.AuthRequirement.IsExplicit() {
-				// Stop if a subset entry is deny or also has an explicit auth type, as
-				// that is the more specific covering key for all remaining subset
-				// keys
-				propagated = true
-				continue
-			}
-			ms.overrideAuthRequirement(newEntry, k, v, changes)
-		}
-	}
-
-	ms.addKeyWithChanges(newKey, newEntry, changes)
 }
 
 // insertIfNotExists only inserts an entry in 'changes.Old' if 'key' does not exist in there already

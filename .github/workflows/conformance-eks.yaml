@@ -116,9 +116,9 @@ env:
   test_concurrency: ${{ inputs.test-concurrency || 3 }}
   clusterNamePrefix: ${{ github.repository_owner }}-${{ github.event.repository.name }}-${{ github.run_id }}-${{ inputs.UID }}-${{ github.run_attempt }}
   # renovate: datasource=github-releases depName=eksctl-io/eksctl
-  eksctl_version: v0.229.0
+  eksctl_version: v0.230.0
   # renovate: datasource=github-releases depName=kubernetes/kubernetes
-  kubectl_version: v1.36.3
+  kubectl_version: v1.37.0
 
 jobs:
   echo-inputs:
@@ -135,7 +135,7 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - name: Set initial commit status
-        uses: cilium/actions/set-commit-status@fe0702f5df0d8e44d48f1baa226c023b73ff6b5e # main
+        uses: cilium/actions/set-commit-status@687b48a0547e534dd7270d5069a5ab7967c0e907 # main
         with:
           sha: ${{ inputs.SHA || github.sha }}
 
@@ -201,7 +201,7 @@ jobs:
           cat /tmp/matrix.json
 
       - name: Set up AWS CLI credentials
-        uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6.2.3
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         with:
           role-to-assume: ${{ secrets.AWS_PR_ASSUME_ROLE }}
           aws-region: us-west-1
@@ -286,7 +286,7 @@ jobs:
 
     steps:
       - name: Set commit status to pending
-        uses: cilium/actions/set-commit-status@fe0702f5df0d8e44d48f1baa226c023b73ff6b5e # main
+        uses: cilium/actions/set-commit-status@687b48a0547e534dd7270d5069a5ab7967c0e907 # main
         with:
           sha: ${{ inputs.SHA || github.sha }}
 
@@ -428,7 +428,7 @@ jobs:
           rm "eksctl_$(uname -s)_amd64.tar.gz"
 
       - name: Set up AWS CLI credentials
-        uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6.2.3
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         with:
           role-to-assume: ${{ secrets.AWS_PR_ASSUME_ROLE }}
           aws-region: ${{ matrix.region }}
@@ -461,7 +461,7 @@ jobs:
             --docker-password="${{ secrets.DOCKER_READ_PASSWORD }}"
 
       - name: Install Cilium CLI
-        uses: cilium/cilium-cli@7ca7fc53c20275f5c10ef5f3557076691fd1d720 # v0.19.7
+        uses: cilium/cilium-cli@c5e42236c7d90bd50e7975ac587f77782666a0aa # v0.20.0
         with:
           skip-build: ${{ env.CILIUM_CLI_SKIP_BUILD }}
           image-repo: ${{ env.CILIUM_CLI_IMAGE_REPO }}
@@ -572,6 +572,7 @@ jobs:
           external-target-ca-name: custom-ca
           external-target-fake-dns: true
           hubble: false
+          include-unsafe-tests: true
 
       - name: Set up job variables for connectivity tests
         id: vars-conn
@@ -582,7 +583,7 @@ jobs:
           # legs a node attaches several secondary ENIs and pod IPs spread over
           # them, which these tests do not cope with:
           #
-          #   north-south-loadbalancing-with-l7-policy: the outside-to-nodeport
+          #   north-south-loadbalancing-with-l7-ingress-policy: the outside-to-nodeport
           #     reply egresses a secondary ENI while carrying the primary ENI's
           #     source IP, so the VPC source/destination check drops it and the
           #     client times out (curl 28). Issue 47391.
@@ -596,7 +597,7 @@ jobs:
           # IPs on the primary ENI, so they run and gate on them as usual. To
           # quarantine another test add it to this list; to re-arm one, drop it.
           QUARANTINED_TESTS=(
-            north-south-loadbalancing-with-l7-policy
+            north-south-loadbalancing-with-l7-ingress-policy
             egress-gateway-excluded-cidrs
           )
 
@@ -631,7 +632,7 @@ jobs:
         run: |
           cilium connectivity test ${{ steps.vars-conn.outputs.connectivity_test_defaults }} \
           --test-concurrency=${{ env.test_concurrency }} \
-          --junit-file "cilium-junits/${{ env.job_name }} (${{ join(matrix.*, ', ') }}) - 1.xml" \
+          --junit-file "cilium-junits/${{ env.job_name }} (${{ join(matrix.*, ', ') }}, ${{ inputs.UID || 1 }}) - 1.xml" \
           --junit-property github_job_step="Run connectivity test (${{ join(matrix.*, ', ') }})"
 
       # Re-run the tests quarantined above (see the quarantine list in the job
@@ -652,7 +653,7 @@ jobs:
           # shellcheck disable=SC2086
           cilium connectivity test ${{ steps.e2e_config.outputs.test_flags }} ${TEST_FLAGS} \
           --test-concurrency=${{ env.test_concurrency }} \
-          --junit-file "cilium-junits/${{ env.job_name }} (${{ join(matrix.*, ', ') }}) - quarantined.xml" \
+          --junit-file "cilium-junits/${{ env.job_name }} (${{ join(matrix.*, ', ') }}, ${{ inputs.UID || 1 }}) - quarantined.xml" \
           --junit-property github_job_step="Run quarantined tests (${{ join(matrix.*, ', ') }})"
 
       - name: Warn on quarantined test failure (${{ join(matrix.*, ', ') }})
@@ -683,7 +684,7 @@ jobs:
         if: ${{ matrix.ipsec == true }}
         uses: ./.github/actions/conn-disrupt-test-check
         with:
-          job-name: ${{ env.job_name }}-${{ matrix.version }}-post-rotate
+          job-name: ${{ env.job_name }}-${{ matrix.version }}-${{ inputs.UID || 1 }}-post-rotate
           full-test: 'true'
           test-concurrency: ${{ env.test_concurrency }}
           extra-connectivity-test-flags: ${{ steps.vars-conn.outputs.connectivity_test_defaults }}

@@ -23,6 +23,7 @@ import (
 	"github.com/cilium/cilium/operator/pkg/ipam/metrics"
 	"github.com/cilium/cilium/operator/watchers"
 	"github.com/cilium/cilium/pkg/defaults"
+	iputil "github.com/cilium/cilium/pkg/ip"
 	ipamOption "github.com/cilium/cilium/pkg/ipam/option"
 	ipamTypes "github.com/cilium/cilium/pkg/ipam/types"
 	v2 "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2"
@@ -52,6 +53,10 @@ const (
 
 	fieldName = "name"
 )
+
+// errInstancesAPIUnstable is returned by MaintainIPPool while the instances
+// API is unstable, in which case pool maintenance is skipped entirely.
+var errInstancesAPIUnstable = errors.New("instances API is unstable, blocking mutating operations")
 
 func (n *Node) SetOpts(ops NodeOperations) {
 	n.ops = ops
@@ -96,6 +101,12 @@ type Node struct {
 	// instanceStoppedRunning records when an instance was most recently set to not running
 	instanceStoppedRunning time.Time
 
+	// instanceSyncRetriggered is true when the per-instance sync has been
+	// re-triggered because the instance was missing from the instance
+	// cache. It is reset by the next successful recalculation, or by a
+	// transient failure of the re-triggered sync.
+	instanceSyncRetriggered bool
+
 	// ipv4Alloc represents IPv4-specific allocation attributes for this node
 	ipv4Alloc ipAllocAttrs
 
@@ -132,10 +143,6 @@ type Node struct {
 
 	// ops is the IPAM implementation to use for this node
 	ops NodeOperations
-
-	// retry is the trigger used to retry pool maintenance while the
-	// instances API is unstable
-	retry *trigger.Trigger
 
 	// logLimiter rate limits potentially repeating warning logs
 	logLimiter logging.Limiter
@@ -228,7 +235,7 @@ type IPStatistics struct {
 	InterfaceCandidates int
 
 	// AssignedStaticIP is the static IP address assigned to the node (ex: public Elastic IP address in AWS)
-	AssignedStaticIP string
+	AssignedStaticIP netip.Addr
 }
 
 // IsRunning returns true if the node is considered to be running
@@ -321,28 +328,6 @@ func (n *Node) getStaticIPTags() ipamTypes.Tags {
 		return n.resource.Spec.IPAM.StaticIPTags
 	}
 	return ipamTypes.Tags{}
-}
-
-// staticIPNeedsResolution reports whether the recorded static IP needs to be
-// (re)resolved through the cloud provider. This is the case when no IP has been
-// assigned yet, or when the stored value is not a valid IP address.
-//
-// The latter handles a migration: earlier operator versions persisted the Azure
-// public IP prefix/address resource ID as a placeholder instead of the actual
-// address. Such legacy values fail to parse as an IP, so they are re-resolved
-// and overwritten with the real address on the next maintenance run. Providers
-// that already record an IP (e.g. AWS) parse cleanly and are left untouched.
-//
-// TODO: the non-IP (resource ID) branch only exists to migrate values persisted
-// by 1.19 azure operators and can be removed in 1.21, once all AssignedStaticIP
-// values are guaranteed to have been updated to actual IP addresses by 1.20
-// operators.
-func staticIPNeedsResolution(assignedStaticIP string) bool {
-	if assignedStaticIP == "" {
-		return true
-	}
-	_, err := netip.ParseAddr(assignedStaticIP)
-	return err != nil
 }
 
 // GetNeededAddresses returns the number of needed addresses that need to be
@@ -442,10 +427,10 @@ func poolRequestedIPs(resource *v2.CiliumNode) (int, int, bool) {
 }
 
 // isMultiPoolNodeLocked returns true if this node's agent uses the multi-pool
-// allocator (1.20+) rather than the CRD allocator (1.19). The detection
-// heuristic checks that the agent has written Spec.IPAM.Pools.Requested
-// (multi-pool demand) and has cleared Status.IPAM.Used (CRD allocator field).
-// Caller must hold n.mutex (at least RLock).
+// allocator rather than the CRD allocator. The detection heuristic checks that
+// the agent has written Spec.IPAM.Pools.Requested (multi-pool demand) and has
+// cleared Status.IPAM.Used (CRD allocator field). Caller must hold n.mutex (at
+// least RLock).
 func (n *Node) isMultiPoolNodeLocked() bool {
 	if n.resource == nil {
 		return false
@@ -647,11 +632,13 @@ func (n *Node) UpdatedResource(resource *v2.CiliumNode) bool {
 
 	n.ops.UpdatedNode(resource)
 
+	// The error is not acted upon here: the caller (NodeManager.Upsert)
+	// holds the NodeManager mutex. Recovery of an instance missing from
+	// the cache is handled by the periodic resync, see resyncNode.
 	n.recalculate(context.Background())
 	allocationNeeded := n.allocationNeeded()
 	releaseNeeded := n.releaseNeeded()
 	if allocationNeeded || releaseNeeded {
-		n.requirePoolMaintenance()
 		n.poolMaintainer.Trigger()
 	}
 
@@ -665,6 +652,8 @@ func (n *Node) resourceAttached() (attached bool) {
 	return
 }
 
+// recalculate the number of needed and excess IPs of the node based on the
+// current state of the instance cache.
 func (n *Node) recalculate(ctx context.Context) {
 	// Skip any recalculation if the CiliumNode resource does not exist yet
 	if !n.resourceAttached() {
@@ -689,11 +678,14 @@ func (n *Node) recalculate(ctx context.Context) {
 		return
 	}
 
+	// The instance is back in the cache, re-arm the recovery sync.
+	n.instanceSyncRetriggered = false
+
 	n.ipv4Alloc.available = a
-	if stats.AssignedStaticIP != "" {
+	if stats.AssignedStaticIP.IsValid() {
 		n.stats.IPv4.AssignedStaticIP = stats.AssignedStaticIP
-	} else if n.stats.IPv4.AssignedStaticIP == "" && n.resource != nil {
-		n.stats.IPv4.AssignedStaticIP = n.resource.Status.IPAM.AssignedStaticIP
+	} else if !n.stats.IPv4.AssignedStaticIP.IsValid() && n.resource != nil {
+		n.stats.IPv4.AssignedStaticIP = n.resource.Status.IPAM.AssignedStaticIP.Addr
 	}
 
 	n.stats.IPv4.AvailableIPs = len(n.ipv4Alloc.available)
@@ -701,16 +693,11 @@ func (n *Node) recalculate(ctx context.Context) {
 	n.stats.IPv4.Capacity = stats.NodeCapacity
 	n.stats.IPv6.AvailablePrefixes = stats.NodeIPv6Prefixes
 
-	// Starting with 1.20, agents use the multi-pool allocator in ENI IPAM mode
-	// and write their demand to Spec.IPAM.Pools.Requested (and stop writing
-	// Status.IPAM.Used).
-	//
-	// 1.19 agents still use the CRD allocator and communicate their IP usage via
-	// Status.IPAM.Used.
-	//
-	// Both those logic branches exist in order to offer a smooth upgrade/downgrade path
-	// between 1.19 and 1.20: an operator upgraded to 1.20 will still honor the API
-	// contract expected by 1.19 agents.
+	// Agents using the cloud multi-pool allocator write their demand to
+	// Spec.IPAM.Pools.Requested and stop writing Status.IPAM.Used. Older agents
+	// still use the CRD allocator and communicate their IP usage through
+	// Status.IPAM.Used. Both branches are retained for rolling upgrades and
+	// downgrades.
 	if requestedIPv4, requestedIPv6, ok := poolRequestedIPs(n.resource); ok && len(n.resource.Status.IPAM.Used) == 0 {
 		// The agent's demand is computed as inUse + preAllocate (linear
 		// pre-allocation). Subtracting preAllocate recovers exact usage.
@@ -756,7 +743,7 @@ func (n *Node) allocationNeeded() bool {
 		return false
 	}
 
-	if len(n.getStaticIPTags()) > 0 && staticIPNeedsResolution(n.stats.IPv4.AssignedStaticIP) {
+	if len(n.getStaticIPTags()) > 0 && !n.stats.IPv4.AssignedStaticIP.IsValid() {
 		return true
 	}
 
@@ -934,6 +921,15 @@ type ReleaseAction struct {
 // ErrLimitsNotFound signals lack of limits for given instance type.
 var ErrLimitsNotFound = errors.New("Limits not found")
 
+// ErrInstanceNotFound signals that an external instances API authoritatively
+// reported that an instance no longer exists.
+var ErrInstanceNotFound = errors.New("instance not found")
+
+// instanceNotFoundSyncReason is the trigger reason used when the instance
+// sync is re-triggered to recover an instance missing from the cache. A
+// failed sync run carrying this reason re-arms the re-trigger.
+const instanceNotFoundSyncReason = "instance-not-found-recovery"
+
 // maintenanceAction represents the resources available for allocation for a
 // particular ciliumNode. If an existing interface has IP allocation capacity
 // left, that capacity is used up first. If not, an available index is found to
@@ -1028,7 +1024,7 @@ func (n *Node) removeStaleReleaseIPs() {
 		if status != ipamOption.IPAMReleased {
 			continue
 		}
-		if _, ok := n.resource.Status.IPAM.ReleaseIPs[addr.String()]; !ok {
+		if _, ok := n.resource.Status.IPAM.ReleaseIPs[iputil.AddrFrom(addr)]; !ok {
 			delete(n.ipv4Alloc.ipReleaseStatus, addr)
 		}
 	}
@@ -1036,18 +1032,18 @@ func (n *Node) removeStaleReleaseIPs() {
 
 // abortNoLongerExcessIPs allows for aborting release of IP if new allocations on the node result in a change of excess
 // count or the interface selected for release.
-func (n *Node) abortNoLongerExcessIPs(excessMap map[string]bool) {
+func (n *Node) abortNoLongerExcessIPs(excessIPs sets.Set[netip.Addr]) {
 	n.mutex.Lock()
 	defer n.mutex.Unlock()
 	if len(n.resource.Status.IPAM.ReleaseIPs) == 0 {
 		return
 	}
-	for ip, status := range n.resource.Status.IPAM.ReleaseIPs {
-		if excessMap[ip] {
+	for key, status := range n.resource.Status.IPAM.ReleaseIPs {
+		if !key.IsValid() {
 			continue
 		}
-		addr, err := netip.ParseAddr(ip)
-		if err != nil {
+		addr := key.Addr
+		if excessIPs.Has(addr) {
 			continue
 		}
 		// Handshake can be aborted from every state except 'released'
@@ -1055,8 +1051,8 @@ func (n *Node) abortNoLongerExcessIPs(excessMap map[string]bool) {
 		// But if the IP is back in the pool, we need to remove it from the release status map.
 		if status == ipamOption.IPAMReleased {
 			// Check if the IP is back in the pool despite being marked as released
-			if _, ok := n.resource.Spec.IPAM.Pool[ip]; ok {
-				delete(n.resource.Status.IPAM.ReleaseIPs, ip)
+			if _, ok := n.resource.Spec.IPAM.Pool[key]; ok {
+				delete(n.resource.Status.IPAM.ReleaseIPs, key)
 				delete(n.ipv4Alloc.ipsMarkedForRelease, addr)
 				delete(n.ipv4Alloc.ipReleaseStatus, addr)
 			}
@@ -1076,7 +1072,7 @@ func (n *Node) abortNoLongerExcessIPs(excessMap map[string]bool) {
 // caller must hold mutex lock
 func (n *Node) handleIPReleaseResponse(markedIP netip.Addr, ipsToRelease *[]netip.Addr) bool {
 	if n.resource.Status.IPAM.ReleaseIPs != nil {
-		if status, ok := n.resource.Status.IPAM.ReleaseIPs[markedIP.String()]; ok {
+		if status, ok := n.resource.Status.IPAM.ReleaseIPs[iputil.AddrFrom(markedIP)]; ok {
 			switch status {
 			case ipamOption.IPAMReadyForRelease:
 				*ipsToRelease = append(*ipsToRelease, markedIP)
@@ -1172,14 +1168,18 @@ func (n *Node) handleIPRelease(ctx context.Context, a *maintenanceAction) (insta
 	n.mutex.Unlock()
 
 	// Abort handshake for IPs that are in the middle of handshake, but are no longer considered excess
-	var excessMap map[string]bool
+	var excessIPs sets.Set[netip.Addr]
 	if a.release != nil && len(a.release.IPsToRelease) > 0 {
-		excessMap = make(map[string]bool, len(a.release.IPsToRelease))
+		excessIPs = make(sets.Set[netip.Addr], len(a.release.IPsToRelease))
 		for _, ip := range a.release.IPsToRelease {
-			excessMap[ip] = true
+			// An unparseable entry simply never matches, exactly as it could
+			// not match a canonical ReleaseIPs key when both were strings.
+			if addr, err := netip.ParseAddr(ip); err == nil {
+				excessIPs.Insert(addr)
+			}
 		}
 	}
-	n.abortNoLongerExcessIPs(excessMap)
+	n.abortNoLongerExcessIPs(excessIPs)
 
 	if len(ipsToRelease) > 0 {
 		a.release.IPsToRelease = cslices.Map(ipsToRelease, netip.Addr.String)
@@ -1290,14 +1290,14 @@ func (n *Node) maintainIPPool(ctx context.Context) (instanceMutated bool, err er
 	if len(n.getStaticIPTags()) > 0 {
 		nodeStats := n.Stats()
 
-		if staticIPNeedsResolution(nodeStats.IPv4.AssignedStaticIP) {
-			ip, err := n.ops.AllocateStaticIP(ctx, n.getStaticIPTags())
+		if !nodeStats.IPv4.AssignedStaticIP.IsValid() {
+			addr, err := n.ops.AllocateStaticIP(ctx, n.getStaticIPTags())
 			if err != nil {
 				return false, err
 			}
 
 			n.mutex.Lock()
-			n.stats.IPv4.AssignedStaticIP = ip
+			n.stats.IPv4.AssignedStaticIP = addr
 			n.mutex.Unlock()
 		}
 	}
@@ -1319,6 +1319,32 @@ func (n *Node) maintainIPPool(ctx context.Context) (instanceMutated bool, err er
 	}
 
 	return n.handleIPAllocation(ctx, a)
+}
+
+// retriggerInstanceSync re-triggers the node's per-instance sync to recover
+// an instance that was dropped from the instance cache by a full resync. To
+// avoid a retry loop for instances that are legitimately gone, the sync is
+// re-triggered at most once until re-armed, either by a recalculation that
+// sees the instance again or by a transient failure of the sync itself.
+// Callers must ensure the instances API is stable. Holding the NodeManager
+// mutex is fine since triggering only signals the sync.
+func (n *Node) retriggerInstanceSync() {
+	n.mutex.Lock()
+	defer n.mutex.Unlock()
+
+	if n.instanceSyncRetriggered || n.instanceSync == nil {
+		return
+	}
+	n.instanceSyncRetriggered = true
+	n.instanceSync.TriggerWithReason(instanceNotFoundSyncReason)
+}
+
+// reArmInstanceSync re-arms the recovery sync after a transient failure of
+// the re-triggered instance sync, so a later recalculation may retry it.
+func (n *Node) reArmInstanceSync() {
+	n.mutex.Lock()
+	n.instanceSyncRetriggered = false
+	n.mutex.Unlock()
 }
 
 func (n *Node) isInstanceRunning() (isRunning bool) {
@@ -1345,14 +1371,21 @@ func (n *Node) updateLastResync(syncTime time.Time) {
 
 // MaintainIPPool attempts to allocate or release all required IPs to fulfill
 // the needed gap. If required, interfaces are created.
+//
+// It owns waitingForPoolMaintenance, taken on entry and released on every
+// return path: the flag makes allocationNeeded() and releaseNeeded() false, and
+// those gate the only two sites that enqueue this, so a pass returning with it
+// set would strand the node for good. It is released before the pass triggers
+// any further asynchronous work, so that a resync racing with the tail of the
+// pass still observes the deficit and can enqueue the next one.
 func (n *Node) MaintainIPPool(ctx context.Context) error {
+	n.requirePoolMaintenance()
+	defer n.poolMaintenanceComplete()
+
 	// As long as the instances API is unstable, don't perform any
 	// operation that can mutate state.
 	if !n.manager.InstancesAPIIsReady() {
-		if n.retry != nil {
-			n.retry.Trigger()
-		}
-		return fmt.Errorf("instances API is unstable. Blocking mutating operations. See logs for details.")
+		return errInstancesAPIUnstable
 	}
 
 	// If the instance has stopped running for less than a minute, don't attempt any deficit
@@ -1367,8 +1400,18 @@ func (n *Node) MaintainIPPool(ctx context.Context) error {
 		n.logger.Load().Debug("Setting resync needed")
 		n.requireResync()
 	}
+
+	// The mutating part of the pass is over. Release the flag before the
+	// instance syncs below: those run asynchronously, and the resync they
+	// end up driving reads allocationNeeded() for this node, which the flag
+	// would make false, dropping the enqueue of the next pass. The deferred
+	// release stays as the guarantee for the early returns above.
 	n.poolMaintenanceComplete()
+
 	n.recalculate(ctx)
+	if n.manager.InstancesAPIIsReady() && !n.manager.instancesAPI.HasInstance(n.InstanceID()) {
+		n.retriggerInstanceSync()
+	}
 	if instanceMutated || err != nil {
 		n.instanceSync.Trigger()
 	}
@@ -1391,17 +1434,17 @@ func (n *Node) PopulateIPReleaseStatus(node *v2.CiliumNode) {
 	n.removeStaleReleaseIPs()
 	n.mutex.Lock()
 	defer n.mutex.Unlock()
-	releaseStatus := make(map[string]ipamTypes.IPReleaseStatus)
+	releaseStatus := make(ipamTypes.IPReleaseStatusMap, len(n.ipv4Alloc.ipReleaseStatus))
 	for addr, status := range n.ipv4Alloc.ipReleaseStatus {
-		ip := addr.String()
-		if existingStatus, ok := node.Status.IPAM.ReleaseIPs[ip]; ok && status == ipamOption.IPAMMarkForRelease {
+		key := iputil.AddrFrom(addr)
+		if existingStatus, ok := node.Status.IPAM.ReleaseIPs[key]; ok && status == ipamOption.IPAMMarkForRelease {
 			// retain status if agent already responded to this IP
 			if existingStatus == ipamOption.IPAMReadyForRelease || existingStatus == ipamOption.IPAMDoNotRelease {
-				releaseStatus[ip] = existingStatus
+				releaseStatus[key] = existingStatus
 				continue
 			}
 		}
-		releaseStatus[ip] = ipamTypes.IPReleaseStatus(status)
+		releaseStatus[key] = ipamTypes.IPReleaseStatus(status)
 	}
 	node.Status.IPAM.ReleaseIPs = releaseStatus
 }
@@ -1409,8 +1452,8 @@ func (n *Node) PopulateIPReleaseStatus(node *v2.CiliumNode) {
 func (n *Node) PopulateStaticIPStatus(node *v2.CiliumNode) {
 	n.mutex.Lock()
 	defer n.mutex.Unlock()
-	if n.stats.IPv4.AssignedStaticIP != "" {
-		node.Status.IPAM.AssignedStaticIP = n.stats.IPv4.AssignedStaticIP
+	if n.stats.IPv4.AssignedStaticIP.IsValid() {
+		node.Status.IPAM.AssignedStaticIP = iputil.AddrFrom(n.stats.IPv4.AssignedStaticIP)
 	}
 }
 

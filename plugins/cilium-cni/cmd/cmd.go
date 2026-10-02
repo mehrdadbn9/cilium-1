@@ -4,6 +4,7 @@
 package cmd
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -226,23 +227,25 @@ func allocateIPsWithDelegatedPlugin(
 	// https://kubernetes.io/docs/reference/kubernetes-api/workload-resources/pod-v1/
 	// Interface returned by IPAM should be treated as the uplink for the Pod as CNI spec introduced by:
 	// https://github.com/containernetworking/cni/pull/1137
-	masterMac := ""
+	var masterMac mac.MAC
 	for _, iface := range ipamResult.Interfaces {
 		if iface.Sandbox != "" {
 			continue
 		}
 
 		if iface.Mac != "" {
-			if ifMac, err := net.ParseMAC(iface.Mac); err != nil {
+			if ifMac, err := mac.ParseMAC(iface.Mac); err != nil {
 				return nil, releaseFunc, fmt.Errorf("failed to parse interface MAC %q: %w", iface.Mac, err)
 			} else {
-				masterMac = ifMac.String()
+				masterMac = ifMac
 			}
 		} else if iface.Name != "" {
-			if uplink, err := safenetlink.LinkByName(iface.Name); err != nil {
+			uplink, err := safenetlink.LinkByName(iface.Name)
+			if err != nil {
 				return nil, releaseFunc, fmt.Errorf("failed to get uplink %q: %w", iface.Name, err)
-			} else {
-				masterMac = uplink.Attrs().HardwareAddr.String()
+			}
+			if masterMac, err = mac.FromHardwareAddr(uplink.Attrs().HardwareAddr); err != nil {
+				return nil, releaseFunc, fmt.Errorf("failed to parse uplink %q MAC: %w", iface.Name, err)
 			}
 		}
 		break
@@ -509,8 +512,8 @@ func configureCongestionControl(conf *models.DaemonConfigurationStatus, sysctl s
 	})
 }
 
-func ifindexFromMac(mac string) (int64, error) {
-	var link netlink.Link
+func ifindexFromMac(m mac.MAC) (int64, error) {
+	var iface netlink.Link
 
 	links, err := safenetlink.LinkList()
 	if err != nil {
@@ -523,19 +526,19 @@ func ifindexFromMac(mac string) (int64, error) {
 		if l.Attrs().RawFlags&unix.IFF_SLAVE != 0 {
 			continue
 		}
-		if l.Attrs().HardwareAddr.String() == mac {
-			if link != nil {
-				return -1, fmt.Errorf("several interfaces found with MAC %s: %s and %s", mac, link.Attrs().Name, l.Attrs().Name)
+		if bytes.Equal(l.Attrs().HardwareAddr, m.HardwareAddr()) {
+			if iface != nil {
+				return -1, fmt.Errorf("several interfaces found with MAC %s: %s and %s", m, iface.Attrs().Name, l.Attrs().Name)
 			}
-			link = l
+			iface = l
 		}
 	}
 
-	if link == nil {
-		return -1, fmt.Errorf("no interface found with MAC %s", mac)
+	if iface == nil {
+		return -1, fmt.Errorf("no interface found with MAC %s", m)
 	}
 
-	return int64(link.Attrs().Index), nil
+	return int64(iface.Attrs().Index), nil
 }
 
 func (cmd *Cmd) Add(args *skel.CmdArgs) (err error) {
@@ -768,8 +771,12 @@ func (cmd *Cmd) Add(args *skel.CmdArgs) (err error) {
 	res.Interfaces = append(res.Interfaces, iface)
 
 	if isLayer2 {
-		ep.Mac = peerLinkAttrs.HardwareAddr.String()
-		ep.HostMac = hostLinkAttrs.HardwareAddr.String()
+		if ep.Mac, err = mac.FromHardwareAddr(peerLinkAttrs.HardwareAddr); err != nil {
+			return fmt.Errorf("invalid MAC address for %s: %w", peerLinkAttrs.Name, err)
+		}
+		if ep.HostMac, err = mac.FromHardwareAddr(hostLinkAttrs.HardwareAddr); err != nil {
+			return fmt.Errorf("invalid MAC address for %s: %w", hostLinkAttrs.Name, err)
+		}
 	}
 	ep.InterfaceIndex = int64(hostLinkAttrs.Index)
 	ep.InterfaceName = hostLinkAttrs.Name
@@ -817,14 +824,14 @@ func (cmd *Cmd) Add(args *skel.CmdArgs) (err error) {
 
 	if needsEndpointRoutingOnHost(conf) {
 		if ipam.IPv4 != nil && ipConfig != nil {
-			err = interfaceAdd(scopedLogger, ipConfig, ipam.IPv4, conf)
+			err = interfaceAdd(ipConfig, ipam.IPv4, conf)
 			if err != nil {
 				return fmt.Errorf("unable to setup interface datapath: %w", err)
 			}
 		}
 
 		if ipam.IPv6 != nil && ipv6Config != nil {
-			err = interfaceAdd(scopedLogger, ipv6Config, ipam.IPv6, conf)
+			err = interfaceAdd(ipv6Config, ipam.IPv6, conf)
 			if err != nil {
 				return fmt.Errorf("unable to setup interface datapath: %w", err)
 			}
@@ -891,17 +898,17 @@ func (cmd *Cmd) Add(args *skel.CmdArgs) (err error) {
 		)
 		return fmt.Errorf("unable to create endpoint: %w", err)
 	}
-	if newEp != nil && newEp.Status != nil && newEp.Status.Networking != nil && newEp.Status.Networking.Mac != "" {
+	if newEp != nil && newEp.Status != nil && newEp.Status.Networking != nil && newEp.Status.Networking.Mac.IsValid() {
 		// Set the MAC address on the interface in the container namespace
 		if isLayer2 {
 			err = ns.Do(func() error {
-				return mac.ReplaceMacAddressWithLinkName(args.IfName, newEp.Status.Networking.Mac)
+				return link.SetHardwareAddr(args.IfName, newEp.Status.Networking.Mac)
 			})
 			if err != nil {
 				return fmt.Errorf("unable to set MAC address on interface %s: %w", args.IfName, err)
 			}
 		}
-		macAddrStr = newEp.Status.Networking.Mac
+		macAddrStr = newEp.Status.Networking.Mac.String()
 	}
 	if err = ns.Do(func() error {
 		configurePacketizationLayerPMTUD(scopedLogger, conf, sysctl)

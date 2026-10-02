@@ -16,35 +16,10 @@
 
 #define LRU_MEM_FLAVOR 0
 
-#define CT_CONNECTION_LIFETIME_TCP	21600
-#define CT_CONNECTION_LIFETIME_NONTCP	60
-#define CT_SERVICE_LIFETIME_TCP		21600
-#define CT_SERVICE_LIFETIME_NONTCP	60
-#define CT_SERVICE_CLOSE_REBALANCE	30
-#define CT_SYN_TIMEOUT			60
-#define CT_CLOSE_TIMEOUT		10
-#define CT_REPORT_INTERVAL		5
-#ifndef CT_REPORT_FLAGS
-# define CT_REPORT_FLAGS		0xff
-#endif
-
-#ifdef ENABLE_IPV4
-#define IPV4_GATEWAY 0xfffff50a
-#define IPV4_ENCRYPT_IFACE 0xfffff50a
-# ifdef ENABLE_MASQUERADE_IPV4
-#  define IPV4_SNAT_EXCLUSION_DST_CIDR 0xffff0000
-#  define IPV4_SNAT_EXCLUSION_DST_CIDR_LEN 16
-# endif /* ENABLE_MASQUERADE_IPV4 */
-#endif /* ENABLE_IPV4 */
-
 #define SNAT_MAPPING_IPV4_SIZE 524288
 #define SNAT_MAPPING_IPV6_SIZE 524288
 
 #ifdef ENABLE_IPV6
-# ifdef ENABLE_MASQUERADE_IPV6
-#  define IPV6_SNAT_EXCLUSION_DST_CIDR      { .addr = { 0xfa, 0xce, 0xff, 0xff, 0xff, 0x0 } }
-#  define IPV6_SNAT_EXCLUSION_DST_CIDR_MASK { .addr = { 0xff, 0xff, 0xff, 0xff, 0xff, 0x0 } }
-# endif /* ENABLE_MASQUERADE_IPV6 */
 #ifdef ENABLE_NODEPORT
 #endif /* ENABLE_NODEPORT */
 #endif /* ENABLE_IPV6 */
@@ -85,40 +60,8 @@
 #define CT_MAP_SIZE_TCP 4096
 #define CT_MAP_SIZE_ANY 4096
 
-#ifdef ENABLE_NODEPORT
-# ifdef ENABLE_IPV4
-#  ifndef IPV4_DIRECT_ROUTING
-#   define IPV4_DIRECT_ROUTING 0
-#  endif
-# endif
-# ifdef ENABLE_IPV6
-#  ifndef IPV6_DIRECT_ROUTING
-#   define IPV6_DIRECT_ROUTING { .addr = { 0x0, 0x0, 0x0, 0x0, 0x0, 0x0 } }
-#  endif
-# endif
-#endif
-
 #define LB4_SRC_RANGE_MAP_SIZE	1000
 #define LB6_SRC_RANGE_MAP_SIZE	1000
-
-#define VLAN_FILTER(ifindex, vlan_id) switch (ifindex) { \
-case 116: \
-switch (vlan_id) { \
-case 4000: \
-case 4001: \
-return true; \
-} \
-break; \
-case 117: \
-switch (vlan_id) { \
-case 4003: \
-case 4004: \
-case 4005: \
-return true; \
-} \
-break; \
-} \
-return false;
 
 /*
  *   **** WARNING, THIS FILE IS DEPRECATED, SEE COMMENT AT THE TOP ****

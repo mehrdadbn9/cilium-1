@@ -12,6 +12,8 @@ import "github.com/cilium/cilium/pkg/datapath/types"
 // Warning: do not instantiate directly! Always use [NewNode] to ensure the
 // default values configured in the ELF are honored.
 type Node struct {
+	// Conntrack timeout configuration.
+	CTTimeouts types.CTTimeoutConfig `config:"ct_timeouts"`
 	// Interface index of the cilium_host device.
 	CiliumHostIfIndex uint32 `config:"cilium_host_ifindex"`
 	// MAC address of the cilium_host device.
@@ -32,6 +34,8 @@ type Node struct {
 	EnableBPFHostRouting bool `config:"enable_bpf_host_routing"`
 	// Enable per flow (conntrack) statistics.
 	EnableConntrackAccounting bool `config:"enable_conntrack_accounting"`
+	// Enable drop notifications.
+	EnableDropNotify bool `config:"enable_drop_notify"`
 	// Enable per endpoint routes.
 	EnableEndpointRoutes bool `config:"enable_endpoint_routes"`
 	// Terminate inbound IPIP/IP6IP6 in BPF on netdev ingress for local endpoint
@@ -43,8 +47,14 @@ type Node struct {
 	EnableJiffies bool `config:"enable_jiffies"`
 	// Enable dynamic source IP resolution for SNAT via linux's routing table.
 	EnableNodeportSourceLookup bool `config:"enable_nodeport_source_lookup"`
+	// Enable SCTP support.
+	EnableSCTP bool `config:"enable_sctp"`
 	// Enable BPF-based proxy redirection.
 	EnableTproxy bool `config:"enable_tproxy"`
+	// Interface index of the IPv4 IPIP encapsulation device.
+	Encap4IfIndex uint32 `config:"encap4_ifindex"`
+	// Interface index of the IPv6 IPIP encapsulation device.
+	Encap6IfIndex uint32 `config:"encap6_ifindex"`
 	// Enable strict encryption for ingress traffic.
 	EncryptionStrictIngress bool `config:"encryption_strict_ingress"`
 	// Maximum number of messages that can be written to BPF events map in 1
@@ -56,8 +66,16 @@ type Node struct {
 	HashInit4Seed uint32 `config:"hash_init4_seed"`
 	// Cluster-wide IPv6 tuple hash seed sourced.
 	HashInit6Seed uint32 `config:"hash_init6_seed"`
+	// IPv4 address of the device used for direct routing between nodes.
+	IPv4DirectRouting types.V4Addr `config:"ipv4_direct_routing"`
 	// Node IPv4 address used as the source for inter-cluster SNAT.
 	IPv4InterClusterSNAT types.V4Addr `config:"ipv4_inter_cluster_snat"`
+	// IPv4 destination prefix excluded from SNAT.
+	IPv4SNATExclusion types.IPv4SNATExclusionPrefix `config:"ipv4_snat_exclusion"`
+	// IPv6 address of the device used for direct routing between nodes.
+	IPv6DirectRouting types.V6Addr `config:"ipv6_direct_routing"`
+	// IPv6 destination prefix excluded from SNAT.
+	IPv6SNATExclusion types.IPv6SNATExclusionPrefix `config:"ipv6_snat_exclusion"`
 	// Number of timer ticks per second.
 	KernelHz uint32 `config:"kernel_hz"`
 	// Default load-balancer backend selection algorithm.
@@ -66,14 +84,24 @@ type Node struct {
 	LBSelectionPerService bool `config:"lb_selection_per_service"`
 	// Level of aggregation for monitor events.
 	MonitorAggregation uint8 `config:"monitor_aggregation"`
+	// TCP flags that trigger monitor reports.
+	MonitorReportFlags uint8 `config:"monitor_report_flags"`
+	// Monitor report interval in seconds.
+	MonitorReportInterval uint32 `config:"monitor_report_interval"`
 	// NAT 46x64 prefix.
 	NAT46X64Prefix types.V4Addr `config:"nat_46x64_prefix"`
 	// Nodeport maximum port value.
 	NodeportPortMax uint16 `config:"nodeport_port_max"`
+	// Nodeport NAT extended maximum port value.
+	NodeportPortMaxNATExt uint16 `config:"nodeport_port_max_nat_ext"`
 	// Nodeport minimum port value.
 	NodeportPortMin uint16 `config:"nodeport_port_min"`
+	// Nodeport NAT extended minimum port value.
+	NodeportPortMinNATExt uint16 `config:"nodeport_port_min_nat_ext"`
 	// Enable ICMP responses for policy-denied traffic.
 	PolicyDenyResponseEnabled bool `config:"policy_deny_response_enabled"`
+	// Internal IPv4 router address assigned to the cilium_host interface.
+	RouterIPv4 types.V4Addr `config:"router_ipv4"`
 	// Internal IPv6 router address assigned to the cilium_host interface.
 	RouterIPv6 types.V6Addr `config:"router_ipv6"`
 	// IPv4 source address used for SNAT when a Pod talks to itself over a Service.
@@ -93,14 +121,19 @@ type Node struct {
 }
 
 func NewNode() *Node {
-	return &Node{0x0,
+	return &Node{cast[types.CTTimeoutConfig]([]byte{0x60, 0x54, 0x0, 0x0, 0x3c, 0x0, 0x0, 0x0, 0x60, 0x54, 0x0, 0x0, 0x3c, 0x0, 0x0, 0x0, 0x1e, 0x0, 0x0, 0x0, 0x3c, 0x0, 0x0, 0x0, 0xa, 0x0, 0x0, 0x0}),
+		0x0,
 		cast[types.MACAddr]([]byte{0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0}),
 		0x0,
 		cast[types.MACAddr]([]byte{0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0}),
 		0x0, 0x8, false, 0x0, false, false, false, false, false, false,
-		false, false, false, 0x0, 0x0, 0x0, 0x0, cast[types.V4Addr]([]byte{0x0, 0x0, 0x0, 0x0}),
-		0x0, 0x1, false, 0x0, cast[types.V4Addr]([]byte{0x0, 0x0, 0x0, 0x0}),
-		0x0, 0x0, false,
+		false, false, false, false, 0x0, 0x0, false, 0x0, 0x0, 0x0,
+		0x0, cast[types.V4Addr]([]byte{0x0, 0x0, 0x0, 0x0}), cast[types.V4Addr]([]byte{0x0, 0x0, 0x0, 0x0}),
+		cast[types.IPv4SNATExclusionPrefix]([]byte{0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0}),
+		cast[types.V6Addr]([]byte{0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0}),
+		cast[types.IPv6SNATExclusionPrefix]([]byte{0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0}),
+		0x0, 0x1, false, 0x0, 0xff, 0x5, cast[types.V4Addr]([]byte{0x0, 0x0, 0x0, 0x0}),
+		0x0, 0x0, 0x0, 0x0, false, cast[types.V4Addr]([]byte{0x0, 0x0, 0x0, 0x0}),
 		cast[types.V6Addr]([]byte{0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0}),
 		cast[types.V4Addr]([]byte{0x0, 0x0, 0x0, 0x0}),
 		cast[types.V6Addr]([]byte{0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0}),

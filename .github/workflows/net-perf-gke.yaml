@@ -66,13 +66,12 @@ env:
   clusterName: ${{ github.event.repository.name }}-${{ github.run_id }}-${{ github.run_attempt }}
   test_name: gke-perf
   USE_GKE_GCLOUD_AUTH_PLUGIN: True
-  gcp_zone: us-east5-a
-  # Additional zones to fall back to if the primary zone is out of capacity
-  # (GCE STOCKOUT). All within the same region as gcp_zone to keep perf results
-  # comparable.
-  gcp_fallback_zones: us-east5-b us-east5-c
+  # Any zone of this region, see "Determine fallback zones" below. us-central1
+  # is the oldest and largest US region, which is the only lever we have on
+  # capacity since GCE does not report it.
+  gcp_zone: us-central1-a
   # renovate: datasource=docker depName=google/cloud-sdk
-  gcloud_version: 578.0.0
+  gcloud_version: 586.0.0
 
 jobs:
   echo-inputs:
@@ -88,7 +87,7 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - name: Set initial commit status
-        uses: cilium/actions/set-commit-status@fe0702f5df0d8e44d48f1baa226c023b73ff6b5e # main
+        uses: cilium/actions/set-commit-status@687b48a0547e534dd7270d5069a5ab7967c0e907 # main
         with:
           sha: ${{ inputs.SHA || github.sha }}
 
@@ -165,7 +164,7 @@ jobs:
 
     steps:
       - name: Set commit status to pending
-        uses: cilium/actions/set-commit-status@fe0702f5df0d8e44d48f1baa226c023b73ff6b5e # main
+        uses: cilium/actions/set-commit-status@687b48a0547e534dd7270d5069a5ab7967c0e907 # main
         with:
           sha: ${{ inputs.SHA || github.sha }}
 
@@ -233,7 +232,7 @@ jobs:
 
       - name: Set up gcloud credentials
         id: 'auth'
-        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
+        uses: google-github-actions/auth@12060449e87204eca501a11f2f7f1483024afff0 # v3.0.0 + google-github-actions/auth#532
         with:
           workload_identity_provider: ${{ secrets.GCP_PERF_WORKLOAD_IDENTITY_PROVIDER }}
           service_account: ${{ secrets.GCP_PERF_SA }}
@@ -254,13 +253,28 @@ jobs:
         run: |
           gcloud info
 
+      - name: Determine fallback zones
+        id: fallback-zones
+        env:
+          ZONE: ${{ env.gcp_zone }}
+        run: |
+          # The other zones of the same region, so that a zone which is out of
+          # capacity does not fail the whole job. Same region only, to keep the
+          # perf results comparable.
+          region="${ZONE%-?}"
+          zones=$(gcloud compute zones list --filter="status=UP" --format='value(name)' \
+            | grep "^${region}-" | grep -v "^${ZONE}$" | tr '\n' ' ')
+          echo "Fallback zones for ${ZONE}: ${zones}"
+          echo "zones=${zones}" >> $GITHUB_OUTPUT
+          echo "candidates=${ZONE} ${zones}" >> $GITHUB_OUTPUT
+
       - name: Create GKE cluster
         id: create-cluster
         uses: ./.github/actions/setup-gke-cluster
         with:
           cluster-name: ${{ env.clusterName }}-${{ matrix.index }}
           zone: ${{ env.gcp_zone }}
-          fallback-zones: ${{ env.gcp_fallback_zones }}
+          fallback-zones: ${{ steps.fallback-zones.outputs.zones }}
           node-taints: ${{ steps.vars.outputs.node_taints }}
           labels: "usage=${{ github.repository_owner }}-${{ github.event.repository.name }},owner=${{ steps.vars.outputs.owner }}"
 
@@ -291,7 +305,7 @@ jobs:
             --docker-password="${{ secrets.DOCKER_READ_PASSWORD }}"
 
       - name: Install Cilium CLI
-        uses: cilium/cilium-cli@7ca7fc53c20275f5c10ef5f3557076691fd1d720 # v0.19.7
+        uses: cilium/cilium-cli@c5e42236c7d90bd50e7975ac587f77782666a0aa # v0.20.0
         with:
           skip-build: ${{ env.CILIUM_CLI_SKIP_BUILD }}
           image-repo: ${{ env.CILIUM_CLI_IMAGE_REPO }}
@@ -345,12 +359,22 @@ jobs:
       - name: Clean up GKE
         if: ${{ always() }}
         env:
-          cluster_zone: ${{ steps.create-cluster.outputs.zone || env.gcp_zone }}
+          CLUSTER: ${{ env.clusterName }}-${{ matrix.index }}
+          # Every zone the cluster could have been created in, not just the one
+          # it ended up in: a creation attempt that was abandoned because it was
+          # too slow keeps provisioning on the GKE side.
+          ZONES: ${{ steps.fallback-zones.outputs.candidates || env.gcp_zone }}
         run: |
-          while [ "$(gcloud container operations list --zone ${cluster_zone} --filter="status=RUNNING AND targetLink~${{ env.clusterName }}-${{ matrix.index }}" --format="value(name)")" ];do
-            echo "cluster has an ongoing operation, waiting for all operations to finish"; sleep 15
+          for zone in ${ZONES}; do
+            while [ "$(gcloud container operations list --zone "${zone}" --filter="status=RUNNING AND targetLink~${CLUSTER}" --format="value(name)")" ];do
+              echo "cluster has an ongoing operation in ${zone}, waiting for all operations to finish"; sleep 15
+            done
+            gcloud container clusters describe "${CLUSTER}" --zone "${zone}" --format 'value(name)' > /dev/null 2>&1 || continue
+            for i in 1 2 3; do
+              gcloud container clusters delete "${CLUSTER}" --zone "${zone}" --quiet --async && break
+              echo "delete of ${CLUSTER} in ${zone} failed (attempt ${i}/3), retrying in 15s"; sleep 15
+            done
           done
-          gcloud container clusters delete ${{ env.clusterName }}-${{ matrix.index }} --zone ${cluster_zone} --quiet --async
         shell: bash {0} # Disable default fail-fast behavior so that all commands run independently
 
       # We needed to configure a unique suffix to ensure that the artifacts can
@@ -363,7 +387,7 @@ jobs:
 
       - name: Export results and sysdump to GS bucket
         if: ${{ always() && steps.run-perf.outcome != 'skipped' && steps.run-perf.outcome != 'cancelled' }}
-        uses: cilium/scale-tests-action/export-results@d89fc21b123f4047828366d1505a8bb5d414c07d # main
+        uses: cilium/scale-tests-action/export-results@529d919e01deb35642ba5c6ecdcbf2e2311cd3de # main
         with:
           test_name: ${{ env.test_name }}-${{ matrix.name }}
           tested_sha: ${{ inputs.SHA || github.sha }}

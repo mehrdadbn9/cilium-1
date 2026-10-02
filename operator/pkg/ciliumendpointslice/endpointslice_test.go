@@ -5,17 +5,18 @@ package ciliumendpointslice
 
 import (
 	"fmt"
-	"sync"
 	"testing"
 	"time"
 
 	"github.com/cilium/hive/cell"
 	"github.com/cilium/hive/hivetest"
 	"github.com/stretchr/testify/assert"
+	"sigs.k8s.io/controller-runtime/pkg/controller/priorityqueue"
 
 	"github.com/cilium/cilium/operator/k8s"
 	tu "github.com/cilium/cilium/operator/pkg/ciliumendpointslice/testutils"
 	cidtest "github.com/cilium/cilium/operator/pkg/ciliumidentity/testutils"
+	cmtypes "github.com/cilium/cilium/pkg/clustermesh/types"
 	"github.com/cilium/cilium/pkg/datapath/linux/ipsec"
 	"github.com/cilium/cilium/pkg/hive"
 	cilium_v2 "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2"
@@ -24,7 +25,6 @@ import (
 	"github.com/cilium/cilium/pkg/k8s/resource"
 	slim_corev1 "github.com/cilium/cilium/pkg/k8s/slim/k8s/api/core/v1"
 	"github.com/cilium/cilium/pkg/labelsfilter"
-	"github.com/cilium/cilium/pkg/lock"
 	"github.com/cilium/cilium/pkg/metrics"
 	"github.com/cilium/cilium/pkg/testutils"
 	wgAgent "github.com/cilium/cilium/pkg/wireguard/agent"
@@ -64,12 +64,11 @@ func TestFCFSModeSyncCESsInLocalCacheDefault(t *testing.T) {
 	cesController := &DefaultController{
 		Controller: &Controller{
 			logger:              log,
-			clientset:           fakeClient.Clientset,
+			clientset:           fakeClient,
 			ciliumEndpointSlice: ciliumEndpointSlice,
 			rateLimit:           rateLimitConfig,
 			enqueuedAt:          make(map[CESKey]time.Time),
 			doReconciler:        r,
-			cond:                *sync.NewCond(&lock.Mutex{}),
 		},
 		manager:        m,
 		reconciler:     r,
@@ -119,9 +118,34 @@ func TestFCFSModeSyncCESsInLocalCacheDefault(t *testing.T) {
 		}
 	}
 
-	cesController.fastQueue.ShutDown()
-	cesController.standardQueue.ShutDown()
+	cesController.queue.ShutDown()
 	hive.Stop(log, t.Context())
+}
+
+func queueLengths(t *testing.T, c *Controller) (standardQueueLen, fastQueueLen int) {
+	t.Helper()
+
+	keys := make([]CESKey, 0, c.queue.Len())
+	priorities := make([]int, 0, c.queue.Len())
+	for c.queue.Len() > 0 {
+		key, priority, shutdown := c.queue.GetWithPriority()
+		assert.False(t, shutdown)
+		keys = append(keys, key)
+		priorities = append(priorities, priority)
+		c.queue.Done(key)
+
+		if priority == highPriority {
+			fastQueueLen++
+		} else {
+			standardQueueLen++
+		}
+	}
+
+	for i, key := range keys {
+		c.queue.AddWithOpts(priorityqueue.AddOpts{Priority: &priorities[i]}, key)
+	}
+
+	return standardQueueLen, fastQueueLen
 }
 
 func TestDifferentSpeedQueuesDefault(t *testing.T) {
@@ -160,7 +184,7 @@ func TestDifferentSpeedQueuesDefault(t *testing.T) {
 	cesController := &DefaultController{
 		Controller: &Controller{
 			logger:              log,
-			clientset:           fakeClient.Clientset,
+			clientset:           fakeClient,
 			ciliumEndpointSlice: ciliumEndpointSlice,
 			rateLimit:           rateLimitConfig,
 			enqueuedAt:          make(map[CESKey]time.Time),
@@ -168,7 +192,6 @@ func TestDifferentSpeedQueuesDefault(t *testing.T) {
 			priorityNamespaces:  make(map[string]struct{}),
 			syncDelay:           0,
 			doReconciler:        r,
-			cond:                *sync.NewCond(&lock.Mutex{}),
 		},
 		manager:        m,
 		reconciler:     r,
@@ -197,12 +220,14 @@ func TestDifferentSpeedQueuesDefault(t *testing.T) {
 			standardQueueLen = 6
 			fastQueueLen = i - 5
 		}
-		//Ensure that the lengths of the queues after adding an element are correct
+		// Ensure that the lengths of the queues after adding an element are correct
 		if err := testutils.WaitUntil(func() bool {
-			return cesController.standardQueue.Len() == standardQueueLen && cesController.fastQueue.Len() == fastQueueLen
+			standardLen, fastLen := queueLengths(t, cesController.Controller)
+			return standardLen == standardQueueLen && fastLen == fastQueueLen
 		}, time.Second); err != nil {
-			assert.Equal(t, standardQueueLen, cesController.standardQueue.Len())
-			assert.Equal(t, fastQueueLen, cesController.fastQueue.Len())
+			standardLen, fastLen := queueLengths(t, cesController.Controller)
+			assert.Equal(t, standardQueueLen, standardLen)
+			assert.Equal(t, fastQueueLen, fastLen)
 		}
 	}
 
@@ -215,17 +240,18 @@ func TestDifferentSpeedQueuesDefault(t *testing.T) {
 			standardQueueLen = 6 - (i - 3)
 			fastQueueLen = 0
 		}
-		//Ensure that the lengths of the queues after removing an element are correct
+		// Ensure that the lengths of the queues after removing an element are correct
 		if err := testutils.WaitUntil(func() bool {
-			return cesController.standardQueue.Len() == standardQueueLen && cesController.fastQueue.Len() == fastQueueLen
+			standardLen, fastLen := queueLengths(t, cesController.Controller)
+			return standardLen == standardQueueLen && fastLen == fastQueueLen
 		}, time.Second); err != nil {
-			assert.Equal(t, standardQueueLen, cesController.standardQueue.Len())
-			assert.Equal(t, fastQueueLen, cesController.fastQueue.Len())
+			standardLen, fastLen := queueLengths(t, cesController.Controller)
+			assert.Equal(t, standardQueueLen, standardLen)
+			assert.Equal(t, fastQueueLen, fastLen)
 		}
 	}
 
-	cesController.fastQueue.ShutDown()
-	cesController.standardQueue.ShutDown()
+	cesController.queue.ShutDown()
 	hive.Stop(log, t.Context())
 }
 
@@ -265,7 +291,7 @@ func TestCESManagementDefault(t *testing.T) {
 	cesController := &DefaultController{
 		Controller: &Controller{
 			logger:              log,
-			clientset:           fakeClient.Clientset,
+			clientset:           fakeClient,
 			ciliumEndpointSlice: ciliumEndpointSlice,
 			rateLimit:           rateLimitConfig,
 			enqueuedAt:          make(map[CESKey]time.Time),
@@ -273,7 +299,6 @@ func TestCESManagementDefault(t *testing.T) {
 			priorityNamespaces:  make(map[string]struct{}),
 			syncDelay:           0,
 			doReconciler:        r,
-			cond:                *sync.NewCond(&lock.Mutex{}),
 		},
 		manager:        m,
 		reconciler:     r,
@@ -285,17 +310,16 @@ func TestCESManagementDefault(t *testing.T) {
 	cep1 := tu.CreateStoreEndpoint(fmt.Sprintf("cep-%d", 0), ns, 0)
 	cesController.onEndpointUpdate(cep1)
 	if err := testutils.WaitUntil(func() bool {
-		return cesController.standardQueue.Len() == 1
+		return cesController.queue.Len() == 1
 	}, time.Second); err != nil {
-		assert.Equal(t, 1, cesController.standardQueue.Len())
+		assert.Equal(t, 1, cesController.queue.Len())
 	}
 	cesController.processNextWorkItem(t.Context())
 	//A CEP is enqueued and processed. Then, the same CEP (and CES) is enqueued
 	//to test if the CESStore works properly and if the associated CES can be found in the store
 	cesController.onEndpointUpdate(cep1)
 
-	queue := cesController.getQueue()
-	key, _ := queue.Get()
+	key, _, _ := cesController.queue.GetWithPriority()
 	if err := testutils.WaitUntil(func() bool {
 		_, exists, _ := r.cesStore.GetByKey(NewCESKey(key.Name, "").key())
 		return exists == true
@@ -304,8 +328,7 @@ func TestCESManagementDefault(t *testing.T) {
 		assert.True(t, exists)
 	}
 
-	cesController.fastQueue.ShutDown()
-	cesController.standardQueue.ShutDown()
+	cesController.queue.ShutDown()
 	hive.Stop(log, t.Context())
 }
 
@@ -353,13 +376,13 @@ func TestFCFSModeSyncCESsInLocalCache(t *testing.T) {
 	cidStore, _ := ciliumIdentity.Store(t.Context())
 	podStore, _ := pods.Store(t.Context())
 	nsStore, _ := namespace.Store(t.Context())
-	r = newSlimReconciler(fakeClient.CiliumFakeClientset.CiliumV2alpha1(), m, log, cesStore, podStore, cidStore, nodeStore, nsStore, cesMetrics, false, false)
+	r = newSlimReconciler(fakeClient.CiliumFakeClientset.CiliumV2alpha1(), m, log, cmtypes.DefaultClusterInfo, cesStore, podStore, cidStore, nodeStore, nsStore, cesMetrics, false, false)
 	rateLimitConfig, err := getRateLimitConfig(params{Cfg: defaultConfig})
 	assert.NoError(t, err)
 	cesController := &SlimController{
 		Controller: &Controller{
 			logger:              log,
-			clientset:           fakeClient.Clientset,
+			clientset:           fakeClient,
 			ciliumEndpointSlice: ciliumEndpointSlice,
 			ciliumNodes:         ciliumNode,
 			namespace:           namespace,
@@ -368,7 +391,6 @@ func TestFCFSModeSyncCESsInLocalCache(t *testing.T) {
 			doReconciler:        r,
 			metrics:             cesMetrics,
 			priorityNamespaces:  make(map[string]struct{}),
-			cond:                *sync.NewCond(&lock.Mutex{}),
 		},
 		ipsecEnabled:   false,
 		wgEnabled:      false,
@@ -431,8 +453,7 @@ func TestFCFSModeSyncCESsInLocalCache(t *testing.T) {
 		}
 	}
 
-	cesController.fastQueue.ShutDown()
-	cesController.standardQueue.ShutDown()
+	cesController.queue.ShutDown()
 	hive.Stop(tlog, t.Context())
 }
 
@@ -481,14 +502,14 @@ func TestDifferentSpeedQueues(t *testing.T) {
 	cidStore, _ := ciliumIdentity.Store(t.Context())
 	podStore, _ := pods.Store(t.Context())
 	nsStore, _ := namespace.Store(t.Context())
-	r = newSlimReconciler(fakeClient.CiliumFakeClientset.CiliumV2alpha1(), m, log, cesStore, podStore, cidStore, nodeStore, nsStore, cesMetrics, false, false)
+	r = newSlimReconciler(fakeClient.CiliumFakeClientset.CiliumV2alpha1(), m, log, cmtypes.DefaultClusterInfo, cesStore, podStore, cidStore, nodeStore, nsStore, cesMetrics, false, false)
 
 	rateLimitConfig, err := getRateLimitConfig(params{Cfg: defaultConfig})
 	assert.NoError(t, err)
 	cesController := &SlimController{
 		Controller: &Controller{
 			logger:              log,
-			clientset:           fakeClient.Clientset,
+			clientset:           fakeClient,
 			ciliumEndpointSlice: ciliumEndpointSlice,
 			ciliumNodes:         ciliumNode,
 			namespace:           namespace,
@@ -497,7 +518,6 @@ func TestDifferentSpeedQueues(t *testing.T) {
 			doReconciler:        r,
 			metrics:             cesMetrics,
 			priorityNamespaces:  make(map[string]struct{}),
-			cond:                *sync.NewCond(&lock.Mutex{}),
 		},
 		ipsecEnabled:   false,
 		wgEnabled:      false,
@@ -529,12 +549,14 @@ func TestDifferentSpeedQueues(t *testing.T) {
 			standardQueueLen = 6
 			fastQueueLen = i - 5
 		}
-		//Ensure that the lengths of the queues after adding an element are correct
+		// Ensure that the lengths of the queues after adding an element are correct
 		if err := testutils.WaitUntil(func() bool {
-			return cesController.standardQueue.Len() == standardQueueLen && cesController.fastQueue.Len() == fastQueueLen
+			standardLen, fastLen := queueLengths(t, cesController.Controller)
+			return standardLen == standardQueueLen && fastLen == fastQueueLen
 		}, time.Second); err != nil {
-			assert.Equal(t, standardQueueLen, cesController.standardQueue.Len())
-			assert.Equal(t, fastQueueLen, cesController.fastQueue.Len())
+			standardLen, fastLen := queueLengths(t, cesController.Controller)
+			assert.Equal(t, standardQueueLen, standardLen)
+			assert.Equal(t, fastQueueLen, fastLen)
 		}
 	}
 
@@ -547,17 +569,18 @@ func TestDifferentSpeedQueues(t *testing.T) {
 			standardQueueLen = 6 - (i - 3)
 			fastQueueLen = 0
 		}
-		//Ensure that the lengths of the queues after removing an element are correct
+		// Ensure that the lengths of the queues after removing an element are correct
 		if err := testutils.WaitUntil(func() bool {
-			return cesController.standardQueue.Len() == standardQueueLen && cesController.fastQueue.Len() == fastQueueLen
+			standardLen, fastLen := queueLengths(t, cesController.Controller)
+			return standardLen == standardQueueLen && fastLen == fastQueueLen
 		}, time.Second); err != nil {
-			assert.Equal(t, standardQueueLen, cesController.standardQueue.Len())
-			assert.Equal(t, fastQueueLen, cesController.fastQueue.Len())
+			standardLen, fastLen := queueLengths(t, cesController.Controller)
+			assert.Equal(t, standardQueueLen, standardLen)
+			assert.Equal(t, fastQueueLen, fastLen)
 		}
 	}
 
-	cesController.fastQueue.ShutDown()
-	cesController.standardQueue.ShutDown()
+	cesController.queue.ShutDown()
 	hive.Stop(tlog, t.Context())
 }
 
@@ -606,14 +629,14 @@ func TestCESManagement(t *testing.T) {
 	nodeStore, _ := ciliumNode.Store(t.Context())
 	cidStore, _ := ciliumIdentity.Store(t.Context())
 	nsStore, _ := namespace.Store(t.Context())
-	r = newSlimReconciler(fakeClient.CiliumFakeClientset.CiliumV2alpha1(), m, log, cesStore, podStore, cidStore, nodeStore, nsStore, cesMetrics, false, false)
+	r = newSlimReconciler(fakeClient.CiliumFakeClientset.CiliumV2alpha1(), m, log, cmtypes.DefaultClusterInfo, cesStore, podStore, cidStore, nodeStore, nsStore, cesMetrics, false, false)
 
 	rateLimitConfig, err := getRateLimitConfig(params{Cfg: defaultConfig})
 	assert.NoError(t, err)
 	cesController := &SlimController{
 		Controller: &Controller{
 			logger:              log,
-			clientset:           fakeClient.Clientset,
+			clientset:           fakeClient,
 			ciliumEndpointSlice: ciliumEndpointSlice,
 			ciliumNodes:         ciliumNode,
 			namespace:           namespace,
@@ -622,7 +645,6 @@ func TestCESManagement(t *testing.T) {
 			doReconciler:        r,
 			metrics:             cesMetrics,
 			priorityNamespaces:  make(map[string]struct{}),
-			cond:                *sync.NewCond(&lock.Mutex{}),
 		},
 		ipsecEnabled:   false,
 		wgEnabled:      false,
@@ -650,17 +672,16 @@ func TestCESManagement(t *testing.T) {
 
 	cesController.onPodUpdate(pod1)
 	if err := testutils.WaitUntil(func() bool {
-		return cesController.standardQueue.Len() == 1
+		return cesController.queue.Len() == 1
 	}, time.Second); err != nil {
-		assert.Equal(t, 1, cesController.standardQueue.Len())
+		assert.Equal(t, 1, cesController.queue.Len())
 	}
 	cesController.processNextWorkItem(t.Context())
 	//A CEP is enqueued and processed. Then, the same CEP (and CES) is enqueued
 	//to test if the CESStore works properly and if the associated CES can be found in the store
 	cesController.onPodUpdate(pod1)
 
-	queue := cesController.getQueue()
-	key, _ := queue.Get()
+	key, _, _ := cesController.queue.GetWithPriority()
 	if err := testutils.WaitUntil(func() bool {
 		_, exists, _ := r.cesStore.GetByKey(NewCESKey(key.Name, "").key())
 		return exists == true
@@ -670,8 +691,7 @@ func TestCESManagement(t *testing.T) {
 	}
 	cesController.onNamespaceDelete(nsObj)
 
-	cesController.fastQueue.ShutDown()
-	cesController.standardQueue.ShutDown()
+	cesController.queue.ShutDown()
 	hive.Stop(tlog, t.Context())
 }
 
@@ -731,13 +751,13 @@ func TestSyncCESsInLocalCacheOperatorDowntime(t *testing.T) {
 	cidStore, _ := ciliumIdentity.Store(t.Context())
 	podStore, _ := pods.Store(t.Context())
 	nsStore, _ := namespace.Store(t.Context())
-	r = newSlimReconciler(fakeClient.CiliumFakeClientset.CiliumV2alpha1(), m, log, cesStore, podStore, cidStore, nodeStore, nsStore, cesMetrics, false, false)
+	r = newSlimReconciler(fakeClient.CiliumFakeClientset.CiliumV2alpha1(), m, log, cmtypes.DefaultClusterInfo, cesStore, podStore, cidStore, nodeStore, nsStore, cesMetrics, false, false)
 	rateLimitConfig, err := getRateLimitConfig(params{Cfg: defaultConfig})
 	assert.NoError(t, err)
 	cesController := &SlimController{
 		Controller: &Controller{
 			logger:              log,
-			clientset:           fakeClient.Clientset,
+			clientset:           fakeClient,
 			ciliumEndpointSlice: ciliumEndpointSlice,
 			ciliumNodes:         ciliumNode,
 			namespace:           namespace,
@@ -747,7 +767,6 @@ func TestSyncCESsInLocalCacheOperatorDowntime(t *testing.T) {
 			metrics:             cesMetrics,
 			priorityNamespaces:  make(map[string]struct{}),
 			syncDelay:           0,
-			cond:                *sync.NewCond(&lock.Mutex{}),
 		},
 		ipsecEnabled:   false,
 		wgEnabled:      false,
@@ -829,7 +848,7 @@ func TestSyncCESsInLocalCacheOperatorDowntime(t *testing.T) {
 	// - ces2 because pod7 was skipped as stale.
 	// - the CES that received pod8 (via onPodUpdate's enqueue).
 	if err := testutils.WaitUntil(func() bool {
-		return cesController.fastQueue.Len()+cesController.standardQueue.Len() >= 1
+		return cesController.queue.Len() >= 1
 	}, time.Second); err != nil {
 		t.Fatalf("expected CES(es) to be enqueued after bootstrap; queues empty")
 	}
@@ -843,7 +862,6 @@ func TestSyncCESsInLocalCacheOperatorDowntime(t *testing.T) {
 		assert.Contains(t, m.mapping.cepData, NewCEPName(pod.Name, "ns"))
 	}
 
-	cesController.fastQueue.ShutDown()
-	cesController.standardQueue.ShutDown()
+	cesController.queue.ShutDown()
 	hive.Stop(tlog, t.Context())
 }

@@ -5,6 +5,7 @@ package peer
 
 import (
 	"net"
+	"net/netip"
 	"strconv"
 	"strings"
 
@@ -12,16 +13,11 @@ import (
 	ciliumDefaults "github.com/cilium/cilium/pkg/defaults"
 	"github.com/cilium/cilium/pkg/hubble/defaults"
 	"github.com/cilium/cilium/pkg/hubble/peer/serviceoption"
-	"github.com/cilium/cilium/pkg/node"
 	"github.com/cilium/cilium/pkg/node/types"
 )
 
-// handler implements the node.Handler interface so that it can be
-// subscribed to a node manager and receives update about nodes being
-// added/updated/deleted. Node update information is turned into
-// peerpb.ChangeNotification and sent to the channel C. As this channel is
-// unbuffered, clients must be ready to read from it before subscribing the
-// handler to the node manager.
+// handler turns node table changes into peerpb.ChangeNotifications. As C is
+// unbuffered, clients must be ready to read from it before processing changes.
 // Once not used anymore, Close must be called to free resources.
 type handler struct {
 	stop        chan struct{}
@@ -41,39 +37,28 @@ func newHandler(withoutTLSInfo bool, addressPref serviceoption.AddressFamilyPref
 	}
 }
 
-func (h *handler) Name() string {
-	return "hubble-peer"
-}
-
-// Ensure that Service implements the NodeHandler interface so that it can be
-// notified of nodes updates by the daemon's node manager.
-var _ node.Handler = (*handler)(nil)
-
-// NodeAdd implements node.Handler.NodeAdd.
-func (h *handler) NodeAdd(n types.Node) error {
+func (h *handler) nodeAdded(n types.Node) {
 	cn := h.newChangeNotification(n, peerpb.ChangeNotificationType_PEER_ADDED)
 	select {
 	case h.C <- cn:
 	case <-h.stop:
 	}
-	return nil
 }
 
-// NodeUpdate implements node.Handler.NodeUpdate.
-func (h *handler) NodeUpdate(o, n types.Node) error {
+func (h *handler) nodeUpdated(o, n types.Node) {
 	oAddr, nAddr := nodeAddress(o, h.addressPref), nodeAddress(n, h.addressPref)
 	if o.Fullname() == n.Fullname() {
-		if oAddr.String() == nAddr.String() {
+		if oAddr == nAddr {
 			// this corresponds to the same peer
 			// => no need to send a notification
-			return nil
+			return
 		}
 		cn := h.newChangeNotification(n, peerpb.ChangeNotificationType_PEER_UPDATED)
 		select {
 		case h.C <- cn:
 		case <-h.stop:
 		}
-		return nil
+		return
 	}
 	// the name has changed; from a service consumer perspective, this is the
 	// same as if the peer with the old name was removed and a new one added
@@ -81,35 +66,21 @@ func (h *handler) NodeUpdate(o, n types.Node) error {
 	select {
 	case h.C <- ocn:
 	case <-h.stop:
-		return nil
+		return
 	}
 	ncn := h.newChangeNotification(n, peerpb.ChangeNotificationType_PEER_ADDED)
 	select {
 	case h.C <- ncn:
 	case <-h.stop:
 	}
-	return nil
 }
 
-// NodeDelete implements node.Handler.NodeDelete.
-func (h *handler) NodeDelete(n types.Node) error {
+func (h *handler) nodeDeleted(n types.Node) {
 	cn := h.newChangeNotification(n, peerpb.ChangeNotificationType_PEER_DELETED)
 	select {
 	case h.C <- cn:
 	case <-h.stop:
 	}
-	return nil
-}
-
-// AllNodeValidateImplementation implements
-func (h handler) AllNodeValidateImplementation() {
-}
-
-// NodeValidateImplementation implements
-// node.Handler.NodeValidateImplementation. It is a no-op.
-func (h handler) NodeValidateImplementation(_ types.Node) error {
-	// no-op
-	return nil
 }
 
 // Close frees handler resources.
@@ -129,7 +100,7 @@ func (h *handler) newChangeNotification(n types.Node, t peerpb.ChangeNotificatio
 	}
 
 	addr := ""
-	if ip := nodeAddress(n, h.addressPref); ip != nil {
+	if ip := nodeAddress(n, h.addressPref); ip.IsValid() {
 		addr = ip.String()
 		if h.hubblePort != 0 {
 			addr = net.JoinHostPort(addr, strconv.Itoa(h.hubblePort))
@@ -146,20 +117,22 @@ func (h *handler) newChangeNotification(n types.Node, t peerpb.ChangeNotificatio
 
 // nodeAddress returns the node's address. If the node has both IPv4 and IPv6
 // addresses, pref controls which address type is returned.
-func nodeAddress(n types.Node, pref serviceoption.AddressFamilyPreference) net.IP {
+func nodeAddress(n types.Node, pref serviceoption.AddressFamilyPreference) netip.Addr {
 	for _, family := range pref {
 		switch family {
 		case serviceoption.AddressFamilyIPv4:
-			if addr := n.GetNodeIP(false); addr.To4() != nil {
+			// GetNodeIP already filters on the address family, so a valid
+			// address is necessarily of the requested one.
+			if addr := n.GetNodeIP(false); addr.IsValid() {
 				return addr
 			}
 		case serviceoption.AddressFamilyIPv6:
-			if addr := n.GetNodeIP(true); addr.To4() == nil {
+			if addr := n.GetNodeIP(true); addr.IsValid() {
 				return addr
 			}
 		}
 	}
-	return nil
+	return netip.Addr{}
 }
 
 // TLSServerName constructs a server name to be used as the TLS server name.

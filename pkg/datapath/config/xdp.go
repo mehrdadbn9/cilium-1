@@ -6,6 +6,7 @@ package config
 import (
 	"github.com/vishvananda/netlink"
 
+	"github.com/cilium/cilium/pkg/byteorder"
 	"github.com/cilium/cilium/pkg/option"
 )
 
@@ -18,6 +19,11 @@ func XDP(lnc *Config, link netlink.Link) any {
 
 	cfg.EnableExtendedIPProtocols = option.Config.EnableExtendedIPProtocols
 
+	cfg.EnableVTEP = option.Config.EnableVTEP
+	if option.Config.EnableVTEP {
+		cfg.VTEPMask = byteorder.NetIPAddrToHost32(option.Config.VtepCidrMask)
+	}
+
 	cfg.EphemeralMin = lnc.EphemeralMin
 
 	cfg.EnableXDPPrefilter = option.Config.EnableXDPPrefilter
@@ -27,44 +33,15 @@ func XDP(lnc *Config, link netlink.Link) any {
 
 	cfg.EnableIPv4Fragments = option.Config.EnableIPv4FragmentsTracking
 	cfg.EnableIPv6Fragments = option.Config.EnableIPv6FragmentsTracking
+	cfg.EnableServiceNoBackendResponse = option.Config.ServiceNoBackendResponseEnabled()
 
-	if option.Config.EnableIPv4 {
-		if option.Config.LoadBalancerRSSv4CIDR != "" {
-			copy(cfg.IPv4RSSPrefix.Addr[:], option.Config.UnsafeDaemonConfigOption.LoadBalancerRSSv4.IP.To4())
-			ones, _ := option.Config.UnsafeDaemonConfigOption.LoadBalancerRSSv4.Mask.Size()
-			cfg.IPv4RSSPrefixBits = uint8(ones)
-		} else {
-			cfg.IPv4RSSPrefixBits = 32
-			if lnc.DirectRoutingDevice != nil {
-				for _, addr := range lnc.DirectRoutingDevice.Addrs {
-					if addr.Addr.Is4() {
-						cfg.IPv4RSSPrefix.Addr = addr.Addr.As4()
-						break
-					}
-				}
-			}
-		}
-	}
-
-	if option.Config.EnableIPv6 {
-		if option.Config.LoadBalancerRSSv6CIDR != "" {
-			copy(cfg.IPv6RSSPrefix.Addr[:], option.Config.UnsafeDaemonConfigOption.LoadBalancerRSSv6.IP.To16())
-			ones, _ := option.Config.UnsafeDaemonConfigOption.LoadBalancerRSSv6.Mask.Size()
-			cfg.IPv6RSSPrefixBits = uint8(ones)
-		} else {
-			cfg.IPv6RSSPrefixBits = 128
-			if lnc.DirectRoutingDevice != nil {
-				for _, addr := range lnc.DirectRoutingDevice.Addrs {
-					if addr.Addr.Is6() {
-						cfg.IPv6RSSPrefix.Addr = addr.Addr.As16()
-						if !addr.Addr.IsLinkLocalUnicast() {
-							break
-						}
-					}
-				}
-			}
-		}
-	}
+	lbRSSCfg := lnc.LoadBalancerRSS
+	ipv4Prefix := lbRSSCfg.IPv4Prefix()
+	cfg.IPv4RSSPrefix.Addr = ipv4Prefix.Addr().As4()
+	cfg.IPv4RSSPrefixBits = uint8(ipv4Prefix.Bits())
+	ipv6Prefix := lbRSSCfg.IPv6Prefix()
+	cfg.IPv6RSSPrefix.Addr = ipv6Prefix.Addr().As16()
+	cfg.IPv6RSSPrefixBits = uint8(ipv6Prefix.Bits())
 
 	return cfg
 }

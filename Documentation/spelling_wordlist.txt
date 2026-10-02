@@ -56,6 +56,7 @@ GiB
 Gospodarek
 Graf
 Gunawardena
+Hetzner
 Holzheu
 Huapeng
 Hypercalls
@@ -295,6 +296,7 @@ ctf
 customConf
 daemonset
 datacenter
+datacenters
 datagram
 datagrams
 datapath
@@ -741,6 +743,7 @@ repos
 reproducibility
 reqid
 requireIPv
+reservedRanges
 resizable
 resolvers
 resync
@@ -865,6 +868,7 @@ tunables
 tunings
 tunnelProtocol
 txtar
+uRPF
 ubuntu
 udp
 ui
@@ -884,6 +888,7 @@ unmanaged
 unmarshalled
 unmigrated
 unpaginated
+unrecognised
 unselect
 unsettable
 untriaged

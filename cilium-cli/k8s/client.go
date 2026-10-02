@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/blang/semver/v4"
+	"github.com/moby/spdystream"
 	"helm.sh/helm/v4/pkg/action"
 	"helm.sh/helm/v4/pkg/cli/output"
 	appsv1 "k8s.io/api/apps/v1"
@@ -394,6 +395,12 @@ var transientExecErrorSubstrings = []string{
 	"TLS handshake timeout",
 }
 
+var transientExecErrors = []error{
+	spdystream.ErrTimeout,
+	spdystream.ErrReset,
+	spdystream.ErrWriteClosedStream,
+}
+
 // IsTransientExecError reports whether err looks like a transient failure of
 // the Kubernetes API server exec proxy, as opposed to a genuine failure of the
 // command that was executed in the pod. Callers that exec through the proxy in
@@ -402,6 +409,9 @@ var transientExecErrorSubstrings = []string{
 func IsTransientExecError(err error) bool {
 	if err == nil {
 		return false
+	}
+	if slices.ContainsFunc(transientExecErrors, func(target error) bool { return errors.Is(err, target) }) {
+		return true
 	}
 	msg := err.Error()
 	return slices.ContainsFunc(transientExecErrorSubstrings, func(substr string) bool {
@@ -682,7 +692,7 @@ func (c *Client) AutodetectFlavor(ctx context.Context) Flavor {
 
 	if context, ok := c.RawConfig.Contexts[c.ContextName()]; ok {
 		if cluster, ok := c.RawConfig.Clusters[context.Cluster]; ok {
-			if strings.HasSuffix(cluster.Server, "eks.amazonaws.com") {
+			if strings.Contains(cluster.Server, ".eks-cluster.") || strings.Contains(cluster.Server, ".eks.") {
 				f.Kind = KindEKS
 				return f
 			} else if strings.HasSuffix(cluster.Server, "azmk8s.io:443") {
@@ -1047,10 +1057,6 @@ func (c *Client) ListCiliumNodes(ctx context.Context) (*ciliumv2.CiliumNodeList,
 
 func (c *Client) ListCiliumNodeConfigs(ctx context.Context, namespace string, opts metav1.ListOptions) (*ciliumv2.CiliumNodeConfigList, error) {
 	return c.CiliumClientset.CiliumV2().CiliumNodeConfigs(namespace).List(ctx, opts)
-}
-
-func (c *Client) ListCiliumPodIPPools(ctx context.Context, opts metav1.ListOptions) (*ciliumv2alpha1.CiliumPodIPPoolList, error) {
-	return c.CiliumClientset.CiliumV2alpha1().CiliumPodIPPools().List(ctx, opts)
 }
 
 func (c *Client) ListCiliumL2AnnouncementPolicies(ctx context.Context, opts metav1.ListOptions) (*ciliumv2alpha1.CiliumL2AnnouncementPolicyList, error) {

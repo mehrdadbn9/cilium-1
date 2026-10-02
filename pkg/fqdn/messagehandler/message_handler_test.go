@@ -86,7 +86,7 @@ func BenchmarkNotifyOnDNSMsg(b *testing.B) {
 		wg sync.WaitGroup
 	)
 
-	policyRepo := policy.NewPolicyRepository(logger, nil, nil, nil, nil, testpolicy.NewPolicyMetricsNoop())
+	policyRepo := policy.NewPolicyRepository(logger, cmtypes.DefaultClusterInfo, nil, nil, nil, nil, testpolicy.NewPolicyMetricsNoop())
 	ipc := &mockipc.MockIPCache{}
 	nm := namemanager.New(namemanager.ManagerParams{
 		Config: namemanager.NameManagerConfig{
@@ -123,7 +123,7 @@ func BenchmarkNotifyOnDNSMsg(b *testing.B) {
 			ID:   uint16(i),
 			IPv4: netip.MustParseAddr(fmt.Sprintf("10.96.%d.%d", i/256, i%256)),
 			SecurityIdentity: &identity.Identity{
-				ID: identity.NumericIdentity(i % int(identity.GetMaximumAllocationIdentity(cmtypes.DefaultClusterInfo.ID))),
+				ID: identity.NumericIdentity(i % int(cmtypes.DefaultClusterInfo.MaximumAllocationIdentity())),
 			},
 			DNSZombies: &fqdn.DNSZombieMappings{
 				Mutex: lock.Mutex{},

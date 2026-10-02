@@ -5,6 +5,8 @@ package ciliumendpointslice
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"slices"
 	"strconv"
 	"time"
@@ -16,7 +18,9 @@ import (
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/client-go/util/workqueue"
+	"sigs.k8s.io/controller-runtime/pkg/controller/priorityqueue"
 
+	"github.com/cilium/cilium/operator/pkg/ciliumidentity"
 	"github.com/cilium/cilium/pkg/identity/key"
 	"github.com/cilium/cilium/pkg/k8s"
 	cilium_api_v2 "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2"
@@ -39,6 +43,9 @@ const (
 	// dropped out of the queue.
 	maxRetries = 15
 
+	// highPriority is the priority used for CES work from priority namespaces.
+	highPriority = 100
+
 	// Default CES Synctime, multiple consecutive syncs with k8s-apiserver are
 	// batched and synced together after a short delay.
 	DefaultCESSyncTime = 500 * time.Millisecond
@@ -53,19 +60,11 @@ func (c *Controller) initializeQueue() {
 		logfields.WorkQueueBurstLimit, c.rateLimit.current.Burst,
 		logfields.WorkQueueSyncBackOff, defaultSyncBackOff)
 
-	// Single rateLimiter controls the number of processed events in both queues.
 	c.rateLimiter = workqueue.NewTypedItemExponentialFailureRateLimiter[CESKey](defaultSyncBackOff, maxSyncBackOff)
-	c.fastQueue = workqueue.NewTypedRateLimitingQueueWithConfig(
-		c.rateLimiter,
-		workqueue.TypedRateLimitingQueueConfig[CESKey]{
-			Name:            "cilium_endpoint_slice_fast",
-			MetricsProvider: c.workqueueMetricsProvider,
-		})
-	c.standardQueue = workqueue.NewTypedRateLimitingQueueWithConfig(
-		c.rateLimiter,
-		workqueue.TypedRateLimitingQueueConfig[CESKey]{
-			Name:            "cilium_endpoint_slice_standard",
-			MetricsProvider: c.workqueueMetricsProvider,
+	c.queue = priorityqueue.New("cilium_endpoint_slice",
+		func(opts *priorityqueue.Opts[CESKey]) {
+			opts.RateLimiter = c.rateLimiter
+			opts.MetricProvider = c.workqueueMetricsProvider
 		})
 }
 
@@ -105,18 +104,12 @@ func (c *Controller) addToQueue(ces CESKey) {
 	c.priorityNamespacesLock.RLock()
 	_, exists := c.priorityNamespaces[ces.Namespace]
 	c.priorityNamespacesLock.RUnlock()
-	time.AfterFunc(c.syncDelay, func() {
-		c.cond.L.Lock()
-		defer c.cond.L.Unlock()
-		if exists {
-			c.fastQueue.Add(ces)
-		} else {
-			c.standardQueue.Add(ces)
-		}
-		c.cond.Signal()
 
-	})
-
+	opts := priorityqueue.AddOpts{After: c.syncDelay}
+	if exists {
+		opts.Priority = new(highPriority)
+	}
+	c.queue.AddWithOpts(opts, ces)
 }
 
 func (c *Controller) enqueueCESReconciliation(cess []CESKey) {
@@ -151,17 +144,14 @@ func (c *Controller) getAndResetCESProcessingDelay(ces CESKey) float64 {
 // start the worker thread, reconciles the modified CESs with api-server
 func (c *DefaultController) Start(ctx cell.HookContext) error {
 	// Processing CES/CEP events:
-	// CES or CEP event is retrieved and checked whether it is from a priority namespace
-	// Event is added to the fast queue if the namespace was priority and to the standard queue otherwise
-
-	// Processing queues:
-	// The controller checks if the fast queue and standard queue are empty
-	// If yes, it waits on signal
-	// if no, it checks if fast queue is empty
-	// If no, it takes element from the fast queue. Otherwise it takes element from the standard queue.
-	// CES from the queue is reconciled with the k8s api-server
-	// if error appears while reconciling and maximum number of retries for this element has not been reached, it is added to the appropriate queue.
-	// if the error has not appeared or the maximum number of retries has been reached, the element is forgotten.
+	// CES or CEP event is retrieved and checked whether it is from a priority namespace.
+	// Event is added with priority highPriority (100) if the namespace was priority, or with
+	// default priority (0) otherwise.
+	//
+	// If an error appears while reconciling and maximum number of retries for this
+	// element has not been reached, it is re-added to the priority queue.
+	// If the error has not appeared or the maximum number of retries has been
+	// reached, the element is forgotten.
 
 	c.logger.InfoContext(ctx, "Bootstrap ces controller")
 	defer utilruntime.HandleCrash()
@@ -218,8 +208,7 @@ func (c *DefaultController) Start(ctx cell.HookContext) error {
 			<-ctx.Done()
 			workerCancel()
 			c.wp.Close()
-			c.fastQueue.ShutDown()
-			c.standardQueue.ShutDown()
+			c.queue.ShutDown()
 			return nil
 		}),
 	)
@@ -230,10 +219,11 @@ func (c *DefaultController) Start(ctx cell.HookContext) error {
 // start the worker thread, reconciles the modified CESs with api-server
 func (c *SlimController) Start(ctx cell.HookContext) error {
 	// Processing CES/Pod events:
-	// CES or Pod event is retrieved and checked whether it is from a priority namespace
-	// Event is added to the fast queue if the namespace was priority and to the standard queue otherwise
+	// CES or Pod event is retrieved and checked whether it is from a priority namespace.
+	// Event is added with priority 100 if the namespace was priority, or with
+	// default priority otherwise.
 
-	// Processing queues handled as with DefaultController.
+	// Processing queue handled as with DefaultController.
 
 	c.logger.InfoContext(ctx, "Bootstrap ces controller")
 	defer utilruntime.HandleCrash()
@@ -245,7 +235,7 @@ func (c *SlimController) Start(ctx cell.HookContext) error {
 	ciStore, _ := c.ciliumIdentity.Store(ctx)
 	cnodeStore, _ := c.ciliumNodes.Store(ctx)
 	namespaceStore, _ := c.namespace.Store(ctx)
-	c.reconciler = newSlimReconciler(c.clientset.CiliumV2alpha1(), c.manager, c.logger, cesStore, podStore, ciStore, cnodeStore, namespaceStore, c.metrics, c.ipsecEnabled, c.wgEnabled)
+	c.reconciler = newSlimReconciler(c.clientset.CiliumV2alpha1(), c.manager, c.logger, c.clusterInfo, cesStore, podStore, ciStore, cnodeStore, namespaceStore, c.metrics, c.ipsecEnabled, c.wgEnabled)
 	c.doReconciler = c.reconciler
 
 	c.initializeQueue()
@@ -290,8 +280,7 @@ func (c *SlimController) Start(ctx cell.HookContext) error {
 		// Add the shutdown job last so it stops first.
 		job.OneShot("shutdown", func(ctx context.Context, health cell.Health) error {
 			<-ctx.Done()
-			c.fastQueue.ShutDown()
-			c.standardQueue.ShutDown()
+			c.queue.ShutDown()
 			workerCancel()
 			return nil
 		}),
@@ -442,29 +431,29 @@ func (c *SlimController) onIdentityDelete(cid *cilium_api_v2.CiliumIdentity) {
 	c.enqueueCESReconciliation(touchedCESs)
 }
 
-// On Pod Update, verify all the necessary fields are set.
-// We recalculate the relevant fields when updating the CES instead of
-// saving them here in case of any changes in value, to minimize the
-// number of CES updates.
-// Returns error if requires retry without pod update.
+// errSkipPodEvent is a sentinel error used by [resolvePodPlacement] when the
+// given pod event should be skipped, waiting for a subsequent update event.
+var errSkipPodEvent = errors.New("pod event skipped")
+
 // resolvePodPlacement gathers the state needed to place a pod into a CES.
-// Returns (node, cidKey, true) if the pod is placeable, or ("", nil, false)
-// if it should be skipped (empty name/namespace, host-network, no IPs,
-// unscheduled, or unresolvable labels). Errors are logged at debug level.
-func (c *SlimController) resolvePodPlacement(pod *slim_corev1.Pod) (string, *key.GlobalIdentity, bool) {
+// Returns a [errSkipPodEvent] error if the event should be skipped without
+// further processing (empty name/namespace, host-network, no IPs, unscheduled),
+// and a real error in case it is not possible to resolve the pod placement
+// (e.g., unresolvable labels).
+func (c *SlimController) resolvePodPlacement(pod *slim_corev1.Pod) (string, *key.GlobalIdentity, error) {
 	if pod.GetName() == "" || pod.GetNamespace() == "" {
-		return "", nil, false
+		return "", nil, errSkipPodEvent
 	}
 	if pod.Spec.HostNetwork {
 		// no CEP for host networking pods
-		return "", nil, false
+		return "", nil, errSkipPodEvent
 	}
 	if _, err := GetPodEndpointNetworking(pod); err != nil {
 		c.logger.Debug("could not get endpointnetworking for pod",
 			logfields.K8sPodName, pod.Name,
 			logfields.Error, err)
 		// When pod is assigned IPs or scheduled, we will receive a new update.
-		return "", nil, false
+		return "", nil, errSkipPodEvent
 	}
 	node, err := getNodeNameForPod(pod)
 	if err != nil {
@@ -472,23 +461,46 @@ func (c *SlimController) resolvePodPlacement(pod *slim_corev1.Pod) (string, *key
 			logfields.K8sPodName, pod.Name,
 			logfields.Error, err)
 		// When pod is scheduled, we will receive a new update.
-		return "", nil, false
+		return "", nil, errSkipPodEvent
 	}
-	cidKey, err := getPodCIDKey(pod, c.logger, c.reconciler.namespaceStore)
+
+	var existingCID *cilium_api_v2.CiliumIdentity
+	if cidName, exists := c.manager.getCIDForCEP(GetCEPNameFromPod(pod)); exists {
+		cid, cidExists, cidErr := c.reconciler.cidStore.GetByKey(resource.Key{Name: string(cidName)})
+		if cidErr != nil {
+			return "", nil, cidErr
+		}
+		if !cidExists {
+			return "", nil, fmt.Errorf("CID name %q exists for pod %s/%s, but the CiliumIdentity was not found", cidName, pod.Namespace, pod.Name)
+		}
+		existingCID = cid
+	}
+
+	cidKey, err := ciliumidentity.GetCIDKeyForPod(c.logger, pod, c.reconciler.namespaceStore, c.reconciler.clusterInfo, existingCID)
 	if err != nil {
 		c.logger.Debug("could not get labels for pod",
 			logfields.K8sPodName, pod.Name,
 			logfields.Error, err)
-		return "", nil, false
+		return "", nil, err
 	}
-	return node, cidKey, true
+	return node, cidKey, nil
 }
 
+// On Pod Update, verify all the necessary fields are set.
+// We recalculate the relevant fields when updating the CES instead of
+// saving them here in case of any changes in value, to minimize the
+// number of CES updates.
+// Returns error if requires retry without pod update.
 func (c *SlimController) onPodUpdate(pod *slim_corev1.Pod) error {
-	node, cidKey, ok := c.resolvePodPlacement(pod)
-	if !ok {
-		return nil
+	node, cidKey, err := c.resolvePodPlacement(pod)
+	if err != nil {
+		if errors.Is(err, errSkipPodEvent) {
+			return nil
+		}
+
+		return err
 	}
+
 	touchedCESs := c.manager.AddPodMapping(pod, node, cidKey)
 	c.enqueueCESReconciliation(touchedCESs)
 	return nil
@@ -636,7 +648,7 @@ podLoop:
 		switch event.Kind {
 		case resource.Upsert:
 			pod := event.Object
-			if _, _, ok := c.resolvePodPlacement(pod); ok {
+			if _, _, err := c.resolvePodPlacement(pod); err == nil {
 				livepods[GetCEPNameFromPod(pod)] = pod
 			}
 		case resource.Delete:
@@ -750,41 +762,25 @@ func (c *Controller) rateLimitProcessing(ctx context.Context) {
 	}
 }
 
-func (c *Controller) getQueue() workqueue.TypedRateLimitingInterface[CESKey] {
-	c.cond.L.Lock()
-	defer c.cond.L.Unlock()
-
-	if c.fastQueue.Len() == 0 && c.standardQueue.Len() == 0 {
-		c.cond.Wait()
-	}
-
-	if c.fastQueue.Len() == 0 {
-		return c.standardQueue
-	} else {
-		return c.fastQueue
-	}
-}
-
 func (c *Controller) processNextWorkItem(ctx context.Context) bool {
 	c.rateLimitProcessing(ctx)
-	queue := c.getQueue()
-	key, quit := queue.Get()
+	key, priority, quit := c.queue.GetWithPriority()
 	if quit {
 		return false
 	}
-	defer queue.Done(key)
+	defer c.queue.Done(key)
 
 	c.logger.Debug("Processing CES", logfields.CESName, key.string())
 
 	queueDelay := c.getAndResetCESProcessingDelay(key)
 	err := c.doReconciler.reconcileCES(ctx, CESName(key.Name))
-	if queue == c.fastQueue {
+	if priority == highPriority {
 		c.metrics.CiliumEndpointSliceQueueDelay.WithLabelValues(LabelQueueFast).Observe(queueDelay)
 	} else {
 		c.metrics.CiliumEndpointSliceQueueDelay.WithLabelValues(LabelQueueStandard).Observe(queueDelay)
 	}
 
-	isRetried := c.handleErr(queue, err, key)
+	isRetried := c.handleErr(err, key, priority)
 	if err != nil {
 		if isRetried {
 			c.metrics.CiliumEndpointSliceSyncTotal.WithLabelValues(LabelValueOutcomeFail, LabelFailureTypeTransient).Inc()
@@ -798,25 +794,21 @@ func (c *Controller) processNextWorkItem(ctx context.Context) bool {
 	return true
 }
 
-func (c *Controller) handleErr(queue workqueue.TypedRateLimitingInterface[CESKey], err error, key CESKey) (retry bool) {
+func (c *Controller) handleErr(err error, key CESKey, priority int) (retry bool) {
 	if err == nil {
-		queue.Forget(key)
+		c.queue.Forget(key)
 		return false
 	}
 
-	if queue.NumRequeues(key) < maxRetries {
+	if c.queue.NumRequeues(key) < maxRetries {
 		if !k8serrors.IsConflict(err) && !k8serrors.IsAlreadyExists(err) && !k8serrors.IsNotFound(err) && !(k8serrors.IsForbidden(err) && k8serrors.HasStatusCause(err, corev1.NamespaceTerminatingCause)) {
 			c.logger.Warn("Error processing CES, retrying",
 				logfields.CESName, key.string(),
 				logfields.Error, err,
-				logfields.Attempt, queue.NumRequeues(key)+1)
+				logfields.Attempt, c.queue.NumRequeues(key)+1)
 		}
-		time.AfterFunc(c.rateLimiter.When(key), func() {
-			c.cond.L.Lock()
-			defer c.cond.L.Unlock()
-			queue.Add(key)
-			c.cond.Signal()
-		})
+		opts := priorityqueue.AddOpts{RateLimited: true, Priority: &priority}
+		c.queue.AddWithOpts(opts, key)
 		return true
 	}
 
@@ -824,6 +816,6 @@ func (c *Controller) handleErr(queue workqueue.TypedRateLimitingInterface[CESKey
 	c.logger.Error("Dropping the CES from queue, exceeded maxRetries",
 		logfields.CESName, key.string(),
 		logfields.Error, err)
-	queue.Forget(key)
+	c.queue.Forget(key)
 	return false
 }

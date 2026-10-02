@@ -7,7 +7,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
-	"strconv"
 	"sync"
 
 	"github.com/cilium/cilium/pkg/labels"
@@ -40,29 +39,28 @@ type Identity struct {
 }
 
 // IPIdentityPair is a pairing of an IP and the security identity to which that
-// IP corresponds. May include an optional Mask which, if present, denotes that
-// the IP represents a CIDR with the specified Mask.
+// IP corresponds.
 //
 // WARNING - STABLE API
 // This structure is written as JSON to the key-value store. Do NOT modify this
 // structure in ways which are not JSON forward compatible.
 type IPIdentityPair struct {
 	IP                net.IP          `json:"IP"`
-	Mask              net.IPMask      `json:"Mask"`
 	HostIP            net.IP          `json:"HostIP"`
 	ID                NumericIdentity `json:"ID"`
 	Key               uint8           `json:"Key"`
 	Metadata          string          `json:"Metadata"`
 	K8sNamespace      string          `json:"K8sNamespace,omitempty"`
 	K8sPodName        string          `json:"K8sPodName,omitempty"`
+	K8sPodUID         string          `json:"K8sPodUID,omitempty"`
 	K8sServiceAccount string          `json:"K8sServiceAccount,omitempty"`
 	NamedPorts        []NamedPort     `json:"NamedPorts,omitempty"`
 }
 
-type IdentityMap map[NumericIdentity]labels.LabelArray
+type IdentityMap map[NumericIdentity]labels.Labels
 
 // GetKeyName returns the kvstore key to be used for the IPIdentityPair
-func (pair *IPIdentityPair) GetKeyName() string { return pair.PrefixString() }
+func (pair *IPIdentityPair) GetKeyName() string { return pair.IP.String() }
 
 // Marshal returns the IPIdentityPair object as JSON byte slice
 func (pair *IPIdentityPair) Marshal() ([]byte, error) { return json.Marshal(pair) }
@@ -146,26 +144,6 @@ func NewIdentity(id NumericIdentity, lbls labels.Labels) *Identity {
 	return &Identity{ID: id, Labels: lbls, LabelArray: lblArray}
 }
 
-// IsHost determines whether the IP in the pair represents a host (true) or a
-// CIDR prefix (false)
-func (pair *IPIdentityPair) IsHost() bool {
-	return pair.Mask == nil
-}
-
-// PrefixString returns the IPIdentityPair's IP as either a host IP in the
-// format w.x.y.z if 'host' is true, or as a prefix in the format the w.x.y.z/N
-// if 'host' is false.
-func (pair *IPIdentityPair) PrefixString() string {
-	ipstr := pair.IP.String()
-
-	if pair.IsHost() {
-		return ipstr
-	}
-
-	ones, _ := pair.Mask.Size()
-	return ipstr + "/" + strconv.Itoa(ones)
-}
-
 // ScopeForLabels returns the identity scope to be used for the label set.
 // If all labels are either CIDR or reserved, then returns the CIDR scope.
 // Note: This assumes the caller has already called LookupReservedIdentityByLabels;
@@ -226,7 +204,9 @@ func AddUserDefinedNumericIdentitySet(m map[string]string) error {
 // LookupReservedIdentityByLabels looks up a reserved identity by its labels and
 // returns it if found. Returns nil if not found.
 func LookupReservedIdentityByLabels(lbls labels.Labels) *Identity {
-	if identity := WellKnown.LookupByLabels(lbls); identity != nil {
+	// if the identity exactly matches a well-known or reserved identity
+	// by labels, then we're done.
+	if identity := reservedIdentityByLabels(lbls); identity != nil {
 		return identity
 	}
 
@@ -250,19 +230,28 @@ func LookupReservedIdentityByLabels(lbls labels.Labels) *Identity {
 
 	var nid NumericIdentity
 	if lbls.HasHostLabel() {
+		// The `reserved:host` label always gets the host reserved identity, no matter what.
 		nid = ReservedIdentityHost
 	} else if lbls.HasRemoteNodeLabel() {
-		// If selecting remote-nodes via CIDR policies is allowed, then
-		// they no longer have a reserved identity.
+		// Force `reserved:remote-node` to be either `remote-node` or `kube-apiserver`
+		// unless expanded node labels are enabled.
+		//
+		// This logic is essentially duplicated in pkg/ipcache/resolveLabels().
+		//
+		// If we've reached this point, the set of labels does not correspond
+		// to an existing reserved label
+
+		// If CIDR selection is enabled, don't force node numeric ID
 		if option.Config.PolicyCIDRMatchesNodes() {
 			return nil
 		}
 		// If selecting remote-nodes via node labels is allowed, then
-		// they no longer have a reserved identity and are using
+		// they may no longer have a reserved identity and are using
 		// IdentityScopeRemoteNode.
 		if option.Config.PerNodeLabelsEnabled() {
 			return nil
 		}
+
 		nid = ReservedIdentityRemoteNode
 		if lbls.HasKubeAPIServerLabel() {
 			// If there's a kube-apiserver label, then we know this is

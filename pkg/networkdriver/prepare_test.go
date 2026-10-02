@@ -5,10 +5,9 @@ package networkdriver
 
 // Tests for prepareResourceClaim covering:
 //
-//   - driver.allocations is written only after UpdateStatus
-//     succeeds; if UpdateStatus fails the map stays empty.
-//     this avoids keeping a local map entry that does not have a
-//     persistent reference in kubernetes
+//   - StateDB allocation state is written only after UpdateStatus
+//     succeeds; if UpdateStatus fails no allocation row is committed.
+//     This avoids local state without a persistent Kubernetes reference.
 //
 //   - when any step inside the device loop fails, rollback
 //     calls Device.Free() and releaseAddrs() for every previously set-up device.
@@ -22,12 +21,14 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"sync/atomic"
 	"testing"
 
 	"github.com/cilium/hive/cell"
 	"github.com/cilium/hive/hivetest"
+	"github.com/cilium/statedb"
 	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
 	resourceapi "k8s.io/api/resource/v1"
@@ -46,6 +47,41 @@ import (
 )
 
 // ---------------------------------------------------------------------------
+// statedb allocation helpers for tests
+// ---------------------------------------------------------------------------
+
+// allocatedRowsForPod returns all allocations owned by podUID.
+func allocatedRowsForPod(t *testing.T, d *Driver, podUID kubetypes.UID) []*DRAAllocation {
+	t.Helper()
+	txn := d.db.ReadTxn()
+	var rows []*DRAAllocation
+	for row := range AllocationsByPodUID(d.allocationTable, txn, podUID) {
+		rows = append(rows, row)
+	}
+	return rows
+}
+
+// allocatedRowsForClaim returns all allocations owned by claimUID.
+func allocatedRowsForClaim(t *testing.T, d *Driver, claimUID kubetypes.UID) []*DRAAllocation {
+	t.Helper()
+	txn := d.db.ReadTxn()
+	var rows []*DRAAllocation
+	for row := range AllocationsByClaimUID(d.allocationTable, txn, claimUID) {
+		rows = append(rows, row)
+	}
+	return rows
+}
+
+// requireNoAllocations asserts that the allocation table is empty.
+func requireNoAllocations(t *testing.T, d *Driver, msgAndArgs ...any) {
+	t.Helper()
+	txn := d.db.ReadTxn()
+	for row := range d.allocationTable.All(txn) {
+		require.Fail(t, fmt.Sprintf("expected no allocations; found row: %+v", row), msgAndArgs...)
+	}
+}
+
+// ---------------------------------------------------------------------------
 // Instrumented device stub
 // ---------------------------------------------------------------------------
 
@@ -58,11 +94,34 @@ type trackedDevice struct {
 	setupCalls atomic.Int32
 	freeCalls  atomic.Int32
 	setupCfgs  []types.DeviceConfig
+
+	// kernelIfName backs KernelIfName(). When empty, KernelIfName() falls back
+	// to name so existing tests that never set it keep their prior behavior.
+	// Merge copies this field forward from an old device when a fresh scan
+	// left it empty, mirroring how a real device manager can lose the kernel
+	// interface name once a device has moved into a pod's network namespace.
+	kernelIfName string
 }
 
-func (d *trackedDevice) IfName() string       { return d.name }
-func (d *trackedDevice) KernelIfName() string { return d.name }
+func (d *trackedDevice) IfName() string { return d.name }
 
+func (d *trackedDevice) KernelIfName() string {
+	if d.kernelIfName != "" {
+		return d.kernelIfName
+	}
+	return d.name
+}
+
+// Merge copies KernelIfName forward from old if this device's fresh scan did
+// not determine one.
+func (d *trackedDevice) Merge(old types.Device) {
+	if d.kernelIfName == "" {
+		d.kernelIfName = old.KernelIfName()
+	}
+}
+
+// GetAttrs intentionally returns nil — these tests do not exercise device
+// attributes, and buildPoolsFromTable handles a nil map safely.
 func (d *trackedDevice) GetAttrs() map[resourceapi.QualifiedName]resourceapi.DeviceAttribute {
 	return nil
 }
@@ -128,6 +187,7 @@ func buildPrepClaim(devices ...string) *resourceapi.ResourceClaim {
 		results = append(results, resourceapi.DeviceRequestAllocationResult{
 			Device:  d,
 			Driver:  prepTestDriverName,
+			Pool:    prepTestPool,
 			Request: prepTestRequest,
 		})
 	}
@@ -187,7 +247,7 @@ func buildGeneratedPrepClaim(devices ...string) *resourceapi.ResourceClaim {
 }
 
 // buildPrepDriver builds a *Driver with a fake kube client and the given
-// devices pre-populated in driver.devices.
+// devices pre-populated as a mock device manager.
 func buildPrepDriver(t *testing.T, cs *k8sClient.FakeClientset, devs ...*trackedDevice) *Driver {
 	t.Helper()
 
@@ -211,6 +271,25 @@ func buildPrepDriver(t *testing.T, cs *k8sClient.FakeClientset, devs ...*tracked
 	require.NoError(t, hive.Start(tlog, t.Context()))
 	t.Cleanup(func() { hive.Stop(tlog, context.Background()) })
 
+	db := statedb.New()
+	deviceTable, err := newDeviceTable(db)
+	require.NoError(t, err)
+	allocationTable, err := newAllocationTable(db)
+	require.NoError(t, err)
+
+	// Pre-populate the table with the test devices under the test pool.
+	if len(deviceList) > 0 {
+		wtxn := db.WriteTxn(deviceTable)
+		for _, dev := range deviceList {
+			deviceTable.Insert(wtxn, &DRADevice{
+				Name:    dev.IfName(),
+				Manager: types.DeviceManagerTypeMock,
+				Dev:     dev,
+			})
+		}
+		wtxn.Commit()
+	}
+
 	return &Driver{
 		logger:     hivetest.Logger(t),
 		kubeClient: cs,
@@ -218,10 +297,12 @@ func buildPrepDriver(t *testing.T, cs *k8sClient.FakeClientset, devs ...*tracked
 		config: &v2alpha1.CiliumNetworkDriverNodeConfigSpec{
 			DriverName: prepTestDriverName,
 		},
-		devices: map[types.DeviceManagerType][]types.Device{
-			types.DeviceManagerTypeMock: deviceList,
+		deviceManagers: map[types.DeviceManagerType]types.DeviceManager{
+			types.DeviceManagerTypeMock: &mockDeviceManager{devices: deviceList},
 		},
-		allocations: make(map[kubetypes.UID]map[kubetypes.UID][]allocation),
+		db:              db,
+		deviceTable:     deviceTable,
+		allocationTable: allocationTable,
 	}
 }
 
@@ -268,9 +349,15 @@ func TestPrepare(t *testing.T) {
 		require.EqualValues(t, 1, dev.setupCalls.Load(), "Setup must be called once")
 		require.EqualValues(t, 0, dev.freeCalls.Load(), "Free must not be called on success")
 
-		require.Contains(t, driver.allocations, prepTestPodUID)
-		require.Contains(t, driver.allocations[prepTestPodUID], prepTestClaimUID)
-		require.Len(t, driver.allocations[prepTestPodUID][prepTestClaimUID], 1)
+		require.NotEmpty(t, allocatedRowsForPod(t, driver, prepTestPodUID), "must have allocations for pod")
+		rows := allocatedRowsForClaim(t, driver, prepTestClaimUID)
+		require.Len(t, rows, 1)
+		require.Equal(t, prepTestPodUID, rows[0].PodUID)
+		require.Equal(t, prepTestClaimUID, rows[0].ClaimUID)
+
+		txn := driver.db.ReadTxn()
+		_, _, found := driver.deviceTable.Get(txn, deviceByName.Query(prepTestDev0))
+		require.True(t, found, "inventory row must remain in statedb")
 
 		updated, err := cs.KubernetesFakeClientset.ResourceV1().
 			ResourceClaims(prepTestClaimNS).Get(t.Context(), prepTestClaimName, metav1.GetOptions{})
@@ -296,8 +383,8 @@ func TestPrepare(t *testing.T) {
 		require.EqualValues(t, 0, dev0.freeCalls.Load())
 		require.EqualValues(t, 0, dev1.freeCalls.Load())
 
-		require.Contains(t, driver.allocations, prepTestPodUID)
-		require.Len(t, driver.allocations[prepTestPodUID][prepTestClaimUID], 2)
+		require.NotEmpty(t, allocatedRowsForPod(t, driver, prepTestPodUID), "must have allocations for pod")
+		require.Len(t, allocatedRowsForClaim(t, driver, prepTestClaimUID), 2)
 
 		updated, err := cs.KubernetesFakeClientset.ResourceV1().
 			ResourceClaims(prepTestClaimNS).Get(t.Context(), prepTestClaimName, metav1.GetOptions{})
@@ -318,7 +405,7 @@ func TestPrepare(t *testing.T) {
 		require.Error(t, result.Err, "UpdateStatus should fail because claim was not pre-created")
 
 		// no partial entry must be left in the map.
-		require.Empty(t, driver.allocations,
+		requireNoAllocations(t, driver,
 			"allocations map must be empty when UpdateStatus fails")
 	})
 
@@ -338,7 +425,7 @@ func TestPrepare(t *testing.T) {
 		require.EqualValues(t, 1, dev1.setupCalls.Load())
 		require.EqualValues(t, 1, dev0.freeCalls.Load(), "dev0 must be rolled back")
 		require.EqualValues(t, 1, dev1.freeCalls.Load(), "dev1 must be rolled back")
-		require.Empty(t, driver.allocations)
+		requireNoAllocations(t, driver)
 	})
 
 	t.Run("test one device succeed, one fails and first one rolled back", func(t *testing.T) {
@@ -364,7 +451,7 @@ func TestPrepare(t *testing.T) {
 		require.EqualValues(t, 0, dev1.freeCalls.Load(),
 			"dev1 Free must not be called because its Setup failed")
 
-		require.Empty(t, driver.allocations)
+		requireNoAllocations(t, driver)
 	})
 
 	t.Run("test one device succeed, one not found and first one rolled back", func(t *testing.T) {
@@ -385,7 +472,7 @@ func TestPrepare(t *testing.T) {
 		require.EqualValues(t, 1, dev0.freeCalls.Load(),
 			"dev0 must be freed when a later device is not found")
 
-		require.Empty(t, driver.allocations)
+		requireNoAllocations(t, driver)
 	})
 
 	t.Run("test first setup fails and no rollback needed", func(t *testing.T) {
@@ -402,7 +489,7 @@ func TestPrepare(t *testing.T) {
 		require.EqualValues(t, 1, dev0.setupCalls.Load())
 		require.EqualValues(t, 0, dev0.freeCalls.Load(),
 			"Free must not be called for the device whose own Setup failed")
-		require.Empty(t, driver.allocations)
+		requireNoAllocations(t, driver)
 	})
 
 	t.Run("test rollback free error returns the original error", func(t *testing.T) {
@@ -426,7 +513,7 @@ func TestPrepare(t *testing.T) {
 		require.EqualValues(t, 1, dev0.freeCalls.Load(),
 			"Free must be attempted even when it will fail")
 
-		require.Empty(t, driver.allocations)
+		requireNoAllocations(t, driver)
 	})
 
 	t.Run("test prepare duplicate claim UID is idempotent", func(t *testing.T) {
@@ -475,10 +562,8 @@ func TestPrepare(t *testing.T) {
 		require.EqualValues(t, 1, dev0.setupCalls.Load(), "dev0 Setup must be called once")
 		require.EqualValues(t, 1, dev1.setupCalls.Load(), "dev1 Setup must be called once")
 
-		require.Contains(t, driver.allocations, prepTestPodUID)
-		require.Len(t, driver.allocations[prepTestPodUID], 2, "allocations map must have 2 claim entries")
-		require.Contains(t, driver.allocations[prepTestPodUID], prepTestClaimUID)
-		require.Contains(t, driver.allocations[prepTestPodUID], prepTestClaimUID2)
+		require.NotEmpty(t, allocatedRowsForPod(t, driver, prepTestPodUID), "must have allocations for pod")
+		require.Len(t, allocatedRowsForPod(t, driver, prepTestPodUID), 2, "allocations map must have 2 claim entries")
 	})
 
 	t.Run("test prepare cross claim device conflict is not allowed", func(t *testing.T) {
@@ -504,9 +589,8 @@ func TestPrepare(t *testing.T) {
 		require.EqualValues(t, 1, dev.setupCalls.Load(), "Setup must not be called for the conflicting claim")
 
 		// The pod entry must only contain the first claim.
-		require.Contains(t, driver.allocations, prepTestPodUID)
-		require.Len(t, driver.allocations[prepTestPodUID], 1)
-		require.Contains(t, driver.allocations[prepTestPodUID], prepTestClaimUID)
+		require.NotEmpty(t, allocatedRowsForPod(t, driver, prepTestPodUID), "must have allocations for pod")
+		require.Len(t, allocatedRowsForClaim(t, driver, prepTestClaimUID), 1, "only the first claim must be allocated")
 	})
 
 	t.Run("test invalid pod ifname is not set up", func(t *testing.T) {
@@ -526,7 +610,7 @@ func TestPrepare(t *testing.T) {
 
 		require.EqualValues(t, 0, dev.setupCalls.Load(),
 			"Setup must not be called when podIfName validation fails")
-		require.Empty(t, driver.allocations)
+		requireNoAllocations(t, driver)
 	})
 
 	t.Run("wrong reservedFor length in claim, we only allow one claim consumer", func(t *testing.T) {
@@ -543,7 +627,7 @@ func TestPrepare(t *testing.T) {
 		require.Error(t, result.Err)
 		require.ErrorIs(t, result.Err, errUnexpectedInput)
 		require.EqualValues(t, 0, dev.setupCalls.Load())
-		require.Empty(t, driver.allocations)
+		requireNoAllocations(t, driver)
 	})
 
 	t.Run("generated claim name from template is prepared correctly", func(t *testing.T) {
@@ -556,7 +640,7 @@ func TestPrepare(t *testing.T) {
 		result := prepOne(t, driver, claim)
 		require.NoError(t, result.Err)
 		require.EqualValues(t, 1, dev.setupCalls.Load())
-		require.Contains(t, driver.allocations, prepTestPodUID)
+		require.NotEmpty(t, allocatedRowsForPod(t, driver, prepTestPodUID), "must have allocations for pod")
 	})
 }
 
@@ -573,7 +657,7 @@ func TestUnprepare(t *testing.T) {
 
 		result := prepOne(t, driver, claim)
 		require.NoError(t, result.Err)
-		require.Contains(t, driver.allocations, prepTestPodUID)
+		require.NotEmpty(t, allocatedRowsForPod(t, driver, prepTestPodUID), "must have allocations for pod")
 
 		releaseResults, err := driver.UnprepareResourceClaims(t.Context(),
 			[]kubeletplugin.NamespacedObject{namedObject(prepTestClaimNS, prepTestClaimName, prepTestClaimUID)})
@@ -581,9 +665,42 @@ func TestUnprepare(t *testing.T) {
 		require.Contains(t, releaseResults, prepTestClaimUID)
 		require.NoError(t, releaseResults[prepTestClaimUID])
 
-		require.Empty(t, driver.allocations,
+		requireNoAllocations(t, driver,
 			"allocations map must be empty after unprepare")
 		require.EqualValues(t, 1, dev.freeCalls.Load(), "Free must be called once on unprepare")
+
+		// Unprepare removes allocation state without modifying inventory.
+		txn := driver.db.ReadTxn()
+		row, _, found := driver.deviceTable.Get(txn, deviceByName.Query(prepTestDev0))
+		require.True(t, found, "inventory row must still exist after unprepare")
+		require.Equal(t, prepTestDev0, row.Name)
+		require.Equal(t, types.DeviceManagerTypeMock, row.Manager)
+		require.Same(t, dev, row.Dev)
+	})
+
+	t.Run("failed free retains allocation for retry", func(t *testing.T) {
+		cs, _ := k8sClient.NewFakeClientset(tlog)
+		dev := &trackedDevice{name: prepTestDev0, freeErr: errors.New("free failed")}
+		claim := buildPrepClaim(prepTestDev0)
+		createPrepClaim(t, cs, claim)
+
+		driver := buildPrepDriver(t, cs, dev)
+		require.NoError(t, prepOne(t, driver, claim).Err)
+
+		results, err := driver.UnprepareResourceClaims(t.Context(),
+			[]kubeletplugin.NamespacedObject{namedObject(prepTestClaimNS, prepTestClaimName, prepTestClaimUID)})
+		require.NoError(t, err)
+		require.Error(t, results[prepTestClaimUID])
+		require.Len(t, allocatedRowsForClaim(t, driver, prepTestClaimUID), 1,
+			"failed cleanup must remain available for retry")
+
+		dev.freeErr = nil
+		results, err = driver.UnprepareResourceClaims(t.Context(),
+			[]kubeletplugin.NamespacedObject{namedObject(prepTestClaimNS, prepTestClaimName, prepTestClaimUID)})
+		require.NoError(t, err)
+		require.NoError(t, results[prepTestClaimUID])
+		requireNoAllocations(t, driver)
+		require.EqualValues(t, 2, dev.freeCalls.Load())
 	})
 
 	t.Run("multiple devices all are freed", func(t *testing.T) {
@@ -605,7 +722,7 @@ func TestUnprepare(t *testing.T) {
 
 		require.EqualValues(t, 1, dev0.freeCalls.Load(), "dev0 must be freed")
 		require.EqualValues(t, 1, dev1.freeCalls.Load(), "dev1 must be freed")
-		require.Empty(t, driver.allocations)
+		requireNoAllocations(t, driver)
 	})
 
 	t.Run("unknown claim (not allocated) does not error out", func(t *testing.T) {
@@ -628,7 +745,7 @@ func TestUnprepare(t *testing.T) {
 		// First attempt: claim not in API → UpdateStatus fails → rollback.
 		result := prepOne(t, driver, claim)
 		require.Error(t, result.Err)
-		require.Empty(t, driver.allocations, "map must be clean after failed prepare")
+		requireNoAllocations(t, driver, "map must be clean after failed prepare")
 
 		// Now create the claim in the API.
 		createPrepClaim(t, cs, claim)
@@ -638,8 +755,8 @@ func TestUnprepare(t *testing.T) {
 		result2 := prepOne(t, driver, claim)
 		require.NoError(t, result2.Err, "second prepare must succeed after rollback cleaned up")
 
-		require.Contains(t, driver.allocations, prepTestPodUID)
-		require.Len(t, driver.allocations[prepTestPodUID][prepTestClaimUID], 1)
+		require.NotEmpty(t, allocatedRowsForPod(t, driver, prepTestPodUID), "must have allocations for pod")
+		require.Len(t, allocatedRowsForClaim(t, driver, prepTestClaimUID), 1)
 
 		// Setup called twice (once per attempt), Free called once (rollback of first attempt).
 		require.EqualValues(t, 2, dev.setupCalls.Load())

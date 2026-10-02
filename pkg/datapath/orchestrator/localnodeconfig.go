@@ -7,14 +7,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"net/netip"
 	"strconv"
 	"strings"
 
 	"github.com/cilium/statedb"
-	"go4.org/netipx"
 
-	"github.com/cilium/cilium/pkg/cidr"
+	cmtypes "github.com/cilium/cilium/pkg/clustermesh/types"
 	"github.com/cilium/cilium/pkg/common"
 	"github.com/cilium/cilium/pkg/datapath/config"
 	"github.com/cilium/cilium/pkg/datapath/connector"
@@ -34,24 +32,10 @@ import (
 	"github.com/cilium/cilium/pkg/mtu"
 	"github.com/cilium/cilium/pkg/node"
 	"github.com/cilium/cilium/pkg/option"
+	cslices "github.com/cilium/cilium/pkg/slices"
 	"github.com/cilium/cilium/pkg/svcrouteconfig"
 	wgTypes "github.com/cilium/cilium/pkg/wireguard/types"
 )
-
-const (
-	// AutoCIDR indicates that a CIDR should be allocated
-	AutoCIDR = "auto"
-)
-
-// prefixToCIDR converts a netip.Prefix to the legacy *cidr.CIDR representation,
-// returning nil for the zero/invalid prefix. It is a transitional boundary
-// helper: the datapath LocalNodeConfiguration still carries *cidr.CIDR fields.
-func prefixToCIDR(p netip.Prefix) *cidr.CIDR {
-	if !p.IsValid() {
-		return nil
-	}
-	return cidr.NewCIDR(netipx.PrefixIPNet(p))
-}
 
 // newLocalNodeConfig constructs LocalNodeConfiguration from the global agent
 // data sources.
@@ -69,6 +53,7 @@ func newLocalNodeConfig(
 	daemon *option.DaemonConfig,
 	localNode node.LocalNode,
 	sysctlOps sysctl.Sysctl,
+	clusterInfo cmtypes.ClusterInfo,
 	tunnelCfg tunnel.Config,
 	txn statedb.ReadTxn,
 	directRoutingDevTbl tables.DirectRoutingDevice,
@@ -86,29 +71,28 @@ func newLocalNodeConfig(
 	connectorConfig connector.Config,
 	plugins plugin.Plugins,
 ) (config.Config, <-chan struct{}, error) {
-	auxPrefixes := []*cidr.CIDR{}
+	auxPrefixes := []ip.Prefix{}
 
-	if daemon.IPv4ServiceRange != AutoCIDR {
-		serviceCIDR, err := cidr.ParseCIDR(daemon.IPv4ServiceRange)
-		if err != nil {
-			return config.Config{}, nil, fmt.Errorf("Invalid IPv4 service prefix %q: %w", daemon.IPv4ServiceRange, err)
-		}
-
-		auxPrefixes = append(auxPrefixes, serviceCIDR)
+	if daemon.IPv4ServiceRange.IsValid() {
+		auxPrefixes = append(auxPrefixes, ip.PrefixFrom(daemon.IPv4ServiceRange))
 	}
 
-	if daemon.IPv6ServiceRange != AutoCIDR {
-		serviceCIDR, err := cidr.ParseCIDR(daemon.IPv6ServiceRange)
-		if err != nil {
-			return config.Config{}, nil, fmt.Errorf("Invalid IPv6 service prefix %q: %w", daemon.IPv6ServiceRange, err)
-		}
-
-		auxPrefixes = append(auxPrefixes, serviceCIDR)
+	if daemon.IPv6ServiceRange.IsValid() {
+		auxPrefixes = append(auxPrefixes, ip.PrefixFrom(daemon.IPv6ServiceRange))
 	}
 
-	nativeDevices, devsWatch := tables.SelectedDevices(devices, txn)
+	nativeDevices, _ := tables.SelectedDevices(devices, txn)
+	// Explicitly bypassed VLANs may be represented by VLAN devices that are not
+	// selected for datapath attachment. Watch all devices so adding or removing
+	// such a VLAN causes the filter configuration to be recalculated.
+	_, devsWatch := devices.AllWatch(txn)
 	nodeAddrsIter, addrsWatch := nodeAddresses.AllWatch(txn)
-	mtuRoute, _, mtuWatch, _ := mtuTbl.GetWatch(txn, mtu.MTURouteIndex.Query(mtu.DefaultPrefixV4))
+	mtuRoute, _, mtuWatch, _ := mtuTbl.GetWatch(txn, mtu.MTURouteByPrefix(mtu.DefaultPrefixV4))
+
+	vlanFilter, err := resolveVLANFilters(nativeDevices, daemon.VLANBPFBypass)
+	if err != nil {
+		return config.Config{}, devsWatch, fmt.Errorf("resolving VLAN filters: %w", err)
+	}
 
 	watchChans := []<-chan struct{}{devsWatch, addrsWatch, mtuWatch}
 	var directRoutingDevice *tables.Device
@@ -168,25 +152,66 @@ func newLocalNodeConfig(
 		return config.Config{}, nil, fmt.Errorf("failed to parse hardware address of '%s': %w", defaults.SecondHostDevice, err)
 	}
 
+	var encap4IfIndex, encap6IfIndex uint32
+	if daemon.UnsafeDaemonConfigOption.EnableIPIPDevices {
+		if daemon.EnableIPv4 {
+			dev, _, watch, ok := devices.GetWatch(txn, tables.DeviceByName(defaults.IPIPv4Device))
+			if !ok {
+				return config.Config{}, watch, fmt.Errorf("failed to look up IPv4 IPIP device '%s'", defaults.IPIPv4Device)
+			}
+			watchChans = append(watchChans, watch)
+			encap4IfIndex = uint32(dev.Index)
+		}
+		if daemon.EnableIPv6 {
+			dev, _, watch, ok := devices.GetWatch(txn, tables.DeviceByName(defaults.IPIPv6Device))
+			if !ok {
+				return config.Config{}, watch, fmt.Errorf("failed to look up IPv6 IPIP device '%s'", defaults.IPIPv6Device)
+			}
+			watchChans = append(watchChans, watch)
+			encap6IfIndex = uint32(dev.Index)
+		}
+	}
+
+	// Validate Encryption Strict Mode Egress
+	nodeIPv4 := localNode.GetNodeIP(false)
+	if daemon.EnableEncryptionStrictModeEgress {
+		if !nodeIPv4.IsValid() {
+			return config.Config{}, nil, fmt.Errorf("unable to parse node IPv4 address %s", nodeIPv4)
+		}
+		if daemon.EncryptionStrictEgressCIDR.Contains(nodeIPv4) {
+			if !daemon.EncryptionStrictEgressAllowRemoteNodeIdentities {
+				return config.Config{}, nil, fmt.Errorf(`encryption strict mode is enabled but the node's IPv4 address
+				is within the strict CIDR range. This will cause the node to drop all traffic.
+				Please either disable encryption or set --encryption-strict-egress-allow-remote-node-identities=true`)
+			}
+		}
+	}
+
+	lbRSSCfg := loadbalancer.NewRSSConfig(
+		daemon.UnsafeDaemonConfigOption.LoadBalancerRSSv4,
+		daemon.UnsafeDaemonConfigOption.LoadBalancerRSSv6,
+		directRoutingDevice,
+	)
+
 	return config.Config{
 		ClusterID:                    localNode.ClusterID,
-		NodeIPv4:                     ip.AddrFromIP(localNode.GetNodeIP(false)),
-		NodeIPv6:                     ip.AddrFromIP(localNode.GetNodeIP(true)),
-		CiliumInternalIPv4:           ip.AddrFromIP(localNode.GetCiliumInternalIP(false)),
-		CiliumInternalIPv6:           ip.AddrFromIP(localNode.GetCiliumInternalIP(true)),
+		ClusterIDBits:                clusterInfo.GetClusterIDBits(),
+		NodeIPv4:                     localNode.GetNodeIP(false),
+		NodeIPv6:                     localNode.GetNodeIP(true),
+		CiliumInternalIPv4:           localNode.GetCiliumInternalIPv4(),
+		CiliumInternalIPv6:           localNode.GetCiliumInternalIPv6(),
 		CiliumNetIfIndex:             uint32(ciliumNetDevice.Index),
 		CiliumNetMAC:                 ciliumNetMAC,
 		CiliumHostIfIndex:            uint32(ciliumHostDevice.Index),
 		CiliumHostMAC:                ciliumHostMAC,
-		AllocCIDRIPv4:                prefixToCIDR(localNode.IPv4AllocCIDR.Prefix.Prefix),
-		AllocCIDRIPv6:                prefixToCIDR(localNode.IPv6AllocCIDR.Prefix.Prefix),
-		NativeRoutingCIDRIPv4:        prefixToCIDR(localNode.RemoteSNATDstAddrExclusionCIDRv4()),
-		NativeRoutingCIDRIPv6:        prefixToCIDR(localNode.RemoteSNATDstAddrExclusionCIDRv6()),
+		NativeRoutingCIDRIPv4:        localNode.RemoteSNATDstAddrExclusionCIDRv4(),
+		NativeRoutingCIDRIPv6:        localNode.RemoteSNATDstAddrExclusionCIDRv6(),
 		ServiceLoopbackIPv4:          localNode.Local.ServiceLoopbackIPv4,
 		ServiceLoopbackIPv6:          localNode.Local.ServiceLoopbackIPv6,
 		Devices:                      nativeDevices,
 		NodeAddresses:                statedb.Collect(nodeAddrsIter),
 		DirectRoutingDevice:          directRoutingDevice,
+		LoadBalancerRSS:              lbRSSCfg,
 		DeriveMasqIPAddrFromDevice:   masqInterface,
 		HostEndpointID:               hostEndpointID,
 		DeviceMTU:                    mtuRoute.DeviceMTU,
@@ -196,6 +221,8 @@ func newLocalNodeConfig(
 		EnableIPv4:                   daemon.EnableIPv4,
 		EnableIPv6:                   daemon.EnableIPv6,
 		EnableEncapsulation:          daemon.TunnelingEnabled(),
+		Encap4IfIndex:                encap4IfIndex,
+		Encap6IfIndex:                encap6IfIndex,
 		RequiresNativeRouting:        daemon.RequiresNativeRouting(),
 		TunnelProtocol:               tunnelCfg.EncapProtocol().ToDpID(),
 		TunnelPort:                   tunnelCfg.Port(),
@@ -209,8 +236,8 @@ func newLocalNodeConfig(
 		EnableIPSec:                  ipsecCfg.Enabled(),
 		EncryptNode:                  daemon.EncryptNode,
 		EnableConntrackAccounting:    daemon.BPFConntrackAccounting,
-		IPv4PodSubnets:               cidr.NewCIDRSlice(daemon.IPv4PodSubnets),
-		IPv6PodSubnets:               cidr.NewCIDRSlice(daemon.IPv6PodSubnets),
+		IPv4PodSubnets:               podSubnets(cslices.Map(daemon.IPv4PodSubnets, ip.PrefixFrom), localNode.Local.IPv4PodSubnets),
+		IPv6PodSubnets:               podSubnets(cslices.Map(daemon.IPv6PodSubnets, ip.PrefixFrom), localNode.Local.IPv6PodSubnets),
 		XDPConfig:                    xdpConfig,
 		LBConfig:                     lbConfig,
 		KPRConfig:                    kprCfg,
@@ -218,8 +245,20 @@ func newLocalNodeConfig(
 		MaglevConfig:                 maglevConfig,
 		DatapathIsLayer2:             connectorConfig.GetOperationalMode().IsLayer2(),
 		DatapathIsNetkit:             connectorConfig.GetOperationalMode().IsNetkit(),
+		VLANFilter:                   vlanFilter,
 		Plugins:                      plugins,
 	}, common.MergeChannels(watchChans...), nil
+}
+
+// podSubnets returns the explicitly configured pod subnets, falling back to
+// the ones derived from the cloud provider. The derived subnets are empty for
+// every IPAM mode that does not allocate pod IPs out of cloud provider
+// subnets, so no mode check is needed here.
+func podSubnets(configured, derived []ip.Prefix) []ip.Prefix {
+	if len(configured) > 0 {
+		return configured
+	}
+	return derived
 }
 
 // getEphemeralPortRangeMin returns the minimum ephemeral port from

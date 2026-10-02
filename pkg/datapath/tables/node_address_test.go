@@ -766,7 +766,7 @@ func TestNodeAddressNodeIPChange(t *testing.T) {
 	txn.Commit()
 	<-watch // wait for propagation
 
-	iter, watch := nodeAddrs.ListWatch(db.ReadTxn(), NodeAddressNodePortIndex.Query(true))
+	iter, watch := nodeAddrs.ListWatch(db.ReadTxn(), NodeAddressesByNodePort(true))
 	addrs := statedb.Collect(iter)
 	if assert.Len(t, addrs, 1) {
 		assert.Equal(t, testNodeIPv4, addrs[0].Addr)
@@ -775,12 +775,12 @@ func TestNodeAddressNodeIPChange(t *testing.T) {
 
 	// Make the 10.0.0.1 the new NodeIP.
 	localNodeStore.Update(func(n *node.LocalNode) {
-		n.SetNodeExternalIP(net.ParseIP("10.0.0.1"))
+		n.SetNodeExternalIP(netip.MustParseAddr("10.0.0.1"))
 	})
 	<-watch
 
 	// The new node IP should now be preferred for NodePort.
-	iter = nodeAddrs.List(db.ReadTxn(), NodeAddressNodePortIndex.Query(true))
+	iter = nodeAddrs.List(db.ReadTxn(), NodeAddressesByNodePort(true))
 	addrs = statedb.Collect(iter)
 	if assert.Len(t, addrs, 1) {
 		assert.Equal(t, "10.0.0.1", addrs[0].Addr.String())
@@ -838,8 +838,8 @@ type testLocalNodeSync struct{}
 
 // InitLocalNode implements node.LocalNodeSynchronizer.
 func (t testLocalNodeSync) InitLocalNode(_ context.Context, n *node.LocalNode) error {
-	n.SetNodeExternalIP(testNodeIPv4.AsSlice())
-	n.SetNodeExternalIP(testNodeIPv6.AsSlice())
+	n.SetNodeExternalIP(testNodeIPv4)
+	n.SetNodeExternalIP(testNodeIPv6)
 	return nil
 }
 
@@ -945,6 +945,117 @@ func TestSortedAddresses(t *testing.T) {
 		// Shuffle again.
 		actual = SortedAddresses(shuffleSlice(slices.Clone(expected)))
 		assert.Equal(t, expected, actual)
+	}
+}
+
+func TestPreferredIPv6Address(t *testing.T) {
+	tests := []struct {
+		name  string
+		addrs []DeviceAddress
+		want  netip.Addr
+	}{
+		{
+			name: "link_local_only",
+			addrs: []DeviceAddress{
+				{Addr: netip.MustParseAddr("fe80::4001:aff:fe35:a805")},
+			},
+			want: netip.MustParseAddr("fe80::4001:aff:fe35:a805"),
+		},
+		{
+			name: "global_only",
+			addrs: []DeviceAddress{
+				{Addr: netip.MustParseAddr("2600:1900:4001:2a1:0:2::")},
+			},
+			want: netip.MustParseAddr("2600:1900:4001:2a1:0:2::"),
+		},
+		{
+			name: "local_first",
+			addrs: []DeviceAddress{
+				{Addr: netip.MustParseAddr("fe80::4001:aff:fe35:a805")},
+				{Addr: netip.MustParseAddr("2600:1900:4001:2a1:0:2::")},
+			},
+			want: netip.MustParseAddr("2600:1900:4001:2a1:0:2::"),
+		},
+		{
+			name: "global_first",
+			addrs: []DeviceAddress{
+				{Addr: netip.MustParseAddr("2600:1900:4001:2a1:0:2::")},
+				{Addr: netip.MustParseAddr("fe80::4001:aff:fe35:a805")},
+			},
+			want: netip.MustParseAddr("2600:1900:4001:2a1:0:2::"),
+		},
+		{
+			name: "select_first_global",
+			addrs: []DeviceAddress{
+				{Addr: netip.MustParseAddr("2600:1900:4001:2a1:0:2::")},
+				{Addr: netip.MustParseAddr("2600:1900:4001:2a1:0:3::")},
+			},
+			want: netip.MustParseAddr("2600:1900:4001:2a1:0:2::"),
+		},
+		{
+			name: "link_local_fallback",
+			addrs: []DeviceAddress{
+				{Addr: netip.MustParseAddr("fe80::1")},
+				{Addr: netip.MustParseAddr("::")},
+			},
+			want: netip.MustParseAddr("fe80::1"),
+		},
+		{
+			name: "ignore_unspecified_address",
+			addrs: []DeviceAddress{
+				{Addr: netip.MustParseAddr("fe80::1")},
+				{Addr: netip.MustParseAddr("::")},
+				{Addr: netip.MustParseAddr("2600:1900:4001:2a1:0:2::")},
+			},
+			want: netip.MustParseAddr("2600:1900:4001:2a1:0:2::"),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, PreferredIPv6Address(tt.addrs))
+		})
+	}
+}
+
+func TestPreferredIPv4Address(t *testing.T) {
+	tests := []struct {
+		name  string
+		addrs []DeviceAddress
+		want  netip.Addr
+	}{
+		{
+			name: "prefer primary IPv4",
+			addrs: []DeviceAddress{
+				{Addr: netip.MustParseAddr("1.1.1.1"), Secondary: true},
+				{Addr: netip.MustParseAddr("2.2.2.2")},
+			},
+			want: netip.MustParseAddr("2.2.2.2"),
+		},
+		{
+			name: "skip preferred IPv6",
+			addrs: []DeviceAddress{
+				{Addr: netip.MustParseAddr("2001:db8::1"), Scope: RT_SCOPE_UNIVERSE},
+				{Addr: netip.MustParseAddr("10.0.0.1"), Scope: RT_SCOPE_SITE},
+			},
+			want: netip.MustParseAddr("10.0.0.1"),
+		},
+		{
+			name:  "no IPv4 address",
+			addrs: []DeviceAddress{{Addr: netip.MustParseAddr("2001:db8::1")}},
+			want:  netip.Addr{},
+		},
+		{
+			name:  "skip unspecified IPv4 address",
+			addrs: []DeviceAddress{{Addr: netip.MustParseAddr("0.0.0.0")}},
+			want:  netip.Addr{},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, PreferredIPv4Address(tt.addrs))
+		})
 	}
 }
 

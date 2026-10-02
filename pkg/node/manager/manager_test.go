@@ -4,17 +4,12 @@
 package manager
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
 	"log/slog"
 	"net"
 	"net/netip"
-	"os"
-	"path/filepath"
 	"slices"
-	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -22,11 +17,11 @@ import (
 	"github.com/cilium/hive/cell"
 	"github.com/cilium/hive/hivetest"
 	"github.com/cilium/statedb"
+	"github.com/cilium/statedb/reconciler"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	cmtypes "github.com/cilium/cilium/pkg/clustermesh/types"
-	"github.com/cilium/cilium/pkg/datapath/iptables/ipset"
 	"github.com/cilium/cilium/pkg/datapath/tables"
 	"github.com/cilium/cilium/pkg/datapath/tunnel"
 	"github.com/cilium/cilium/pkg/hive"
@@ -53,6 +48,10 @@ type nodeEvent struct {
 	event    string
 	prefix   netip.Prefix
 	metadata ipcache.IPMetadata
+}
+
+func testClusterSizeDependantInterval(interval time.Duration) time.Duration {
+	return interval
 }
 
 type ipcacheMock struct {
@@ -122,60 +121,6 @@ func (i *ipcacheMock) RemoveMetadataBatch(updates ...ipcache.MU) (revision uint6
 		i.RemoveMetadata(update.Prefix, update.Resource, update.Metadata)
 	}
 	return 0
-}
-
-type ipsetMock struct {
-	v4 map[string]struct{}
-	v6 map[string]struct{}
-}
-
-func newIPSetMock() *ipsetMock {
-	return &ipsetMock{
-		v4: make(map[string]struct{}),
-		v6: make(map[string]struct{}),
-	}
-}
-
-type ipsetInitializerMock struct{}
-
-func (i *ipsetInitializerMock) InitDone() {
-}
-
-func (i *ipsetMock) NewInitializer() ipset.Initializer {
-	return &ipsetInitializerMock{}
-}
-
-func (i *ipsetMock) AddToIPSet(name string, family ipset.Family, addrs ...netip.Addr) {
-	for _, addr := range addrs {
-		if name == ipset.CiliumNodeIPSetV4 && family == ipset.INetFamily {
-			i.v4[addr.String()] = struct{}{}
-		} else if name == ipset.CiliumNodeIPSetV6 && family == ipset.INet6Family {
-			i.v6[addr.String()] = struct{}{}
-		}
-	}
-}
-
-func (i *ipsetMock) RemoveFromIPSet(name string, addrs ...netip.Addr) {
-	for _, addr := range addrs {
-		if name == ipset.CiliumNodeIPSetV4 {
-			delete(i.v4, addr.String())
-		} else if name == ipset.CiliumNodeIPSetV6 {
-			delete(i.v6, addr.String())
-		}
-	}
-}
-
-func ipsetContains(ipsetMgr *ipsetMock, setName string, addr string) (bool, error) {
-	switch setName {
-	case ipset.CiliumNodeIPSetV4:
-		_, found := ipsetMgr.v4[addr]
-		return found, nil
-	case ipset.CiliumNodeIPSetV6:
-		_, found := ipsetMgr.v6[addr]
-		return found, nil
-	default:
-		return false, fmt.Errorf("unexpected ipset name %s", setName)
-	}
 }
 
 type signalNodeHandler struct {
@@ -251,7 +196,7 @@ func TestNodeLifecycle(t *testing.T) {
 	dp.EnableNodeDeleteEvent = true
 	ipcacheMock := newIPcacheMock()
 	h, _ := cell.NewSimpleHealth()
-	mngr, err := New(logger, &option.DaemonConfig{}, cmtypes.DefaultClusterInfo, tunnel.Config{}, ipcacheMock, newIPSetMock(), nil, NewNodeMetrics(), h, nil, nil, nil, fakewireguard.Config{}, node.NewTestLocalNodeStore(node.LocalNode{}))
+	mngr, err := New(logger, &option.DaemonConfig{}, cmtypes.DefaultClusterInfo, tunnel.Config{}, ipcacheMock, NewNodeMetrics(), h, nil, nil, nil, fakewireguard.Config{}, nil, testClusterSizeDependantInterval)
 	mngr.Subscribe(dp)
 	require.NoError(t, err)
 
@@ -259,7 +204,7 @@ func TestNodeLifecycle(t *testing.T) {
 		Name: "node1", Cluster: "c1", IPAddresses: []nodeTypes.Address{
 			{
 				Type: addressing.NodeInternalIP,
-				IP:   net.ParseIP("10.0.0.1"),
+				IP:   iputil.AddrFrom(netip.MustParseAddr("10.0.0.1")),
 			},
 		},
 		Source: source.Unspec,
@@ -281,7 +226,7 @@ func TestNodeLifecycle(t *testing.T) {
 		Name: "node2", Cluster: "c1", IPAddresses: []nodeTypes.Address{
 			{
 				Type: addressing.NodeInternalIP,
-				IP:   net.ParseIP("10.0.0.2"),
+				IP:   iputil.AddrFrom(netip.MustParseAddr("10.0.0.2")),
 			},
 		},
 		Source: source.Unspec,
@@ -348,7 +293,7 @@ func TestNodeLabels(t *testing.T) {
 		Source:  source.Unspec,
 	}
 
-	mngr, err := New(logger, &option.DaemonConfig{}, cmtypes.DefaultClusterInfo, tunnel.Config{}, ipcacheMock, newIPSetMock(), nil, NewNodeMetrics(), h, nil, nil, nil, fakewireguard.Config{}, node.NewTestLocalNodeStore(node.LocalNode{Node: nLocal}))
+	mngr, err := New(logger, &option.DaemonConfig{}, cmtypes.DefaultClusterInfo, tunnel.Config{}, ipcacheMock, NewNodeMetrics(), h, nil, nil, nil, fakewireguard.Config{}, nil, testClusterSizeDependantInterval)
 	mngr.Subscribe(dp)
 	require.NoError(t, err)
 	mngr.NodeUpdated(nRemote)
@@ -426,6 +371,223 @@ func TestNodeLabels(t *testing.T) {
 	}
 }
 
+func TestNodeCIDRLabels(t *testing.T) {
+	oldNodeSelectorLabels := option.Config.EnableNodeSelectorLabels
+	oldPolicyCIDRMatchMode := option.Config.PolicyCIDRMatchMode
+	oldClusterName := option.Config.ClusterName
+	t.Cleanup(func() {
+		option.Config.EnableNodeSelectorLabels = oldNodeSelectorLabels
+		option.Config.PolicyCIDRMatchMode = oldPolicyCIDRMatchMode
+		option.Config.ClusterName = oldClusterName
+	})
+	option.Config.EnableNodeSelectorLabels = false
+	option.Config.PolicyCIDRMatchMode = []string{}
+	option.Config.ClusterName = "default"
+
+	logger := hivetest.Logger(t)
+	labelsfilter.ParseLabelPrefixCfg(logger, nil, nil, "")
+
+	h, _ := cell.NewSimpleHealth()
+	ipc := ipcache.NewIPCache(&ipcache.Configuration{
+		Context:           t.Context(),
+		Logger:            logger,
+		IdentityAllocator: testidentity.NewMockIdentityAllocator(nil),
+		IdentityUpdater:   &mockUpdater{},
+	})
+	mngr, err := New(logger, &option.DaemonConfig{}, cmtypes.DefaultClusterInfo, tunnel.Config{}, ipc, NewNodeMetrics(), h, nil, nil, nil, fakewireguard.Config{}, nil, testClusterSizeDependantInterval)
+	require.NoError(t, err)
+
+	nodeTypes.SetName("localNode")
+	nLocal := nodeTypes.Node{
+		Name:    "localNode",
+		Cluster: option.Config.ClusterName,
+		Labels:  map[string]string{"a": "b"},
+		Source:  source.Local,
+		IPAddresses: []nodeTypes.Address{{
+			Type: addressing.NodeInternalIP,
+			IP:   iputil.AddrFrom(netip.MustParseAddr("10.0.0.1")),
+		}},
+	}
+	nRemote := nodeTypes.Node{
+		Name:    "remoteNode",
+		Cluster: option.Config.ClusterName,
+		Labels:  map[string]string{"a": "c"},
+		Source:  source.Kubernetes,
+		IPAddresses: []nodeTypes.Address{{
+			Type: addressing.NodeInternalIP,
+			IP:   iputil.AddrFrom(netip.MustParseAddr("10.0.0.2")),
+		}},
+	}
+
+	setIPLabels := func(pfx string, lbls ...string) {
+		var rev uint64
+		if len(lbls) > 0 {
+			rev = ipc.UpsertMetadataBatch(ipcache.MU{
+				Prefix:   cmtypes.MustParsePrefixCluster(pfx),
+				Source:   source.CustomResource,
+				Resource: "dummy",
+				Metadata: []ipcache.IPMetadata{labels.ParseLabels(lbls...)},
+			})
+		} else {
+			rev = ipc.RemoveMetadataBatch(ipcache.MU{
+				Prefix:   cmtypes.MustParsePrefixCluster(pfx),
+				Source:   source.CustomResource,
+				Resource: "dummy",
+				Metadata: []ipcache.IPMetadata{labels.Labels{}},
+			})
+		}
+		ipc.WaitForRevision(t.Context(), rev)
+	}
+
+	dummyIP := netip.MustParseAddr("100.0.0.1")
+
+	// updateAndCheck commits the node update to the
+	updateAndCheck := func(n nodeTypes.Node, wantLbls labels.Labels, wantNID identity.NumericIdentity) {
+		t.Helper()
+		mngr.NodeUpdated(n)
+		// make a dummy ipcache update so we're sure the metadata resolver has run.
+		// This is to prevent test flakes.
+		setIPLabels(dummyIP.String()+"/32", "reserved:ingress")
+		dummyIP = dummyIP.Next()
+
+		ip := netip.MustParseAddr(n.IPAddresses[0].IP.String())
+		ipcID, ok := ipc.LookupSecIDByIP(ip)
+		require.True(t, ok)
+		if wantNID != 0 {
+			require.Equal(t, wantNID, ipcID.ID)
+		}
+		secID := ipc.IdentityAllocator.LookupIdentityByID(t.Context(), ipcID.ID)
+		require.NotNil(t, secID)
+		require.Equal(t, wantLbls, secID.Labels)
+	}
+
+	// Standard case: nodes do not have non-reserved labels.
+	updateAndCheck(nLocal, labels.ParseLabels(
+		"reserved:host",
+	), identity.ReservedIdentityHost)
+
+	updateAndCheck(nRemote, labels.ParseLabels(
+		"reserved:remote-node",
+	), identity.ReservedIdentityRemoteNode)
+
+	// Set both nodes to be kube-apiserver
+	setIPLabels("10.0.0.1/32", "reserved:kube-apiserver")
+	setIPLabels("10.0.0.2/32", "reserved:kube-apiserver")
+
+	updateAndCheck(nLocal, labels.ParseLabels(
+		"reserved:host",
+		"reserved:kube-apiserver",
+	), identity.ReservedIdentityHost)
+
+	updateAndCheck(nRemote, labels.ParseLabels(
+		"reserved:remote-node",
+		"reserved:kube-apiserver",
+	), identity.ReservedIdentityKubeAPIServer)
+
+	// Enable CIDR selection, see that nothing changes
+	option.Config.PolicyCIDRMatchMode = []string{"nodes"}
+
+	updateAndCheck(nLocal, labels.ParseLabels(
+		"reserved:host",
+		"reserved:kube-apiserver",
+	), identity.ReservedIdentityHost)
+
+	updateAndCheck(nRemote, labels.ParseLabels(
+		"reserved:remote-node",
+		"reserved:kube-apiserver",
+	), identity.ReservedIdentityKubeAPIServer)
+
+	// Add a CIDR selector that covers both nodes
+	setIPLabels("10.0.0.0/24", "cidr:10.0.0.0/24")
+
+	updateAndCheck(nLocal, labels.ParseLabels(
+		"reserved:host",
+		"reserved:kube-apiserver",
+		"cidr:10.0.0.0/24",
+	), identity.ReservedIdentityHost)
+
+	updateAndCheck(nRemote, labels.ParseLabels(
+		"reserved:remote-node",
+		"reserved:kube-apiserver",
+		"cidr:10.0.0.0/24",
+	), identity.IdentityScopeRemoteNode)
+
+	// Add a CIDR selector that selects only one node
+	setIPLabels("10.0.0.2/31", "cidr:10.0.0.2/31")
+
+	updateAndCheck(nLocal, labels.ParseLabels(
+		"reserved:host",
+		"reserved:kube-apiserver",
+		"cidr:10.0.0.0/24",
+	), identity.ReservedIdentityHost)
+
+	updateAndCheck(nRemote, labels.ParseLabels(
+		"reserved:remote-node",
+		"reserved:kube-apiserver",
+		"cidr:10.0.0.2/31",
+	), identity.IdentityScopeRemoteNode+1)
+
+	// Remove the /24 selector
+	setIPLabels("10.0.0.0/24")
+
+	updateAndCheck(nLocal, labels.ParseLabels(
+		"reserved:host",
+		"reserved:kube-apiserver",
+	), identity.ReservedIdentityHost)
+
+	updateAndCheck(nRemote, labels.ParseLabels(
+		"reserved:remote-node",
+		"reserved:kube-apiserver",
+		"cidr:10.0.0.2/31",
+	), identity.IdentityScopeRemoteNode+1)
+
+	// add the /24 back, remove kube-apiserver from localhost
+	setIPLabels("10.0.0.1/32")
+	setIPLabels("10.0.0.0/24", "cidr:10.0.0.0/24")
+
+	updateAndCheck(nLocal, labels.ParseLabels(
+		"reserved:host",
+		"cidr:10.0.0.0/24",
+	), identity.ReservedIdentityHost)
+
+	updateAndCheck(nRemote, labels.ParseLabels(
+		"reserved:remote-node",
+		"reserved:kube-apiserver",
+		"cidr:10.0.0.2/31",
+	), identity.IdentityScopeRemoteNode+1)
+
+	// remove the /31, see that remote node was correctly updated.
+	setIPLabels("10.0.0.2/31")
+
+	updateAndCheck(nLocal, labels.ParseLabels(
+		"reserved:host",
+		"cidr:10.0.0.0/24",
+	), identity.ReservedIdentityHost)
+
+	updateAndCheck(nRemote, labels.ParseLabels(
+		"reserved:remote-node",
+		"reserved:kube-apiserver",
+		"cidr:10.0.0.0/24",
+	), identity.IdentityScopeRemoteNode+2)
+
+	// Enable node selector labels
+	option.Config.EnableNodeSelectorLabels = true
+	updateAndCheck(nLocal, labels.ParseLabels(
+		"reserved:host",
+		"node:a=b",
+		"k8s:io.cilium.k8s.policy.cluster=default",
+		"cidr:10.0.0.0/24",
+	), identity.ReservedIdentityHost)
+
+	updateAndCheck(nRemote, labels.ParseLabels(
+		"reserved:remote-node",
+		"reserved:kube-apiserver",
+		"node:a=c",
+		"k8s:io.cilium.k8s.policy.cluster=default",
+		"cidr:10.0.0.0/24",
+	), identity.IdentityScopeRemoteNode+3)
+}
+
 func TestMultipleSources(t *testing.T) {
 	logger := hivetest.Logger(t)
 
@@ -435,7 +597,7 @@ func TestMultipleSources(t *testing.T) {
 	dp.EnableNodeDeleteEvent = true
 	ipcacheMock := newIPcacheMock()
 	h, _ := cell.NewSimpleHealth()
-	mngr, err := New(logger, &option.DaemonConfig{}, cmtypes.DefaultClusterInfo, tunnel.Config{}, ipcacheMock, newIPSetMock(), nil, NewNodeMetrics(), h, nil, nil, nil, fakewireguard.Config{}, node.NewTestLocalNodeStore(node.LocalNode{}))
+	mngr, err := New(logger, &option.DaemonConfig{}, cmtypes.DefaultClusterInfo, tunnel.Config{}, ipcacheMock, NewNodeMetrics(), h, nil, nil, nil, fakewireguard.Config{}, nil, testClusterSizeDependantInterval)
 	require.NoError(t, err)
 	mngr.Subscribe(dp)
 	defer mngr.Stop(context.TODO())
@@ -443,7 +605,7 @@ func TestMultipleSources(t *testing.T) {
 	n1k8s := nodeTypes.Node{Name: "node1", Cluster: "c1", Source: source.Kubernetes, IPAddresses: []nodeTypes.Address{
 		{
 			Type: addressing.NodeInternalIP,
-			IP:   net.ParseIP("10.0.0.1"),
+			IP:   iputil.AddrFrom(netip.MustParseAddr("10.0.0.1")),
 		},
 	}}
 	mngr.NodeUpdated(n1k8s)
@@ -462,7 +624,7 @@ func TestMultipleSources(t *testing.T) {
 	n1agent := nodeTypes.Node{Name: "node1", Cluster: "c1", Source: source.Local, IPAddresses: []nodeTypes.Address{
 		{
 			Type: addressing.NodeInternalIP,
-			IP:   net.ParseIP("10.0.0.1"),
+			IP:   iputil.AddrFrom(netip.MustParseAddr("10.0.0.1")),
 		},
 	}}
 	mngr.NodeUpdated(n1agent)
@@ -519,7 +681,7 @@ func BenchmarkUpdateAndDeleteCycle(b *testing.B) {
 	dp := fakenode.NewHandler()
 	h, _ := cell.NewSimpleHealth()
 	logger := hivetest.Logger(b)
-	mngr, err := New(logger, &option.DaemonConfig{}, cmtypes.DefaultClusterInfo, tunnel.Config{}, ipcacheMock, newIPSetMock(), nil, NewNodeMetrics(), h, nil, nil, nil, fakewireguard.Config{}, node.NewTestLocalNodeStore(node.LocalNode{}))
+	mngr, err := New(logger, &option.DaemonConfig{}, cmtypes.DefaultClusterInfo, tunnel.Config{}, ipcacheMock, NewNodeMetrics(), h, nil, nil, nil, fakewireguard.Config{}, nil, testClusterSizeDependantInterval)
 	require.NoError(b, err)
 	mngr.Subscribe(dp)
 	defer mngr.Stop(context.TODO())
@@ -536,39 +698,13 @@ func BenchmarkUpdateAndDeleteCycle(b *testing.B) {
 	b.StopTimer()
 }
 
-func TestClusterSizeDependantInterval(t *testing.T) {
-	logger := hivetest.Logger(t)
-
-	ipcacheMock := newIPcacheMock()
-	dp := fakenode.NewHandler()
-	h, _ := cell.NewSimpleHealth()
-	mngr, err := New(logger, &option.DaemonConfig{}, cmtypes.DefaultClusterInfo, tunnel.Config{}, ipcacheMock, newIPSetMock(), nil, NewNodeMetrics(), h, nil, nil, nil, fakewireguard.Config{}, node.NewTestLocalNodeStore(node.LocalNode{}))
-	require.NoError(t, err)
-	mngr.Subscribe(dp)
-	defer mngr.Stop(context.TODO())
-
-	prevInterval := time.Nanosecond
-
-	for i := range 1000 {
-		n := nodeTypes.Node{Name: fmt.Sprintf("%d", i), Source: source.Local, IPAddresses: []nodeTypes.Address{
-			{
-				Type: addressing.NodeInternalIP,
-				IP:   net.ParseIP("10.0.0.1"),
-			},
-		}}
-		mngr.NodeUpdated(n)
-		newInterval := mngr.ClusterSizeDependantInterval(time.Minute)
-		assert.Greater(t, newInterval, prevInterval)
-	}
-}
-
 func TestBackgroundSync(t *testing.T) {
 	signalNodeHandler := newSignalNodeHandler()
 	signalNodeHandler.EnableNodeValidateImplementationEvent = true
 	ipcacheMock := newIPcacheMock()
 	h, _ := cell.NewSimpleHealth()
 	logger := hivetest.Logger(t)
-	mngr, err := New(logger, &option.DaemonConfig{}, cmtypes.DefaultClusterInfo, tunnel.Config{}, ipcacheMock, newIPSetMock(), nil, NewNodeMetrics(), h, nil, nil, nil, fakewireguard.Config{}, node.NewTestLocalNodeStore(node.LocalNode{}))
+	mngr, err := New(logger, &option.DaemonConfig{}, cmtypes.DefaultClusterInfo, tunnel.Config{}, ipcacheMock, NewNodeMetrics(), h, nil, nil, nil, fakewireguard.Config{}, nil, testClusterSizeDependantInterval)
 	mngr.Subscribe(signalNodeHandler)
 	require.NoError(t, err)
 	defer mngr.Stop(context.TODO())
@@ -600,7 +736,7 @@ func TestBackgroundSync(t *testing.T) {
 		n := nodeTypes.Node{Name: fmt.Sprintf("%d", i), Source: source.Kubernetes, IPAddresses: []nodeTypes.Address{
 			{
 				Type: addressing.NodeInternalIP,
-				IP:   net.ParseIP("10.0.0.1"),
+				IP:   iputil.AddrFrom(netip.MustParseAddr("10.0.0.1")),
 			},
 		}}
 		mngr.NodeUpdated(n)
@@ -638,7 +774,7 @@ func TestIpcache(t *testing.T) {
 	dp := newSignalNodeHandler()
 	h, _ := cell.NewSimpleHealth()
 	logger := hivetest.Logger(t)
-	mngr, err := New(logger, &option.DaemonConfig{}, cmtypes.DefaultClusterInfo, tunnel.Config{}, ipcacheMock, newIPSetMock(), nil, NewNodeMetrics(), h, nil, nil, nil, fakewireguard.Config{}, node.NewTestLocalNodeStore(node.LocalNode{}))
+	mngr, err := New(logger, &option.DaemonConfig{}, cmtypes.DefaultClusterInfo, tunnel.Config{}, ipcacheMock, NewNodeMetrics(), h, nil, nil, nil, fakewireguard.Config{}, nil, testClusterSizeDependantInterval)
 	require.NoError(t, err)
 	mngr.Subscribe(dp)
 	defer mngr.Stop(context.TODO())
@@ -647,9 +783,9 @@ func TestIpcache(t *testing.T) {
 		Name:    "node1",
 		Cluster: "c1",
 		IPAddresses: []nodeTypes.Address{
-			{Type: addressing.NodeCiliumInternalIP, IP: net.ParseIP("1.1.1.1")},
-			{Type: addressing.NodeInternalIP, IP: net.ParseIP("10.0.0.2")},
-			{Type: addressing.NodeExternalIP, IP: net.ParseIP("f00d::1")},
+			{Type: addressing.NodeCiliumInternalIP, IP: iputil.AddrFrom(netip.MustParseAddr("1.1.1.1"))},
+			{Type: addressing.NodeInternalIP, IP: iputil.AddrFrom(netip.MustParseAddr("10.0.0.2"))},
+			{Type: addressing.NodeExternalIP, IP: iputil.AddrFrom(netip.MustParseAddr("f00d::1"))},
 		},
 
 		IPv4AllocCIDR:           nodeTypes.PrefixFrom(netip.MustParsePrefix("10.0.0.0/24")),
@@ -709,7 +845,7 @@ func TestIpcache(t *testing.T) {
 	// Update node by removing ExternalIPs and secondary PodCIDRs
 	n1 = *n1.DeepCopy()
 	n1.IPAddresses = slices.DeleteFunc(n1.IPAddresses, func(address nodeTypes.Address) bool {
-		return address.IP.Equal(net.ParseIP("f00d::1"))
+		return address.IP.Addr == netip.MustParseAddr("f00d::1")
 	})
 	n1.IPv4SecondaryAllocCIDRs = nil
 	n1.IPv6SecondaryAllocCIDRs = nil
@@ -783,7 +919,7 @@ func TestIpcacheHealthIP(t *testing.T) {
 	dp := newSignalNodeHandler()
 	h, _ := cell.NewSimpleHealth()
 	logger := hivetest.Logger(t)
-	mngr, err := New(logger, &option.DaemonConfig{}, cmtypes.DefaultClusterInfo, tunnel.Config{}, ipcacheMock, newIPSetMock(), nil, NewNodeMetrics(), h, nil, nil, nil, fakewireguard.Config{}, node.NewTestLocalNodeStore(node.LocalNode{}))
+	mngr, err := New(logger, &option.DaemonConfig{}, cmtypes.DefaultClusterInfo, tunnel.Config{}, ipcacheMock, NewNodeMetrics(), h, nil, nil, nil, fakewireguard.Config{}, nil, testClusterSizeDependantInterval)
 	require.NoError(t, err)
 	mngr.Subscribe(dp)
 	defer mngr.Stop(context.TODO())
@@ -792,7 +928,7 @@ func TestIpcacheHealthIP(t *testing.T) {
 		Name:    "node1",
 		Cluster: "c1",
 		IPAddresses: []nodeTypes.Address{
-			{Type: addressing.NodeCiliumInternalIP, IP: net.ParseIP("1.1.1.1").To4()},
+			{Type: addressing.NodeCiliumInternalIP, IP: iputil.AddrFrom(netip.MustParseAddr("1.1.1.1"))},
 		},
 		IPv4HealthIP: iputil.AddrFrom(netip.MustParseAddr("10.0.0.4")),
 		IPv6HealthIP: iputil.AddrFrom(netip.MustParseAddr("f00d::4")),
@@ -830,7 +966,7 @@ func TestNodeEncryption(t *testing.T) {
 	h, _ := cell.NewSimpleHealth()
 	mngr, err := New(logger, &option.DaemonConfig{
 		EncryptNode: true,
-	}, cmtypes.DefaultClusterInfo, tunnel.Config{}, ipcacheMock, newIPSetMock(), nil, NewNodeMetrics(), h, nil, nil, nil, fakewireguard.Config{}, node.NewTestLocalNodeStore(node.LocalNode{}))
+	}, cmtypes.DefaultClusterInfo, tunnel.Config{}, ipcacheMock, NewNodeMetrics(), h, nil, nil, nil, fakewireguard.Config{}, nil, testClusterSizeDependantInterval)
 	require.NoError(t, err)
 	mngr.Subscribe(dp)
 	defer mngr.Stop(context.TODO())
@@ -839,9 +975,9 @@ func TestNodeEncryption(t *testing.T) {
 		Name:    "node1",
 		Cluster: "c1",
 		IPAddresses: []nodeTypes.Address{
-			{Type: addressing.NodeCiliumInternalIP, IP: net.ParseIP("1.1.1.1")},
-			{Type: addressing.NodeInternalIP, IP: net.ParseIP("10.0.0.2")},
-			{Type: addressing.NodeExternalIP, IP: net.ParseIP("f00d::1")},
+			{Type: addressing.NodeCiliumInternalIP, IP: iputil.AddrFrom(netip.MustParseAddr("1.1.1.1"))},
+			{Type: addressing.NodeInternalIP, IP: iputil.AddrFrom(netip.MustParseAddr("10.0.0.2"))},
+			{Type: addressing.NodeExternalIP, IP: iputil.AddrFrom(netip.MustParseAddr("f00d::1"))},
 		},
 		IPv4AllocCIDR:           nodeTypes.PrefixFrom(netip.MustParsePrefix("10.0.0.0/24")),
 		IPv4SecondaryAllocCIDRs: []nodeTypes.Prefix{nodeTypes.PrefixFrom(netip.MustParsePrefix("192.168.10.0/28"))},
@@ -954,7 +1090,7 @@ func TestNode(t *testing.T) {
 	dp.EnableNodeDeleteEvent = true
 	h, _ := cell.NewSimpleHealth()
 	logger := hivetest.Logger(t)
-	mngr, err := New(logger, &option.DaemonConfig{}, cmtypes.DefaultClusterInfo, tunnel.Config{}, ipcacheMock, newIPSetMock(), nil, NewNodeMetrics(), h, nil, nil, nil, fakewireguard.Config{}, node.NewTestLocalNodeStore(node.LocalNode{}))
+	mngr, err := New(logger, &option.DaemonConfig{}, cmtypes.DefaultClusterInfo, tunnel.Config{}, ipcacheMock, NewNodeMetrics(), h, nil, nil, nil, fakewireguard.Config{}, nil, testClusterSizeDependantInterval)
 	require.NoError(t, err)
 	mngr.Subscribe(dp)
 	defer mngr.Stop(context.TODO())
@@ -965,11 +1101,11 @@ func TestNode(t *testing.T) {
 		IPAddresses: []nodeTypes.Address{
 			{
 				Type: addressing.NodeCiliumInternalIP,
-				IP:   net.ParseIP("192.0.2.1"),
+				IP:   iputil.AddrFrom(netip.MustParseAddr("192.0.2.1")),
 			},
 			{
 				Type: addressing.NodeCiliumInternalIP,
-				IP:   net.ParseIP("2001:DB8::1"),
+				IP:   iputil.AddrFrom(netip.MustParseAddr("2001:DB8::1")),
 			},
 		},
 		IPv4HealthIP: iputil.AddrFrom(netip.MustParseAddr("192.0.2.2")),
@@ -998,12 +1134,12 @@ func TestNode(t *testing.T) {
 	n1V2.IPAddresses = []nodeTypes.Address{
 		{
 			Type: addressing.NodeCiliumInternalIP,
-			IP:   net.ParseIP("192.0.2.10"),
+			IP:   iputil.AddrFrom(netip.MustParseAddr("192.0.2.10")),
 		},
 		{
 			// We will keep the IPv6 the same to make sure we will not delete it
 			Type: addressing.NodeCiliumInternalIP,
-			IP:   net.ParseIP("2001:DB8::1"),
+			IP:   iputil.AddrFrom(netip.MustParseAddr("2001:DB8::1")),
 		},
 	}
 	n1V2.IPv4HealthIP = iputil.AddrFrom(netip.MustParseAddr("192.0.2.20"))
@@ -1081,19 +1217,21 @@ func TestNodeManagerEmitStatus(t *testing.T) {
 	hive := hive.New(
 		cell.Provide(func() testParams {
 			return testParams{
-				Config:        config,
-				TunnelConf:    tunnel.Config{},
-				WgConf:        fakewireguard.Config{},
-				IPCache:       ipcacheMock,
-				IPSet:         newIPSetMock(),
-				NodeMetrics:   NewNodeMetrics(),
-				IPSetFilterFn: func(no *nodeTypes.Node) bool { return false },
+				Config:      config,
+				TunnelConf:  tunnel.Config{},
+				WgConf:      fakewireguard.Config{},
+				IPCache:     ipcacheMock,
+				NodeMetrics: NewNodeMetrics(),
 			}
 		}),
-		cell.Provide(tables.NewDeviceTable),                   // Provide statedb.RWTable[*tables.Device]
-		cell.Provide(statedb.RWTable[*tables.Device].ToTable), // Provide statedb.Table[*tables.Device] from RW table
+		cell.Provide(tables.NewDeviceTable),
+		cell.Provide(statedb.RWTable[*tables.Device].ToTable),
+		cell.Provide(node.NewNodeTable),
+		cell.Provide(node.NewWriter),
+		cell.Provide(func() node.ClusterSizeDependantIntervalFunc {
+			return func(interval time.Duration) time.Duration { return interval }
+		}),
 		cell.Module("node_manager", "Node Manager", cell.Provide(New)),
-		node.LocalNodeStoreTestCell,
 		cell.Provide(func() cmtypes.ClusterInfo { return cmtypes.DefaultClusterInfo }),
 		cell.Invoke(fn),
 	)
@@ -1107,7 +1245,7 @@ func TestNodeManagerEmitStatus(t *testing.T) {
 		}
 
 		rx := db.ReadTxn()
-		ss, _, watch, found := statusTable.GetWatch(rx, health.PrimaryIndex.Query(id.HealthID()))
+		ss, _, watch, found := statusTable.GetWatch(rx, health.StatusByID(id.HealthID()))
 		if !found {
 			_, watch = statusTable.AllWatch(rx)
 		}
@@ -1181,13 +1319,11 @@ func (mh *mockHealth) Close() {}
 
 type testParams struct {
 	cell.Out
-	Config        *option.DaemonConfig
-	TunnelConf    tunnel.Config
-	WgConf        wgTypes.Config
-	IPCache       IPCache
-	IPSet         ipset.Manager
-	NodeMetrics   *nodeMetrics
-	IPSetFilterFn IPSetFilterFn
+	Config      *option.DaemonConfig
+	TunnelConf  tunnel.Config
+	WgConf      wgTypes.Config
+	IPCache     IPCache
+	NodeMetrics *nodeMetrics
 }
 
 type mockUpdater struct{}
@@ -1216,7 +1352,7 @@ func TestNodeWithSameInternalIP(t *testing.T) {
 	h, _ := cell.NewSimpleHealth()
 	mngr, err := New(logger, &option.DaemonConfig{
 		LocalRouterIPv4: "169.254.4.6",
-	}, cmtypes.DefaultClusterInfo, tunnel.Config{}, ipcache, newIPSetMock(), nil, NewNodeMetrics(), h, nil, nil, nil, fakewireguard.Config{}, node.NewTestLocalNodeStore(node.LocalNode{}))
+	}, cmtypes.DefaultClusterInfo, tunnel.Config{}, ipcache, NewNodeMetrics(), h, nil, nil, nil, fakewireguard.Config{}, nil, testClusterSizeDependantInterval)
 	require.NoError(t, err)
 	mngr.Subscribe(dp)
 	defer mngr.Stop(context.TODO())
@@ -1227,15 +1363,15 @@ func TestNodeWithSameInternalIP(t *testing.T) {
 		IPAddresses: []nodeTypes.Address{
 			{
 				Type: addressing.NodeInternalIP,
-				IP:   net.ParseIP("10.128.0.40"),
+				IP:   iputil.AddrFrom(netip.MustParseAddr("10.128.0.40")),
 			},
 			{
 				Type: addressing.NodeExternalIP,
-				IP:   net.ParseIP("34.171.135.203"),
+				IP:   iputil.AddrFrom(netip.MustParseAddr("34.171.135.203")),
 			},
 			{
 				Type: addressing.NodeCiliumInternalIP,
-				IP:   net.ParseIP("169.254.4.6"),
+				IP:   iputil.AddrFrom(netip.MustParseAddr("169.254.4.6")),
 			},
 		},
 		Source: source.Local,
@@ -1259,15 +1395,15 @@ func TestNodeWithSameInternalIP(t *testing.T) {
 		IPAddresses: []nodeTypes.Address{
 			{
 				Type: addressing.NodeInternalIP,
-				IP:   net.ParseIP("10.128.0.110"),
+				IP:   iputil.AddrFrom(netip.MustParseAddr("10.128.0.110")),
 			},
 			{
 				Type: addressing.NodeExternalIP,
-				IP:   net.ParseIP("34.170.71.139"),
+				IP:   iputil.AddrFrom(netip.MustParseAddr("34.170.71.139")),
 			},
 			{
 				Type: addressing.NodeCiliumInternalIP,
-				IP:   net.ParseIP("169.254.4.6"),
+				IP:   iputil.AddrFrom(netip.MustParseAddr("169.254.4.6")),
 			},
 		},
 		Source: source.CustomResource,
@@ -1286,341 +1422,192 @@ func TestNodeWithSameInternalIP(t *testing.T) {
 	}
 }
 
-// TestNodeIpset tests that the ipset entries on the node are updated correctly
-// when a node is updated or removed.
-// It is inspired from TestNode() in manager_test.go.
-func TestNodeIpset(t *testing.T) {
+func TestNodeTableMirroring(t *testing.T) {
 	logger := hivetest.Logger(t)
-	ipsetExpect := func(ipsetMgr *ipsetMock, ip string, expected bool) {
-		setName := ipset.CiliumNodeIPSetV6
-		if v4 := net.ParseIP(ip).To4(); v4 != nil {
-			setName = ipset.CiliumNodeIPSetV4
-		}
-
-		found, err := ipsetContains(ipsetMgr, setName, strings.ToLower(ip))
-		require.NoError(t, err)
-
-		if found && !expected {
-			t.Errorf("ipset %s contains IP %s but it should not", setName, ip)
-		}
-		if !found && expected {
-			t.Errorf("ipset %s does not contain expected IP %s", setName, ip)
-		}
-	}
-
-	dp := newSignalNodeHandler()
-	dp.EnableNodeAddEvent = true
-	dp.EnableNodeUpdateEvent = true
-	dp.EnableNodeDeleteEvent = true
-	filter := func(no *nodeTypes.Node) bool { return no.Name != "node1" }
-	h, _ := cell.NewSimpleHealth()
-	mngr, err := New(logger, &option.DaemonConfig{
-		RoutingMode:          option.RoutingModeNative,
-		EnableIPv4Masquerade: true,
-	}, cmtypes.DefaultClusterInfo, tunnel.Config{}, newIPcacheMock(), newIPSetMock(), filter, NewNodeMetrics(), h, nil, nil, nil, fakewireguard.Config{}, node.NewTestLocalNodeStore(node.LocalNode{}))
-	mngr.Subscribe(dp)
+	db := statedb.New()
+	nodeTable, err := node.NewNodeTable(db)
 	require.NoError(t, err)
-	defer mngr.Stop(context.TODO())
+	writer := node.NewWriter(logger, db, nodeTable)
+
+	ipcacheMock := newIPcacheMock()
+	h, _ := cell.NewSimpleHealth()
+	mngr, err := New(
+		logger,
+		&option.DaemonConfig{},
+		cmtypes.ClusterInfo{Name: "c1"},
+		tunnel.Config{},
+		ipcacheMock,
+		NewNodeMetrics(),
+		h,
+		nil,
+		db,
+		nil,
+		fakewireguard.Config{},
+		writer,
+		testClusterSizeDependantInterval,
+	)
+	require.NoError(t, err)
+
+	initialized, initWatch := nodeTable.Initialized(db.ReadTxn())
+	require.False(t, initialized)
+	require.ElementsMatch(t, []string{
+		ClusterNodeTableInitializerName,
+		MeshNodeTableInitializerName,
+	}, nodeTable.PendingInitializers(db.ReadTxn()))
 
 	n1 := nodeTypes.Node{
 		Name:    "node1",
 		Cluster: "c1",
-		IPAddresses: []nodeTypes.Address{
-			{
-				Type: addressing.NodeCiliumInternalIP,
-				IP:   net.ParseIP("192.0.2.1"),
-			},
-			{
-				Type: addressing.NodeCiliumInternalIP,
-				IP:   net.ParseIP("2001:DB8::1"),
-			},
-			{
-				Type: addressing.NodeInternalIP,
-				IP:   net.ParseIP("10.0.0.1"),
-			},
-			{
-				Type: addressing.NodeInternalIP,
-				IP:   net.ParseIP("2001:ABCD::1"),
-			},
-		},
-		IPv4HealthIP: iputil.AddrFrom(netip.MustParseAddr("192.0.2.2")),
-		IPv6HealthIP: iputil.AddrFrom(netip.MustParseAddr("2001:DB8::2")),
-		Source:       source.KVStore,
+		IPAddresses: []nodeTypes.Address{{
+			Type: addressing.NodeInternalIP,
+			IP:   iputil.AddrFrom(netip.MustParseAddr("10.0.0.1")),
+		}},
+		Source: source.KVStore,
 	}
-	mngr.NodeUpdated(n1)
-
-	select {
-	case nodeEvent := <-dp.NodeAddEvent:
-		require.Equal(t, n1, nodeEvent)
-	case nodeEvent := <-dp.NodeUpdateEvent:
-		t.Errorf("Unexpected NodeUpdate() event %#v", nodeEvent)
-	case nodeEvent := <-dp.NodeDeleteEvent:
-		t.Errorf("Unexpected NodeDelete() event %#v", nodeEvent)
-	case <-time.After(3 * time.Second):
-		t.Errorf("timeout while waiting for NodeAdd() event")
-	}
-
-	ipsetExpect(mngr.ipsetMgr.(*ipsetMock), "192.0.2.1", false)
-	ipsetExpect(mngr.ipsetMgr.(*ipsetMock), "2001:DB8::1", false)
-	ipsetExpect(mngr.ipsetMgr.(*ipsetMock), "10.0.0.1", true)
-	ipsetExpect(mngr.ipsetMgr.(*ipsetMock), "2001:ABCD::1", true)
-
 	n2 := nodeTypes.Node{
 		Name:    "node2",
 		Cluster: "c1",
-		IPAddresses: []nodeTypes.Address{
-			{
-				Type: addressing.NodeInternalIP,
-				IP:   net.ParseIP("10.1.0.1"),
-			},
-			{
-				Type: addressing.NodeInternalIP,
-				IP:   net.ParseIP("2001:ABCE::1"),
-			},
-		},
-		Source: source.CustomResource,
-	}
-	mngr.NodeUpdated(n2)
-
-	select {
-	case nodeEvent := <-dp.NodeAddEvent:
-		require.Equal(t, n2, nodeEvent)
-	case nodeEvent := <-dp.NodeUpdateEvent:
-		t.Errorf("Unexpected NodeUpdate() event %#v", nodeEvent)
-	case nodeEvent := <-dp.NodeDeleteEvent:
-		t.Errorf("Unexpected NodeDelete() event %#v", nodeEvent)
-	case <-time.After(3 * time.Second):
-		t.Errorf("timeout while waiting for NodeAdd() event")
+		IPAddresses: []nodeTypes.Address{{
+			Type: addressing.NodeInternalIP,
+			IP:   iputil.AddrFrom(netip.MustParseAddr("10.0.0.2")),
+		}},
+		Source: source.KVStore,
 	}
 
-	ipsetExpect(mngr.ipsetMgr.(*ipsetMock), "10.0.0.1", true)
-	ipsetExpect(mngr.ipsetMgr.(*ipsetMock), "2001:ABCD::1", true)
-	ipsetExpect(mngr.ipsetMgr.(*ipsetMock), "10.1.0.1", false)
-	ipsetExpect(mngr.ipsetMgr.(*ipsetMock), "2001:ABCE::1", false)
+	requireNode := func(t *testing.T, n nodeTypes.Node) {
+		stored, _, found := nodeTable.Get(db.ReadTxn(), node.NodeByName(n.Fullname()))
+		require.True(t, found)
+		require.Equal(t, n, stored.Node)
+		require.Nil(t, stored.Local)
+	}
+	requireNoNode := func(t *testing.T, n nodeTypes.Node) {
+		_, _, found := nodeTable.Get(db.ReadTxn(), node.NodeByName(n.Fullname()))
+		require.False(t, found)
+	}
 
-	n1.IPv4HealthIP = iputil.AddrFrom(netip.MustParseAddr("192.0.2.20"))
 	mngr.NodeUpdated(n1)
+	requireNode(t, n1)
+
+	txn := db.WriteTxn(nodeTable)
+	stored, _, found := nodeTable.Get(txn, node.NodeByName(n1.Fullname()))
+	require.True(t, found)
+	stored = stored.DeepCopy()
+	stored.Statuses = stored.Statuses.Set("test", reconciler.StatusDone())
+	_, _, err = nodeTable.Insert(txn, stored)
+	require.NoError(t, err)
+	txn.Commit()
+
+	n1.EncryptionKey = 42
+	mngr.NodeUpdated(n1)
+	requireNode(t, n1)
+	stored, _, found = nodeTable.Get(db.ReadTxn(), node.NodeByName(n1.Fullname()))
+	require.True(t, found)
+	require.Equal(t, reconciler.StatusKindPending, stored.Statuses.Get("test").Kind)
+
+	mngr.NodeUpdated(n2)
+	requireNode(t, n1)
+	requireNode(t, n2)
+
+	// NodeManager delegates table conflict resolution to node.Writer. For
+	// equal-priority address owners the latest update wins.
+	n3 := n2.DeepCopy()
+	n3.Name = "node3"
+	mngr.NodeUpdated(*n3)
+	requireNode(t, n1)
+	requireNoNode(t, n2)
+	requireNode(t, *n3)
+
+	// Deleting the displaced node must not delete the current address owner.
+	mngr.NodeDeleted(n2)
+	requireNoNode(t, n2)
+	requireNode(t, *n3)
+
+	mngr.NodeUpdated(n2)
+	requireNode(t, n1)
+	requireNode(t, n2)
+	requireNoNode(t, *n3)
 
 	select {
-	case nodeEvent := <-dp.NodeAddEvent:
-		t.Errorf("Unexpected NodeAdd() event %#v", nodeEvent)
-	case nodeEvent := <-dp.NodeUpdateEvent:
-		require.Equal(t, n1, nodeEvent)
-	case nodeEvent := <-dp.NodeDeleteEvent:
-		t.Errorf("Unexpected NodeDelete() event %#v", nodeEvent)
-	case <-time.After(3 * time.Second):
-		t.Errorf("timeout while waiting for NodeUpdate() event")
+	case <-initWatch:
+		t.Fatal("node table initialized before NodeSync")
+	default:
 	}
 
-	ipsetExpect(mngr.ipsetMgr.(*ipsetMock), "192.0.2.1", false)
-	ipsetExpect(mngr.ipsetMgr.(*ipsetMock), "2001:DB8::1", false)
-	ipsetExpect(mngr.ipsetMgr.(*ipsetMock), "10.0.0.1", true)
-	ipsetExpect(mngr.ipsetMgr.(*ipsetMock), "2001:ABCD::1", true)
+	initialized, _ = nodeTable.Initialized(db.ReadTxn())
+	require.False(t, initialized)
+
+	mngr.NodeSync()
+	require.Equal(t, []string{
+		MeshNodeTableInitializerName,
+	}, nodeTable.PendingInitializers(db.ReadTxn()))
+
+	select {
+	case <-initWatch:
+		t.Fatal("node table initialized before MeshNodeSync")
+	default:
+	}
+
+	mngr.MeshNodeSync()
+
+	select {
+	case <-initWatch:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for node table initializer")
+	}
+	initialized, _ = nodeTable.Initialized(db.ReadTxn())
+	require.True(t, initialized)
 
 	mngr.NodeDeleted(n1)
-	select {
-	case nodeEvent := <-dp.NodeDeleteEvent:
-		require.Equal(t, n1, nodeEvent)
-	case nodeEvent := <-dp.NodeAddEvent:
-		t.Errorf("Unexpected NodeAdd() event %#v", nodeEvent)
-	case nodeEvent := <-dp.NodeUpdateEvent:
-		t.Errorf("Unexpected NodeUpdate() event %#v", nodeEvent)
-	case <-time.After(3 * time.Second):
-		t.Errorf("timeout while waiting for NodeDelete() event")
-	}
-
-	ipsetExpect(mngr.ipsetMgr.(*ipsetMock), "192.0.2.1", false)
-	ipsetExpect(mngr.ipsetMgr.(*ipsetMock), "2001:DB8::1", false)
-	ipsetExpect(mngr.ipsetMgr.(*ipsetMock), "10.0.0.1", false)
-	ipsetExpect(mngr.ipsetMgr.(*ipsetMock), "2001:ABCD::1", false)
+	requireNoNode(t, n1)
+	requireNode(t, n2)
 }
 
-// Tests that the node manager calls delete on nodes to be pruned.
-func TestNodesStartupPruning(t *testing.T) {
-	c1Node1 := nodeTypes.Node{Name: "node1", Cluster: "c1", IPAddresses: []nodeTypes.Address{
-		{
-			Type: addressing.NodeInternalIP,
-			IP:   net.ParseIP("10.0.0.1"),
-		},
-	}}
+func TestNodeTableInitializersCompleteInEitherOrder(t *testing.T) {
+	for _, meshFirst := range []bool{false, true} {
+		name := "cluster-first"
+		if meshFirst {
+			name = "mesh-first"
+		}
+		t.Run(name, func(t *testing.T) {
+			db := statedb.New()
+			nodeTable, err := node.NewNodeTable(db)
+			require.NoError(t, err)
+			writer := node.NewWriter(hivetest.Logger(t), db, nodeTable)
 
-	c1Node2 := nodeTypes.Node{Name: "node2", Cluster: "c1", IPAddresses: []nodeTypes.Address{
-		{
-			Type: addressing.NodeInternalIP,
-			IP:   net.ParseIP("10.0.0.2"),
-		},
-	}}
+			health, _ := cell.NewSimpleHealth()
+			mngr, err := New(
+				hivetest.Logger(t),
+				&option.DaemonConfig{},
+				cmtypes.ClusterInfo{Name: "c1"},
+				tunnel.Config{},
+				newIPcacheMock(),
+				NewNodeMetrics(),
+				health,
+				nil,
+				db,
+				nil,
+				fakewireguard.Config{},
+				writer,
+				testClusterSizeDependantInterval,
+			)
+			require.NoError(t, err)
 
-	c1StaleNode := nodeTypes.Node{Name: "node3", Cluster: "c1", IPAddresses: []nodeTypes.Address{
-		{
-			Type: addressing.NodeInternalIP,
-			IP:   net.ParseIP("10.0.0.3"),
-		},
-	}}
-
-	c2Node1 := nodeTypes.Node{Name: "node1", Cluster: "c2", IPAddresses: []nodeTypes.Address{
-		{
-			Type: addressing.NodeInternalIP,
-			IP:   net.ParseIP("10.0.0.4"),
-		},
-	}}
-
-	c2StaleNode := nodeTypes.Node{Name: "node2", Cluster: "c2", IPAddresses: []nodeTypes.Address{
-		{
-			Type: addressing.NodeInternalIP,
-			IP:   net.ParseIP("10.0.0.5"),
-		},
-	}}
-
-	setupManager := func(t *testing.T, stateDir string) (*manager, *signalNodeHandler) {
-		logger := hivetest.Logger(t)
-
-		// Create a nodes.json file from the above two nodes, simulating a previous instance of the agent.
-		nodesFilePath := filepath.Join(stateDir, nodesFilename)
-		nf, err := os.Create(nodesFilePath)
-		require.NoError(t, err)
-		t.Cleanup(func() {
-			nf.Close()
-			os.Remove(nodesFilePath)
-		})
-		e := json.NewEncoder(nf)
-		require.NoError(t, e.Encode([]nodeTypes.Node{
-			c1Node1, c1Node2, c1StaleNode, c2Node1, c2StaleNode,
-		}))
-		require.NoError(t, nf.Sync())
-		require.NoError(t, nf.Close())
-
-		// Create a node manager and add only c1-node1 (local).
-		ipcacheMock := newIPcacheMock()
-		dp := newSignalNodeHandler()
-		dp.EnableNodeDeleteEvent = true
-		h, _ := cell.NewSimpleHealth()
-		mngr, err := New(logger, &option.DaemonConfig{
-			StateDir: stateDir,
-		}, cmtypes.ClusterInfo{Name: "c1"}, tunnel.Config{}, ipcacheMock, newIPSetMock(), nil, NewNodeMetrics(), h, nil, nil, nil, fakewireguard.Config{}, node.NewTestLocalNodeStore(node.LocalNode{}))
-		require.NoError(t, err)
-		t.Cleanup(func() {
-			mngr.Stop(context.TODO())
-		})
-		mngr.Subscribe(dp)
-		mngr.NodeUpdated(c1Node1)
-
-		// Load the nodes from disk.
-		mngr.restoreNodeCheckpoint()
-		require.NoError(t, mngr.initNodeCheckpointer(time.Microsecond))
-		// We remove our test file here to be able to tell once the nodemanager has
-		// written one itself.
-		require.NoError(t, os.Remove(nodesFilePath))
-
-		return mngr, dp
-	}
-
-	checkNodeFileMatches := func(t *testing.T, stateDir string, nodes ...nodeTypes.Node) {
-		path := filepath.Join(stateDir, nodesFilename)
-
-		var prevBytes []byte
-
-		require.EventuallyWithT(t, func(c *assert.CollectT) {
-			checkpointBytes, err := os.ReadFile(path)
-			assert.NoError(c, err)
-
-			if bytes.Equal(checkpointBytes, prevBytes) {
-				c.FailNow()
+			if meshFirst {
+				mngr.MeshNodeSync()
+				require.Equal(t, []string{
+					ClusterNodeTableInitializerName,
+				}, nodeTable.PendingInitializers(db.ReadTxn()))
+				mngr.NodeSync()
+			} else {
+				mngr.NodeSync()
+				require.Equal(t, []string{
+					MeshNodeTableInitializerName,
+				}, nodeTable.PendingInitializers(db.ReadTxn()))
+				mngr.MeshNodeSync()
 			}
 
-			prevBytes = checkpointBytes
-
-			var nl []nodeTypes.Node
-			assert.NoError(c, json.Unmarshal(checkpointBytes, &nl))
-			assert.ElementsMatch(c, nodes, nl)
-		}, time.Second*2, 100*time.Millisecond)
+			initialized, _ := nodeTable.Initialized(db.ReadTxn())
+			require.True(t, initialized)
+		})
 	}
-
-	t.Run("cluster nodes synced first", func(t *testing.T) {
-		stateDir := t.TempDir()
-		mngr, dp := setupManager(t, stateDir)
-
-		// Simulate cluster initial listing.
-		// Add c1 node2 and declare cluster nodes synced.
-		// This should prune c1 node3 (since it's present in the file but not in our
-		// current view).
-		mngr.NodeUpdated(c1Node2)
-		mngr.NodeSync()
-
-		select {
-		case dn := <-dp.NodeDeleteEvent:
-			expectedNode := c1StaleNode
-			expectedNode.Source = source.Restored
-			assert.Equal(t, expectedNode, dn, "should have deleted stale node c1 node3 (with source=Restored)")
-		case <-time.After(time.Second * 5):
-			t.Fatal("should have received a node deletion event for stale node c1 node3")
-		}
-
-		checkNodeFileMatches(t, stateDir, c1Node1, c1Node2)
-
-		// Simulate initial cluster mesh sync. This should prune c2 node2 (since
-		// it's present in the file but not in our current view).
-		mngr.NodeUpdated(c2Node1)
-		mngr.MeshNodeSync()
-
-		select {
-		case dn := <-dp.NodeDeleteEvent:
-			expectedNode := c2StaleNode
-			expectedNode.Source = source.Restored
-			assert.Equal(t, expectedNode, dn, "should have deleted stale node c2 node2 (with source=Restored)")
-		case <-time.After(time.Second * 5):
-			t.Fatal("should have received a node deletion event for stale node c2 node2")
-		}
-
-		checkNodeFileMatches(t, stateDir, c1Node1, c1Node2, c2Node1)
-
-		assert.Equal(t, float64(2), mngr.metrics.EventsReceived.WithLabelValues("delete", string(source.Restored)).Get())
-		assert.Equal(t, float64(3), mngr.metrics.NumNodes.Get())
-	})
-
-	t.Run("meshed nodes synced first", func(t *testing.T) {
-		stateDir := t.TempDir()
-		mngr, dp := setupManager(t, stateDir)
-
-		// Simulate clustermesh initial sync before cluster nodes are finished listing.
-		// Add c2 node1 and declare clustermesh nodes synced (but not cluster nodes).
-		// This should prune c2 node2 (since it's present in the file but not in our
-		// current view).
-		// Restored cluster nodes should not be pruned yet.
-		mngr.NodeUpdated(c2Node1)
-		mngr.MeshNodeSync()
-
-		select {
-		case dn := <-dp.NodeDeleteEvent:
-			expectedNode := c2StaleNode
-			expectedNode.Source = source.Restored
-			assert.Equal(t, expectedNode, dn, "should have deleted stale node c2 node2 (with source=Restored)")
-		case <-time.After(time.Second * 5):
-			t.Fatal("should have received a node deletion event for stale node c2 node2")
-		}
-
-		// Checkpoint should have c1 node1 (local) and c2 node1 (meshed).
-		checkNodeFileMatches(t, stateDir, c1Node1, c2Node1)
-
-		// Simulate cluster initial listing.
-		// Add c1 node2 and declare cluster nodes synced.
-		// This should prune c1 node3 (since it's present in the file but not in our
-		// current view).
-		mngr.NodeUpdated(c1Node2)
-		mngr.NodeSync()
-
-		select {
-		case dn := <-dp.NodeDeleteEvent:
-			expectedNode := c1StaleNode
-			expectedNode.Source = source.Restored
-			assert.Equal(t, expectedNode, dn, "should have deleted stale node c1 node3 (with source=Restored)")
-		case <-time.After(time.Second * 5):
-			t.Fatal("should have received a node deletion event for stale node c1 node3")
-		}
-
-		checkNodeFileMatches(t, stateDir, c1Node1, c1Node2, c2Node1)
-
-		assert.Equal(t, float64(2), mngr.metrics.EventsReceived.WithLabelValues("delete", string(source.Restored)).Get())
-		assert.Equal(t, float64(3), mngr.metrics.NumNodes.Get())
-	})
 }

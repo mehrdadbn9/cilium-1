@@ -72,6 +72,7 @@ type UpsertParams struct {
 	Metadata          string
 	K8sNamespace      string
 	K8sPodName        string
+	K8sPodUID         string
 	K8sServiceAccount string
 	NPM               types.NamedPortMap
 }
@@ -100,6 +101,7 @@ func (s *IPIdentitySynchronizer) Upsert(ctx context.Context, params *UpsertParam
 		Key:               params.Key,
 		K8sNamespace:      params.K8sNamespace,
 		K8sPodName:        params.K8sPodName,
+		K8sPodUID:         params.K8sPodUID,
 		K8sServiceAccount: params.K8sServiceAccount,
 		NamedPorts:        namedPorts,
 	}
@@ -287,10 +289,10 @@ func WithCachedPrefix(cached bool) IWOpt {
 
 // WithIdentityValidator registers a validation function to ensure that the
 // observed IPs are associated with an identity belonging to the expected range.
-func WithIdentityValidator(clusterID uint32) IWOpt {
+func WithIdentityValidator(cinfo cmtypes.ClusterInfo, clusterID uint32) IWOpt {
 	return func(opts *iwOpts) {
-		min := identity.GetMinimalAllocationIdentity(clusterID)
-		max := identity.GetMaximumAllocationIdentity(clusterID)
+		min := identity.NumericIdentity(cinfo.MinimalAllocationIdentityFor(clusterID))
+		max := identity.NumericIdentity(cinfo.MaximumAllocationIdentityFor(clusterID))
 
 		validator := func(pair *identity.IPIdentityPair) error {
 			switch {
@@ -373,21 +375,10 @@ func (iw *IPIdentityWatcher) WaitForSync(ctx context.Context) error {
 // OnUpdate is triggered when a new upsertion event is observed, and
 // synchronizes local caching of endpoint IP to ipIDPair mapping with
 // the operation the key-value store has informed us about.
-//
-// To resolve conflicts between hosts and full CIDR prefixes:
-//   - Insert hosts into the cache as ".../w.x.y.z"
-//   - Insert CIDRS into the cache as ".../w.x.y.z/N"
-//   - If a host entry created, notify the listeners.
-//   - If a CIDR is created and there's no overlapping host
-//     entry, ie it is a less than fully masked CIDR, OR
-//     it is a fully masked CIDR and there is no corresponding
-//     host entry, then:
-//   - Notify the listeners.
-//   - Otherwise, do not notify listeners.
 func (iw *IPIdentityWatcher) OnUpdate(k storepkg.Key) {
 	ipIDPair := k.(*identity.IPIdentityPair)
 
-	ip := ipIDPair.PrefixString()
+	ip := ipIDPair.IP.String()
 	if ip == "<nil>" {
 		iw.log.Warn("Ignoring entry with nil IP")
 		return
@@ -410,10 +401,11 @@ func (iw *IPIdentityWatcher) OnUpdate(k storepkg.Key) {
 	}
 
 	var k8sMeta *K8sMetadata
-	if ipIDPair.K8sNamespace != "" || ipIDPair.K8sPodName != "" || len(ipIDPair.NamedPorts) > 0 {
+	if ipIDPair.K8sNamespace != "" || ipIDPair.K8sPodName != "" || ipIDPair.K8sPodUID != "" || len(ipIDPair.NamedPorts) > 0 {
 		k8sMeta = &K8sMetadata{
 			Namespace:  ipIDPair.K8sNamespace,
 			PodName:    ipIDPair.K8sPodName,
+			PodUID:     ipIDPair.K8sPodUID,
 			NamedPorts: make(types.NamedPortMap, len(ipIDPair.NamedPorts)),
 		}
 		for _, np := range ipIDPair.NamedPorts {
@@ -460,16 +452,9 @@ func (iw *IPIdentityWatcher) OnUpdate(k storepkg.Key) {
 // OnDelete is triggered when a new deletion event is observed, and
 // synchronizes local caching of endpoint IP to ipIDPair mapping with
 // the operation the key-value store has informed us about.
-//
-// To resolve conflicts between hosts and full CIDR prefixes:
-//   - If a host is removed, check for an overlapping CIDR
-//     and if it exists, notify the listeners with an upsert
-//     for the CIDR's identity
-//   - If any other deletion case, notify listeners of
-//     the deletion event.
 func (iw *IPIdentityWatcher) OnDelete(k storepkg.NamedKey) {
 	ipIDPair := k.(*identity.IPIdentityPair)
-	ip := ipIDPair.PrefixString()
+	ip := ipIDPair.IP.String()
 
 	iw.log.Debug(
 		"Observed deletion event",

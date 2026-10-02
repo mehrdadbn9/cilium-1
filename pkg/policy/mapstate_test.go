@@ -6,6 +6,7 @@ package policy
 import (
 	"fmt"
 	"iter"
+	"log/slog"
 	"net/netip"
 	"slices"
 	"strconv"
@@ -15,6 +16,8 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	cmtypes "github.com/cilium/cilium/pkg/clustermesh/types"
+	"github.com/cilium/cilium/pkg/defaults"
 	"github.com/cilium/cilium/pkg/identity"
 	"github.com/cilium/cilium/pkg/labels"
 	"github.com/cilium/cilium/pkg/policy/api"
@@ -230,18 +233,6 @@ func TestPassMetasMerge(t *testing.T) {
 
 func (e mapStateEntry) withLabels(lbls labels.LabelArrayList) mapStateEntry {
 	e.derivedFromRules = makeRuleOrigin(lbls, nil)
-	return e
-}
-
-// withExplicitAuth sets an explicit auth requirement
-func (e mapStateEntry) withExplicitAuth(authType AuthType) mapStateEntry {
-	e.AuthRequirement = authType.AsExplicitRequirement()
-	return e
-}
-
-// withDerivedAuth sets a derived auth requirement
-func (e mapStateEntry) withDerivedAuth(authType AuthType) mapStateEntry {
-	e.AuthRequirement = authType.AsDerivedRequirement()
 	return e
 }
 
@@ -1122,10 +1113,6 @@ func proxyEntryDNS(proxyPort uint16) mapStateEntry {
 	return NewMapStateEntry(AllowEntry.WithProxyPort(proxyPort).WithListenerPriority(ListenerPriorityDNS)).withLabels(labels.LabelArrayList{nil})
 }
 
-func proxyEntryCRD(proxyPort uint16) mapStateEntry {
-	return NewMapStateEntry(AllowEntry.WithProxyPort(proxyPort).WithListenerPriority(ListenerPriorityCRD)).withLabels(labels.LabelArrayList{nil})
-}
-
 func denyEntry() mapStateEntry {
 	return NewMapStateEntry(DenyEntry).withLabels(labels.LabelArrayList{nil})
 }
@@ -1457,7 +1444,7 @@ func TestMapState_AccumulateMapChangesDeny(t *testing.T) {
 			if x.deny {
 				verdict = types.Deny
 			}
-			value := newMapStateEntry(0, types.HighestPriority, types.LowestPriority, NilRuleOrigin, proxyPort, priority, verdict, NoAuthRequirement)
+			value := newMapStateEntry(0, types.HighestPriority, types.LowestPriority, NilRuleOrigin, proxyPort, priority, verdict)
 			policyMaps.AccumulateMapChanges(0, 0, adds, deletes, key, value)
 		}
 		policyMaps.SyncMapChanges(types.MockSelectorSnapshot())
@@ -1480,7 +1467,6 @@ func TestMapState_AccumulateMapChangesDeny(t *testing.T) {
 func TestMapState_AccumulateMapChanges(t *testing.T) {
 	csFoo := newTestCachedSelector("Foo", false)
 	csBar := newTestCachedSelector("Bar", false)
-	csWildcard := newTestCachedSelector("wildcard", true)
 
 	identityCache := identity.IdentityMap{
 		identity.NumericIdentity(identityFoo): labelsFoo,
@@ -1497,7 +1483,6 @@ func TestMapState_AccumulateMapChanges(t *testing.T) {
 		ingress  bool
 		redirect ListenerPriority
 		deny     bool
-		authReq  AuthRequirement
 		level    types.Priority
 	}
 	tests := []struct {
@@ -1688,280 +1673,6 @@ func TestMapState_AccumulateMapChanges(t *testing.T) {
 		deletes: Keys{},
 	}, {
 		continued: false,
-		name:      "test-5a - auth type propagation from the most specific covering key",
-		args: []args{
-			{cs: csFoo, adds: []int{43}, authReq: AuthTypeAlwaysFail.AsExplicitRequirement()},
-			{cs: csFoo, adds: []int{0}, proto: 6, authReq: AuthTypeSpire.AsExplicitRequirement()},
-			{cs: csBar, adds: []int{43}, port: 80, proto: 6, redirect: ListenerPriorityHTTP},
-		},
-		state: testMapState(t, mapStateMap{
-			egressKey(43, 0, 0, 0):  allowEntry().withExplicitAuth(AuthTypeAlwaysFail),
-			egressKey(0, 6, 0, 0):   allowEntry().withExplicitAuth(AuthTypeSpire),
-			egressKey(43, 6, 80, 0): proxyEntryHTTP(1).withDerivedAuth(AuthTypeAlwaysFail),
-		}),
-		adds: Keys{
-			egressKey(43, 0, 0, 0):  {},
-			egressKey(0, 6, 0, 0):   {},
-			egressKey(43, 6, 80, 0): {},
-		},
-		deletes: Keys{},
-	}, {
-		continued: false,
-		name:      "test-5a-r - auth type propagation from the most specific covering key - reverse",
-		args: []args{
-			{cs: csBar, adds: []int{43}, port: 80, proto: 6, redirect: ListenerPriorityHTTP},
-			{cs: csFoo, adds: []int{0}, proto: 6, authReq: AuthTypeSpire.AsExplicitRequirement()},
-			{cs: csFoo, adds: []int{43}, authReq: AuthTypeAlwaysFail.AsExplicitRequirement()},
-		},
-		state: testMapState(t, mapStateMap{
-			egressKey(43, 0, 0, 0):  allowEntry().withExplicitAuth(AuthTypeAlwaysFail),
-			egressKey(0, 6, 0, 0):   allowEntry().withExplicitAuth(AuthTypeSpire),
-			egressKey(43, 6, 80, 0): proxyEntryHTTP(1).withDerivedAuth(AuthTypeAlwaysFail),
-		}),
-		adds: Keys{
-			egressKey(43, 0, 0, 0):  {},
-			egressKey(0, 6, 0, 0):   {},
-			egressKey(43, 6, 80, 0): {},
-		},
-		deletes: Keys{},
-	}, {
-		continued: false,
-		name:      "test-5b - higher priority proxy port override with auth entries",
-		args: []args{
-			{cs: csFoo, adds: []int{43}, proto: 6, redirect: ListenerPriorityHTTP},
-			// lower priority redirect (ListenerPriorityCRD) is overridden by ListenerPriorityHTTP
-			{cs: csFoo, adds: []int{43}, port: 80, proto: 6, prefix: 12, redirect: ListenerPriorityCRD},
-			// but more specific entries with different auth are not
-			{cs: csBar, adds: []int{43}, port: 80, proto: 6, prefix: 16, authReq: AuthTypeSpire.AsExplicitRequirement()},
-			{cs: csBar, adds: []int{43}, port: 81, proto: 6, prefix: 16, authReq: AuthTypeSpire.AsExplicitRequirement()},
-		},
-		state: testMapState(t, mapStateMap{
-			egressKey(43, 6, 0, 0): proxyEntryHTTP(1),
-			// egressKey(43, 6, 80, 12): proxyEntryCRD(1),
-			egressKey(43, 6, 80, 0): proxyEntryHTTP(1).withExplicitAuth(AuthTypeSpire),
-			egressKey(43, 6, 81, 0): proxyEntryHTTP(1).withExplicitAuth(AuthTypeSpire),
-		}),
-		adds: Keys{
-			egressKey(43, 6, 0, 0): {},
-			// egressKey(43, 6, 80, 12): {},
-			egressKey(43, 6, 80, 16): {},
-			egressKey(43, 6, 81, 16): {},
-		},
-		deletes: Keys{},
-	}, {
-		continued: false,
-		name:      "test-5b-r - higher priority proxy port override with auth entries - reverse",
-		args: []args{
-			{cs: csBar, adds: []int{43}, port: 80, proto: 6, prefix: 16, authReq: AuthTypeSpire.AsExplicitRequirement()},
-			{cs: csFoo, adds: []int{43}, port: 80, proto: 6, prefix: 12, redirect: ListenerPriorityHTTP},
-		},
-		state: testMapState(t, mapStateMap{
-			egressKey(43, 6, 80, 12): proxyEntryHTTP(1),
-			egressKey(43, 6, 80, 0):  proxyEntryHTTP(1).withExplicitAuth(AuthTypeSpire),
-		}),
-		adds: Keys{
-			egressKey(43, 6, 80, 12): {},
-			egressKey(43, 6, 80, 0):  {},
-		},
-		deletes: Keys{},
-	}, {
-		continued: false,
-		name:      "test-5c - higher priority proxy port not overridden with auth entries",
-		args: []args{
-			{cs: csFoo, adds: []int{43}, proto: 6, redirect: ListenerPriorityCRD},
-			// higher priority redirect (ListenerPriorityHTTP) is not overridden by ListenerPriorityCRD
-			{cs: csFoo, adds: []int{43}, port: 80, proto: 6, prefix: 12, redirect: ListenerPriorityHTTP},
-			// more specific entries with different auth are not overridden
-			{cs: csBar, adds: []int{43}, port: 80, proto: 6, prefix: 16, authReq: AuthTypeSpire.AsExplicitRequirement()},
-			{cs: csBar, adds: []int{43}, port: 81, proto: 6, prefix: 16, authReq: AuthTypeSpire.AsExplicitRequirement()},
-		},
-		state: testMapState(t, mapStateMap{
-			egressKey(43, 6, 0, 0):   proxyEntryCRD(1),
-			egressKey(43, 6, 80, 12): proxyEntryHTTP(1),
-			egressKey(43, 6, 80, 0):  proxyEntryHTTP(1).withExplicitAuth(AuthTypeSpire),
-			egressKey(43, 6, 81, 0):  proxyEntryHTTP(1).withExplicitAuth(AuthTypeSpire),
-		}),
-		adds: Keys{
-			egressKey(43, 6, 0, 0):   {},
-			egressKey(43, 6, 80, 12): {},
-			egressKey(43, 6, 80, 16): {},
-			egressKey(43, 6, 81, 16): {},
-		},
-		deletes: Keys{},
-	}, {
-		continued: false,
-		name:      "test-5c-r - higher priority proxy port not overridden with auth entries - reverse",
-		args: []args{
-			// more specific entries with different auth are not overridden
-			{cs: csBar, adds: []int{43}, port: 81, proto: 6, prefix: 16, authReq: AuthTypeSpire.AsExplicitRequirement()},
-			{cs: csBar, adds: []int{43}, port: 80, proto: 6, prefix: 16, authReq: AuthTypeSpire.AsExplicitRequirement()},
-			// higher priority redirect (ListenerPriorityHTTP) is not overridden by ListenerPriorityCRD
-			{cs: csFoo, adds: []int{43}, port: 80, proto: 6, prefix: 12, redirect: ListenerPriorityHTTP},
-			{cs: csFoo, adds: []int{43}, proto: 6, redirect: ListenerPriorityCRD},
-		},
-		state: testMapState(t, mapStateMap{
-			egressKey(43, 6, 0, 0):   proxyEntryCRD(1),
-			egressKey(43, 6, 80, 12): proxyEntryHTTP(1),
-			egressKey(43, 6, 80, 0):  proxyEntryHTTP(1).withExplicitAuth(AuthTypeSpire),
-			egressKey(43, 6, 81, 0):  proxyEntryHTTP(1).withExplicitAuth(AuthTypeSpire),
-		}),
-		adds: Keys{
-			egressKey(43, 6, 0, 0):   {},
-			egressKey(43, 6, 80, 12): {},
-			egressKey(43, 6, 80, 16): {},
-			egressKey(43, 6, 81, 16): {},
-		},
-		deletes: Keys{},
-	}, {
-		continued: false,
-		name:      "test-5d - higher priority proxy port propagation to auth entries",
-		args: []args{
-			{cs: csFoo, adds: []int{43}, proto: 6, redirect: ListenerPriorityHTTP},
-			// lower priority redirect (ListenerPriorityCRD) is overridden by ListenerPriorityHTTP redirect, but kept due to different auth requirement
-			{cs: csFoo, adds: []int{43}, port: 80, proto: 6, prefix: 12, redirect: ListenerPriorityCRD, authReq: AuthTypeSpire.AsExplicitRequirement()},
-			// but more specific entries without redirect and the same auth are not added
-			{cs: csBar, adds: []int{43}, port: 80, proto: 6, prefix: 16, authReq: AuthTypeSpire.AsExplicitRequirement()},
-			{cs: csBar, adds: []int{43}, port: 81, proto: 6, prefix: 16, authReq: AuthTypeSpire.AsExplicitRequirement()},
-		},
-		state: testMapState(t, mapStateMap{
-			egressKey(43, 6, 0, 0):   proxyEntryHTTP(1),
-			egressKey(43, 6, 80, 12): proxyEntryHTTP(1).withExplicitAuth(AuthTypeSpire),
-			egressKey(43, 6, 80, 16): proxyEntryHTTP(1).withExplicitAuth(AuthTypeSpire),
-			egressKey(43, 6, 81, 16): proxyEntryHTTP(1).withExplicitAuth(AuthTypeSpire),
-		}),
-		adds: Keys{
-			egressKey(43, 6, 0, 0):   {},
-			egressKey(43, 6, 80, 12): {},
-			egressKey(43, 6, 80, 16): {},
-			egressKey(43, 6, 81, 16): {},
-		},
-		deletes: Keys{},
-	}, {
-		continued: false,
-		name:      "test-5d-r - higher priority proxy port propagation to auth entries - reverse",
-		args: []args{
-			{cs: csBar, adds: []int{43}, port: 81, proto: 6, prefix: 16, authReq: AuthTypeSpire.AsExplicitRequirement()},
-			{cs: csBar, adds: []int{43}, port: 80, proto: 6, prefix: 16, authReq: AuthTypeSpire.AsExplicitRequirement()},
-			{cs: csFoo, adds: []int{43}, port: 80, proto: 6, prefix: 12, redirect: ListenerPriorityCRD, authReq: AuthTypeSpire.AsExplicitRequirement()},
-			{cs: csFoo, adds: []int{43}, proto: 6, redirect: ListenerPriorityHTTP},
-		},
-		state: testMapState(t, mapStateMap{
-			egressKey(43, 6, 0, 0):   proxyEntryHTTP(1),
-			egressKey(43, 6, 80, 12): proxyEntryHTTP(1).withExplicitAuth(AuthTypeSpire),
-			egressKey(43, 6, 80, 16): proxyEntryHTTP(1).withExplicitAuth(AuthTypeSpire),
-			egressKey(43, 6, 81, 16): proxyEntryHTTP(1).withExplicitAuth(AuthTypeSpire),
-		}),
-		adds: Keys{
-			egressKey(43, 6, 0, 0):   {},
-			egressKey(43, 6, 80, 12): {},
-			egressKey(43, 6, 80, 16): {},
-			egressKey(43, 6, 81, 16): {},
-		},
-		deletes: Keys{},
-	}, {
-		continued: false,
-		name:      "test-5e - higher priority proxy port propagation to auth proxy entry",
-		args: []args{
-			{cs: csFoo, adds: []int{43}, proto: 6, redirect: ListenerPriorityHTTP},
-			// lower priority redirect (ListenerPriorityCRD) is overridden by ListenerPriorityHTTP redirect, but kept due to different auth requirement
-			{cs: csFoo, adds: []int{43}, port: 80, proto: 6, prefix: 12, redirect: ListenerPriorityCRD, authReq: AuthTypeSpire.AsExplicitRequirement()},
-			// but more specific entries with same auth are not added
-			{cs: csBar, adds: []int{43}, port: 80, proto: 6, prefix: 16},
-			{cs: csBar, adds: []int{43}, port: 81, proto: 6, prefix: 16},
-		},
-		state: testMapState(t, mapStateMap{
-			egressKey(43, 6, 0, 0):   proxyEntryHTTP(1),
-			egressKey(43, 6, 80, 12): proxyEntryHTTP(1).withExplicitAuth(AuthTypeSpire),
-		}),
-		adds: Keys{
-			egressKey(43, 6, 0, 0):   {},
-			egressKey(43, 6, 80, 12): {},
-		},
-		deletes: Keys{},
-	}, {
-		continued: false,
-		name:      "test-5e-r - higher priority proxy port propagation to auth proxy entry - reverse",
-		args: []args{
-			{cs: csBar, adds: []int{43}, port: 81, proto: 6, prefix: 16},
-			{cs: csBar, adds: []int{43}, port: 80, proto: 6, prefix: 16},
-			{cs: csFoo, adds: []int{43}, port: 80, proto: 6, prefix: 12, redirect: ListenerPriorityCRD, authReq: AuthTypeSpire.AsExplicitRequirement()},
-			{cs: csFoo, adds: []int{43}, proto: 6, redirect: ListenerPriorityHTTP},
-		},
-		state: testMapState(t, mapStateMap{
-			egressKey(43, 6, 0, 0):   proxyEntryHTTP(1),
-			egressKey(43, 6, 80, 12): proxyEntryHTTP(1).withExplicitAuth(AuthTypeSpire),
-		}),
-		adds: Keys{
-			egressKey(43, 6, 0, 0):   {},
-			egressKey(43, 6, 80, 12): {},
-		},
-		deletes: Keys{},
-	}, {
-		continued: false,
-		name:      "test-6a - L3-only explicit auth type and L4-only without",
-		args: []args{
-			{cs: csFoo, adds: []int{43}, authReq: AuthTypeSpire.AsExplicitRequirement()},
-			{cs: csWildcard, adds: []int{0}, port: 80, proto: 6, redirect: ListenerPriorityHTTP},
-		},
-		state: testMapState(t, mapStateMap{
-			egressKey(43, 0, 0, 0): allowEntry().withExplicitAuth(AuthTypeSpire),
-			egressKey(0, 6, 80, 0): proxyEntryHTTP(1),
-		}),
-		adds: Keys{
-			egressKey(43, 0, 0, 0): {},
-			egressKey(0, 6, 80, 0): {},
-		},
-		deletes: Keys{},
-	}, {
-		continued: false,
-		name:      "test-6a-r - L3-only explicit auth type and L4-only without - reverse",
-		args: []args{
-			{cs: csWildcard, adds: []int{0}, port: 80, proto: 6, redirect: ListenerPriorityHTTP},
-			{cs: csFoo, adds: []int{43}, authReq: AuthTypeSpire.AsExplicitRequirement()},
-		},
-		state: testMapState(t, mapStateMap{
-			egressKey(43, 0, 0, 0): allowEntry().withExplicitAuth(AuthTypeSpire),
-			egressKey(0, 6, 80, 0): proxyEntryHTTP(1),
-		}),
-		adds: Keys{
-			egressKey(43, 0, 0, 0): {},
-			egressKey(0, 6, 80, 0): {},
-		},
-		deletes: Keys{},
-	}, {
-		continued: false,
-		name:      "test-7a - L3/proto explicit auth type and L4-only without",
-		args: []args{
-			{cs: csFoo, adds: []int{43}, proto: 6, authReq: AuthTypeSpire.AsExplicitRequirement()},
-			{cs: csWildcard, adds: []int{0}, port: 80, proto: 6, redirect: ListenerPriorityHTTP},
-		},
-		state: testMapState(t, mapStateMap{
-			egressKey(43, 6, 0, 0): allowEntry().withExplicitAuth(AuthTypeSpire),
-			egressKey(0, 6, 80, 0): proxyEntryHTTP(1),
-		}),
-		adds: Keys{
-			egressKey(43, 6, 0, 0): {},
-			egressKey(0, 6, 80, 0): {},
-		},
-		deletes: Keys{},
-	}, {
-		continued: false,
-		name:      "test-7a-1 - L3/proto explicit auth type and L4-only without - reverse",
-		args: []args{
-			{cs: csWildcard, adds: []int{0}, port: 80, proto: 6, redirect: ListenerPriorityHTTP},
-			{cs: csFoo, adds: []int{43}, proto: 6, authReq: AuthTypeSpire.AsExplicitRequirement()},
-		},
-		state: testMapState(t, mapStateMap{
-			egressKey(43, 6, 0, 0): allowEntry().withExplicitAuth(AuthTypeSpire),
-			egressKey(0, 6, 80, 0): proxyEntryHTTP(1),
-		}),
-		adds: Keys{
-			egressKey(43, 6, 0, 0): {},
-			egressKey(0, 6, 80, 0): {},
-		},
-		deletes: Keys{},
-	}, {
-		continued: false,
 		name:      "test-n - title",
 		args:      []args{
 			// {cs: csFoo, adds: []int{42, 43}, deletes: []int{50}, port: 80, proto: 6, ingress: true, redirect: ListenerPriorityHTTP, deny: false},
@@ -2021,58 +1732,11 @@ func TestMapState_AccumulateMapChanges(t *testing.T) {
 			if x.deny {
 				verdict = types.Deny
 			}
-			value := newMapStateEntry(x.level, types.HighestPriority, types.LowestPriority, NilRuleOrigin, proxyPort, priority, verdict, x.authReq)
+			value := newMapStateEntry(x.level, types.HighestPriority, types.LowestPriority, NilRuleOrigin, proxyPort, priority, verdict)
 			policyMaps.AccumulateMapChanges(0, 0, adds, deletes, key, value)
 		}
 		policyMaps.SyncMapChanges(types.MockSelectorSnapshot())
-		_, changes := policyMaps.consumeMapChanges(epPolicy, authRules|denyRules|redirectRules)
-		policyMapState.validatePortProto(t)
-		require.True(t, policyMapState.Equal(&tt.state), "%s (MapState):\n%s", tt.name, policyMapState.diff(&tt.state))
-		require.Equal(t, tt.adds, changes.Adds, tt.name+" (adds)")
-		require.Equal(t, tt.deletes, changes.Deletes, tt.name+" (deletes)")
-	}
-
-	// repeat tests without the auth feature set when not actually used so that both code paths get tested
-	authFeatureUsed := false
-	for _, tt := range tests {
-		t.Log(tt.name + " (without auth feature)")
-		policyMaps := MapChanges{logger: hivetest.Logger(t)}
-		if !tt.continued {
-			authFeatureUsed = false
-			policyMapState = emptyMapState(hivetest.Logger(t))
-		}
-		epPolicy.policyMapState = policyMapState
-
-		for _, x := range tt.args {
-			dir := trafficdirection.Egress
-			if x.ingress {
-				dir = trafficdirection.Ingress
-			}
-			adds := x.cs.addSelections(x.adds...)
-			deletes := x.cs.deleteSelections(x.deletes...)
-			key := KeyForDirection(dir).WithPortProtoPrefix(x.proto, x.port, x.prefix)
-			var proxyPort uint16
-			var priority ListenerPriority
-			if x.redirect != 0 {
-				proxyPort = 1
-				priority = x.redirect
-			}
-			if x.authReq != NoAuthRequirement {
-				authFeatureUsed = true
-			}
-			verdict := types.Allow
-			if x.deny {
-				verdict = types.Deny
-			}
-			value := newMapStateEntry(x.level, types.HighestPriority, types.LowestPriority, NilRuleOrigin, proxyPort, priority, verdict, x.authReq)
-			policyMaps.AccumulateMapChanges(0, 0, adds, deletes, key, value)
-		}
-		policyMaps.SyncMapChanges(types.MockSelectorSnapshot())
-		features := denyRules | redirectRules
-		if authFeatureUsed {
-			features |= authRules
-		}
-		_, changes := policyMaps.consumeMapChanges(epPolicy, features)
+		_, changes := policyMaps.consumeMapChanges(epPolicy, denyRules|redirectRules)
 		policyMapState.validatePortProto(t)
 		require.True(t, policyMapState.Equal(&tt.state), "%s (MapState):\n%s", tt.name, policyMapState.diff(&tt.state))
 		require.Equal(t, tt.adds, changes.Adds, tt.name+" (adds)")
@@ -2364,7 +2028,7 @@ func TestMapState_denyPreferredInsertWithSubnets(t *testing.T) {
 			}
 			aKeys = append(aKeys, IngressKey().WithIdentity(idA).WithPortProto(tt.aProto, tt.aPort))
 		}
-		aEntry := NewMapStateEntry(types.NewMapStateEntry(tt.aLevel, tt.aIsDeny, 0, 0, types.NoAuthRequirement))
+		aEntry := NewMapStateEntry(types.NewMapStateEntry(tt.aLevel, tt.aIsDeny, 0, 0))
 		var bKeys []Key
 		for _, idB := range tt.bIdentities {
 			if tt.outcome&worldIPl3only > 0 && idB == worldIPIdentity &&
@@ -2385,7 +2049,7 @@ func TestMapState_denyPreferredInsertWithSubnets(t *testing.T) {
 			}
 			bKeys = append(bKeys, IngressKey().WithIdentity(idB).WithPortProto(tt.bProto, tt.bPort))
 		}
-		bEntry := NewMapStateEntry(types.NewMapStateEntry(tt.bLevel, tt.bIsDeny, 0, 0, types.NoAuthRequirement))
+		bEntry := NewMapStateEntry(types.NewMapStateEntry(tt.bLevel, tt.bIsDeny, 0, 0))
 		expectedKeys := emptyMapState(hivetest.Logger(t))
 		if tt.outcome&insertAllowAll > 0 {
 			for _, k := range anyIngressKeys {
@@ -2498,12 +2162,12 @@ func TestMapState_denyPreferredInsertWithSubnets(t *testing.T) {
 		for _, idA := range tt.aIdentities {
 			aKeys = append(aKeys, IngressKey().WithIdentity(idA).WithPortProto(tt.aProto, tt.aPort))
 		}
-		aEntry := NewMapStateEntry(types.NewMapStateEntry(tt.aLevel, tt.aIsDeny, 0, 0, types.NoAuthRequirement))
+		aEntry := NewMapStateEntry(types.NewMapStateEntry(tt.aLevel, tt.aIsDeny, 0, 0))
 		var bKeys []Key
 		for _, idB := range tt.bIdentities {
 			bKeys = append(bKeys, EgressKey().WithIdentity(idB).WithPortProto(tt.bProto, tt.bPort))
 		}
-		bEntry := NewMapStateEntry(types.NewMapStateEntry(tt.bLevel, tt.bIsDeny, 0, 0, types.NoAuthRequirement))
+		bEntry := NewMapStateEntry(types.NewMapStateEntry(tt.bLevel, tt.bIsDeny, 0, 0))
 		expectedKeys := emptyMapState(hivetest.Logger(t))
 		if tt.outcome&insertAllowAll > 0 {
 			for _, k := range anyIngressKeys {
@@ -2636,19 +2300,12 @@ type keyEntry struct {
 func TestMapState_orderedMapStateValidation(t *testing.T) {
 	// identities used in tests
 	identityFoo := identity.NumericIdentity(100)
-	labelsFoo := labels.ParseSelectLabelArray("foo", "blue")
 	identityWorld := identity.ReservedIdentityWorld
-	labelsWorld := labels.LabelWorld.LabelArray()
 	identitySubnet := localIdentity(192020)
-	labelsSubnet := labels.GetCIDRLabels(netip.MustParsePrefix(string(api.CIDR("192.0.2.0/24")))).LabelArray()
 	identitySubnetIP := localIdentity(192023)
-	labelsSubnetIP := labels.GetCIDRLabels(netip.MustParsePrefix(string(api.CIDR("192.0.2.3/32")))).LabelArray()
 	identityWorldIP := localIdentity(192042)
-	labelsWorldIP := labels.GetCIDRLabels(netip.MustParsePrefix(string(api.CIDR("192.0.4.2/32")))).LabelArray()
 	identity1111 := localIdentity(1111)
-	labels1111 := labels.GetCIDRLabels(netip.MustParsePrefix(string(api.CIDR("1.1.1.1/32")))).LabelArray()
 	identity1100 := localIdentity(1100)
-	labels1100 := labels.GetCIDRLabels(netip.MustParsePrefix(string(api.CIDR("1.1.0.0/16")))).LabelArray()
 
 	type probe struct {
 		key   Key
@@ -2660,21 +2317,15 @@ func TestMapState_orderedMapStateValidation(t *testing.T) {
 		entries      []keyEntry
 	}
 	tests := []struct {
-		name       string               // test name
-		identities identity.IdentityMap // Identities used in the test
-		tiers      []TierEntries        // Explicitly ordered sets of implicitly ordered entries
-		want       mapStateMap          // expected MapState, optional
-		probes     []probe              // probes to test the policy, optional
+		name   string        // test name
+		tiers  []TierEntries // Explicitly ordered sets of implicitly ordered entries
+		want   mapStateMap   // expected MapState, optional
+		probes []probe       // probes to test the policy, optional
 	}{{
 		name: "allow one.one.one.one, deny everything else on port 80 TAKE 2",
 		// 1. allow 1.1.1.1:80
 		// 2. deny *:80-81
 		// 3. allow 1.1.1.1:*
-		identities: identity.IdentityMap{
-			identity1111:  labels1111,
-			identity1100:  labels1100,
-			identityWorld: labelsWorld,
-		},
 		tiers: []TierEntries{{
 			basePriority: 1000,
 			entries: []keyEntry{
@@ -2708,11 +2359,6 @@ func TestMapState_orderedMapStateValidation(t *testing.T) {
 		// 1. allow 1.1.1.1:80
 		// 2. deny *:80
 		// 3. allow 1.1.1.1:*
-		identities: identity.IdentityMap{
-			identity1111:  labels1111,
-			identity1100:  labels1100,
-			identityWorld: labelsWorld,
-		},
 		tiers: []TierEntries{{
 			basePriority: 2000,
 			entries: []keyEntry{
@@ -2754,11 +2400,6 @@ func TestMapState_orderedMapStateValidation(t *testing.T) {
 		// 1. allow 1.1.1.1:80-81
 		// 2. deny *:80
 		// 3. allow 1.1.1.1:*
-		identities: identity.IdentityMap{
-			identity1111:  labels1111,
-			identity1100:  labels1100,
-			identityWorld: labelsWorld,
-		},
 		tiers: []TierEntries{{
 			basePriority: 1000,
 			entries: []keyEntry{
@@ -2792,11 +2433,6 @@ func TestMapState_orderedMapStateValidation(t *testing.T) {
 		// 1. allow 1.1.1.1:80
 		// 2. deny *:80
 		// 3. allow 1.1.1.1:*
-		identities: identity.IdentityMap{
-			identity1111:  labels1111,
-			identity1100:  labels1100,
-			identityWorld: labelsWorld,
-		},
 		tiers: []TierEntries{{
 			basePriority: 1000,
 			entries: []keyEntry{
@@ -2831,11 +2467,6 @@ func TestMapState_orderedMapStateValidation(t *testing.T) {
 		// 1. allow 1.1.1.1:80
 		// 2. deny *:80
 		// 3. allow 1.1.1.1:*
-		identities: identity.IdentityMap{
-			identity1111:  labels1111,
-			identity1100:  labels1100,
-			identityWorld: labelsWorld,
-		},
 		tiers: []TierEntries{{
 			basePriority: 1000,
 			entries: []keyEntry{
@@ -2878,11 +2509,6 @@ func TestMapState_orderedMapStateValidation(t *testing.T) {
 		// 1. allow 1.1.1.1:80
 		// 2. deny *:80
 		// 3. allow 1.1.0.0/16:*
-		identities: identity.IdentityMap{
-			identity1111:  labels1111,
-			identity1100:  labels1100,
-			identityWorld: labelsWorld,
-		},
 		tiers: []TierEntries{{
 			basePriority: 1000,
 			entries: []keyEntry{
@@ -2920,10 +2546,6 @@ func TestMapState_orderedMapStateValidation(t *testing.T) {
 		},
 	}, {
 		name: "ordered test-1a: earlier order allow takes precedence",
-		identities: identity.IdentityMap{
-			identityFoo:   labelsFoo,
-			identityWorld: labelsWorld,
-		},
 		tiers: []TierEntries{{
 			basePriority: 1000,
 			entries: []keyEntry{
@@ -2952,10 +2574,6 @@ func TestMapState_orderedMapStateValidation(t *testing.T) {
 		},
 	}, {
 		name: "ordered test-1b: earlier order allow takes precedence",
-		identities: identity.IdentityMap{
-			identityFoo:   labelsFoo,
-			identityWorld: labelsWorld,
-		},
 		tiers: []TierEntries{{
 			basePriority: 1000,
 			entries: []keyEntry{
@@ -2981,10 +2599,6 @@ func TestMapState_orderedMapStateValidation(t *testing.T) {
 		},
 	}, {
 		name: "ordered test-2a: earlier order deny takes precedence",
-		identities: identity.IdentityMap{
-			identityFoo:   labelsFoo,
-			identityWorld: labelsWorld,
-		},
 		tiers: []TierEntries{{
 			basePriority: 1000,
 			entries: []keyEntry{
@@ -3017,13 +2631,6 @@ func TestMapState_orderedMapStateValidation(t *testing.T) {
 		},
 	}, {
 		name: "ordered test-3a: CIDR deny with an earlier order allow hole",
-		identities: identity.IdentityMap{
-			identityFoo:      labelsFoo,
-			identityWorld:    labelsWorld,
-			identityWorldIP:  labelsWorldIP,
-			identitySubnet:   labelsSubnet,
-			identitySubnetIP: labelsSubnetIP,
-		},
 		tiers: []TierEntries{{
 			basePriority: 42000,
 			entries: []keyEntry{
@@ -3077,9 +2684,6 @@ func TestMapState_orderedMapStateValidation(t *testing.T) {
 		},
 	}, {
 		name: "deny 1.1.1.1",
-		identities: identity.IdentityMap{
-			identity1111: labels1111,
-		},
 		tiers: []TierEntries{{
 			basePriority: 0,
 			entries: []keyEntry{
@@ -3098,9 +2702,6 @@ func TestMapState_orderedMapStateValidation(t *testing.T) {
 		probes: []probe{},
 	}, {
 		name: "Allow 1.1.1.1",
-		identities: identity.IdentityMap{
-			identity1111: labels1111,
-		},
 		tiers: []TierEntries{{
 			basePriority: 0,
 			entries: []keyEntry{
@@ -3122,9 +2723,6 @@ func TestMapState_orderedMapStateValidation(t *testing.T) {
 		probes: []probe{},
 	}, {
 		name: "PASS 1.1.1.1 over deny all",
-		identities: identity.IdentityMap{
-			identity1111: labels1111,
-		},
 		tiers: []TierEntries{{
 			basePriority: 0,
 			entries: []keyEntry{
@@ -3242,7 +2840,7 @@ func TestMapState_orderedMapStateValidation(t *testing.T) {
 func TestMapState_passValidation(t *testing.T) {
 	// identities used in tests
 	identity1111 := localIdentity(1111)
-	labels1111 := labels.GetCIDRLabels(netip.MustParsePrefix(string(api.CIDR("1.1.1.1/32")))).LabelArray()
+	labels1111 := labels.GetCIDRLabels(netip.MustParsePrefix(string(api.CIDR("1.1.1.1/32"))))
 
 	identityCache := identity.IdentityMap{
 		identity1111: labels1111,
@@ -3436,6 +3034,234 @@ func TestMapState_passValidation(t *testing.T) {
 	}
 }
 
+// TestMapState_lookupSpecificAndAggregate checks that when a flow matches both an entry with the
+// specific remote identity and an entry with the aggregate identity of that remote identity,
+// lookup() selects the same entry as the bpf datapath (__policy_can_access() in
+// bpf/lib/policy.h):
+//
+//  1. The specific-identity entry is selected if it has the highest possible precedence (a
+//     priority 0 deny), without looking at the aggregate entry.
+//  2. Otherwise, the entry with the higher precedence is selected.
+//  3. On the same precedence, the entry with the longer L4 prefix is selected.
+//  4. If the L4 prefixes are equally long, the specific-identity entry is selected.
+//
+// The entries are labeled, since two allow entries without a proxy redirect are otherwise
+// indistinguishable, but the selected entry is what policy verdict correlation (e.g., Hubble)
+// reports the flow as being allowed by.
+func TestMapState_lookupSpecificAndAggregate(t *testing.T) {
+	logger := hivetest.Logger(t)
+
+	// An in-cluster identity and its aggregate identity.
+	id := identity.NumericIdentity(1001)
+	agg := identity.ReservedIdentityAggregateCluster
+	require.Equal(t, agg, aggregateFor(id, emptyMapState(logger).clusterInfo))
+
+	specificLabels := labels.LabelArrayList{labels.ParseLabelArray("rule=specific")}
+	aggregateLabels := labels.LabelArrayList{labels.ParseLabelArray("rule=aggregate")}
+
+	// Flow to 'id' on TCP port 80.
+	flow := egressKey(id, 6, 80, 16)
+
+	tests := []struct {
+		name     string
+		idKey    Key
+		idEntry  mapStateEntry
+		aggKey   Key
+		aggEntry mapStateEntry
+		wantAgg  bool // true if the datapath selects the aggregate entry
+	}{
+		{
+			name:     "allow: aggregate has the more specific L4 (ANY vs. TCP/80)",
+			idKey:    egressKey(id, 0, 0, 0),
+			idEntry:  allowEntry(),
+			aggKey:   egressKey(agg, 6, 80, 16),
+			aggEntry: allowEntry(),
+			wantAgg:  true,
+		},
+		{
+			name:     "allow: aggregate has the more specific L4 (TCP/ANY vs. TCP/80)",
+			idKey:    egressKey(id, 6, 0, 0),
+			idEntry:  allowEntry(),
+			aggKey:   egressKey(agg, 6, 80, 16),
+			aggEntry: allowEntry(),
+			wantAgg:  true,
+		},
+		{
+			name:     "allow: aggregate has the more specific L4 (TCP/80-81 vs. TCP/80)",
+			idKey:    egressKey(id, 6, 80, 15),
+			idEntry:  allowEntry(),
+			aggKey:   egressKey(agg, 6, 80, 16),
+			aggEntry: allowEntry(),
+			wantAgg:  true,
+		},
+		{
+			name:     "allow: specific has the more specific L4 (TCP/80 vs. ANY)",
+			idKey:    egressKey(id, 6, 80, 16),
+			idEntry:  allowEntry(),
+			aggKey:   egressKey(agg, 0, 0, 0),
+			aggEntry: allowEntry(),
+			wantAgg:  false,
+		},
+		{
+			name:     "allow: specific has the more specific L4 (TCP/80 vs. TCP/ANY)",
+			idKey:    egressKey(id, 6, 80, 16),
+			idEntry:  allowEntry(),
+			aggKey:   egressKey(agg, 6, 0, 0),
+			aggEntry: allowEntry(),
+			wantAgg:  false,
+		},
+		{
+			name:     "allow: equally specific L4 (TCP/80)",
+			idKey:    egressKey(id, 6, 80, 16),
+			idEntry:  allowEntry(),
+			aggKey:   egressKey(agg, 6, 80, 16),
+			aggEntry: allowEntry(),
+			wantAgg:  false,
+		},
+		{
+			name:     "allow: equally specific L4 (ANY)",
+			idKey:    egressKey(id, 0, 0, 0),
+			idEntry:  allowEntry(),
+			aggKey:   egressKey(agg, 0, 0, 0),
+			aggEntry: allowEntry(),
+			wantAgg:  false,
+		},
+		{
+			name:     "proxy redirects with the same listener priority: aggregate has the more specific L4",
+			idKey:    egressKey(id, 6, 0, 0),
+			idEntry:  proxyEntryHTTP(1111),
+			aggKey:   egressKey(agg, 6, 80, 16),
+			aggEntry: proxyEntryHTTP(2222),
+			wantAgg:  true,
+		},
+		{
+			name:     "proxy redirects with the same listener priority: specific has the more specific L4",
+			idKey:    egressKey(id, 6, 80, 16),
+			idEntry:  proxyEntryHTTP(1111),
+			aggKey:   egressKey(agg, 6, 0, 0),
+			aggEntry: proxyEntryHTTP(2222),
+			wantAgg:  false,
+		},
+		{
+			name:     "higher precedence: specific proxy redirect over aggregate allow with the more specific L4",
+			idKey:    egressKey(id, 6, 0, 0),
+			idEntry:  proxyEntryHTTP(1111),
+			aggKey:   egressKey(agg, 6, 80, 16),
+			aggEntry: allowEntry(),
+			wantAgg:  false,
+		},
+		{
+			name:     "higher precedence: aggregate proxy redirect over specific allow with the more specific L4",
+			idKey:    egressKey(id, 6, 80, 16),
+			idEntry:  allowEntry(),
+			aggKey:   egressKey(agg, 6, 0, 0),
+			aggEntry: proxyEntryHTTP(2222),
+			wantAgg:  true,
+		},
+		{
+			name:     "higher precedence: specific allow on a higher priority over aggregate allow with the more specific L4",
+			idKey:    egressKey(id, 0, 0, 0),
+			idEntry:  allowEntry().withLevel(5),
+			aggKey:   egressKey(agg, 6, 80, 16),
+			aggEntry: allowEntry().withLevel(10),
+			wantAgg:  false,
+		},
+		{
+			name:     "higher precedence: aggregate allow on a higher priority over specific allow with the more specific L4",
+			idKey:    egressKey(id, 6, 80, 16),
+			idEntry:  allowEntry().withLevel(10),
+			aggKey:   egressKey(agg, 0, 0, 0),
+			aggEntry: allowEntry().withLevel(5),
+			wantAgg:  true,
+		},
+		{
+			name:     "higher precedence: specific deny over aggregate allow with the more specific L4",
+			idKey:    egressKey(id, 0, 0, 0),
+			idEntry:  denyEntry(),
+			aggKey:   egressKey(agg, 6, 80, 16),
+			aggEntry: allowEntry(),
+			wantAgg:  false,
+		},
+		{
+			name:     "higher precedence: aggregate deny over specific allow with the more specific L4",
+			idKey:    egressKey(id, 6, 80, 16),
+			idEntry:  allowEntry(),
+			aggKey:   egressKey(agg, 0, 0, 0),
+			aggEntry: denyEntry(),
+			wantAgg:  true,
+		},
+		{
+			name:     "priority 0 denies: specific is selected even if aggregate has the more specific L4",
+			idKey:    egressKey(id, 0, 0, 0),
+			idEntry:  denyEntry(),
+			aggKey:   egressKey(agg, 6, 80, 16),
+			aggEntry: denyEntry(),
+			wantAgg:  false,
+		},
+		{
+			name:     "denies on the same priority: aggregate has the more specific L4",
+			idKey:    egressKey(id, 0, 0, 0),
+			idEntry:  denyEntry().withLevel(5),
+			aggKey:   egressKey(agg, 6, 80, 16),
+			aggEntry: denyEntry().withLevel(5),
+			wantAgg:  true,
+		},
+		{
+			name:     "denies on the same priority: specific has the more specific L4",
+			idKey:    egressKey(id, 6, 80, 16),
+			idEntry:  denyEntry().withLevel(5),
+			aggKey:   egressKey(agg, 0, 0, 0),
+			aggEntry: denyEntry().withLevel(5),
+			wantAgg:  false,
+		},
+		{
+			name:     "denies on the same priority: equally specific L4",
+			idKey:    egressKey(id, 6, 80, 16),
+			idEntry:  denyEntry().withLevel(5),
+			aggKey:   egressKey(agg, 6, 80, 16),
+			aggEntry: denyEntry().withLevel(5),
+			wantAgg:  false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			idEntry := tt.idEntry.withLabels(specificLabels)
+			aggEntry := tt.aggEntry.withLabels(aggregateLabels)
+
+			// Test setup: both entries must match the flow on their own.
+			for _, e := range []struct {
+				key   Key
+				entry mapStateEntry
+			}{{tt.idKey, idEntry}, {tt.aggKey, aggEntry}} {
+				ms := emptyMapState(logger)
+				ms.insert(e.key, e.entry)
+				got, found := ms.lookup(flow)
+				require.True(t, found, "test setup: %s does not match flow %s", e.key, flow)
+				require.Equal(t, e.entry.MapStateEntry, got.MapStateEntry)
+			}
+
+			ms := emptyMapState(logger)
+			ms.insert(tt.idKey, idEntry)
+			ms.insert(tt.aggKey, aggEntry)
+
+			want := idEntry
+			if tt.wantAgg {
+				want = aggEntry
+			}
+			got, found := ms.lookup(flow)
+			require.True(t, found)
+			require.Equal(t, want.derivedFromRules.Value().LabelArray(), got.derivedFromRules.Value().LabelArray(),
+				"lookup() selected a different entry than the datapath would.\nMapState:\n%s", ms)
+			require.Equal(t, want.MapStateEntry, got.MapStateEntry)
+		})
+	}
+}
+
+func emptyMapState(logger *slog.Logger) mapState {
+	return newMapState(logger, MapStateSizes{}, 0, cmtypes.ClusterInfo{MaxConnectedClusters: defaults.MaxConnectedClusters})
+}
+
 func permutations(arr []int) [][]int {
 	var helper func([]int, int)
 	res := [][]int{}
@@ -3460,4 +3286,23 @@ func permutations(arr []int) [][]int {
 	}
 	helper(arr, len(arr))
 	return res
+}
+
+// TestNewMapStatePreallocation checks that a map state sized after another one preallocates a
+// distinct keyset per identity in the id index, as upsert reuses non-nil preallocated keysets.
+func TestNewMapStatePreallocation(t *testing.T) {
+	logger := hivetest.Logger(t)
+
+	key := EgressKey().WithTCPPort(80)
+	entry := newMapStateEntry(0, types.HighestPriority, types.LowestPriority, NilRuleOrigin, 0, 0, types.Allow)
+
+	old := newMapState(logger, MapStateSizes{}, namedPortRules, cmtypes.DefaultClusterInfo)
+	old.upsert(key.WithIdentity(1000), entry)
+	old.upsert(key.WithIdentity(1001), entry)
+
+	ms := newMapState(logger, old.Sizes(), namedPortRules, cmtypes.DefaultClusterInfo)
+	require.Len(t, ms.byId, 2)
+	ms.upsert(key.WithIdentity(1000), entry)
+	require.Len(t, ms.byId[identity.NumericIdentity(1000)], 1)
+	require.Empty(t, ms.byId[identity.NumericIdentity(1001)])
 }

@@ -5,9 +5,10 @@ package features
 
 import (
 	"fmt"
-	"reflect"
 	"slices"
 	"testing"
+
+	"github.com/stretchr/testify/assert"
 )
 
 func TestComputeFailureExceptions(t *testing.T) {
@@ -50,9 +51,7 @@ func TestComputeFailureExceptions(t *testing.T) {
 			// computeFailureExceptions doesn't guarantee the order of the
 			// returned slice so we have to sort both slices.
 			slices.Sort(result)
-			if !reflect.DeepEqual(result, test.expectedExceptions) {
-				t.Errorf("Expected exceptions to be %v, but got: %v", test.expectedExceptions, result)
-			}
+			assert.Equal(t, test.expectedExceptions, result)
 		})
 	}
 }
@@ -178,6 +177,87 @@ func TestSameSubnet(t *testing.T) {
 			if result != tt.expected {
 				t.Errorf("SameSubnet(%q, %q, %q) = %v, want %v",
 					tt.ip1, tt.ip2, tt.topology, result, tt.expected)
+			}
+		})
+	}
+}
+
+func TestGetIPFamily(t *testing.T) {
+	for _, tt := range []struct {
+		name   string
+		ip     string
+		family IPFamily
+	}{
+		{
+			name:   "empty",
+			ip:     "",
+			family: IPFamilyAny,
+		},
+		{
+			name:   "invalid IPv4",
+			ip:     "10.0.1.",
+			family: IPFamilyAny,
+		},
+		{
+			name:   "hostname",
+			ip:     "example.com",
+			family: IPFamilyAny,
+		},
+		{
+			name:   "IPv4",
+			ip:     "10.0.13.12",
+			family: IPFamilyV4,
+		},
+		{
+			name:   "IPv4 unspecified",
+			ip:     "0.0.0.0",
+			family: IPFamilyV4,
+		},
+		{
+			name:   "IPv4 mapped IPv6",
+			ip:     "::ffff:192.0.2.128",
+			family: IPFamilyV4,
+		},
+		{
+			name:   "IPv4 mapped IPv6 in hexadecimal",
+			ip:     "::ffff:c000:280",
+			family: IPFamilyV4,
+		},
+		{
+			name:   "IPv4 compatible IPv6",
+			ip:     "::192.0.2.128",
+			family: IPFamilyV6,
+		},
+		{
+			name:   "IPv6",
+			ip:     "2001:db8::1",
+			family: IPFamilyV6,
+		},
+		{
+			name:   "IPv6 loopback",
+			ip:     "::1",
+			family: IPFamilyV6,
+		},
+		{
+			name:   "IPv6 unspecified",
+			ip:     "::",
+			family: IPFamilyV6,
+		},
+		{
+			name:   "IPv6 with zone",
+			ip:     "fe80::1%eth0",
+			family: IPFamilyV6,
+		},
+		{
+			name:   "Prefix",
+			ip:     "192.0.2.1/32",
+			family: IPFamilyAny,
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			family := GetIPFamily(tt.ip)
+			if family != tt.family {
+				t.Errorf("GetFamily(%q) = %v, want %v", tt.ip, family, tt.family)
 			}
 		})
 	}

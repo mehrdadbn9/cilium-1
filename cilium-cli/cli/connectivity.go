@@ -206,6 +206,7 @@ func newCmdConnectivityTest(hooks api.Hooks) *cobra.Command {
 	cmd.Flags().StringVar(&params.ConnDisruptTestRestartsPath, "conn-disrupt-test-restarts-path", "/tmp/cilium-conn-disrupt-restarts", "Conn disrupt test temporary result file (used internally)")
 	cmd.Flags().StringVar(&params.ConnDisruptTestXfrmErrorsPath, "conn-disrupt-test-xfrm-errors-path", "/tmp/cilium-conn-disrupt-xfrm-errors", "Conn disrupt test temporary result file (used internally)")
 	cmd.Flags().DurationVar(&params.ConnDisruptDispatchInterval, "conn-disrupt-dispatch-interval", 0, "TCP packet dispatch interval")
+	cmd.Flags().DurationVar(&params.ConnDisruptClientTimeout, "conn-disrupt-client-timeout", 0, "Conn disrupt client per-request timeout, after which it exits (0 leaves the client default)")
 
 	cmd.Flags().StringSliceVar(&params.ExpectedDropReasons, "expected-drop-reasons", defaults.ExpectedDropReasons, "List of expected drop reasons")
 	cmd.Flags().MarkHidden("expected-drop-reasons")
@@ -246,6 +247,9 @@ func newCmdConnectivityPerf(hooks api.Hooks) *cobra.Command {
 		Short: "Test network performance",
 		Long:  ``,
 		PreRunE: func(_ *cobra.Command, _ []string) error {
+			if duration := params.PerfParameters.Duration; duration%time.Second != 0 {
+				return fmt.Errorf("invalid --duration %s: fractional seconds are not supported", duration)
+			}
 			// This is a bit of hack that allows us to override default values
 			// of these parameters that are not visible in perf subcommand options
 			// as we can't have different defaults specified in test and perf subcommands

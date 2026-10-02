@@ -63,7 +63,7 @@ concurrency:
 
 env:
   # renovate: datasource=golang-version depName=go
-  go-version: 1.26.5
+  go-version: 1.27.1
 
 jobs:
   echo-inputs:
@@ -80,7 +80,7 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - name: Set initial commit status
-        uses: cilium/actions/set-commit-status@fe0702f5df0d8e44d48f1baa226c023b73ff6b5e # main
+        uses: cilium/actions/set-commit-status@687b48a0547e534dd7270d5069a5ab7967c0e907 # main
         with:
           sha: ${{ inputs.SHA || github.sha }}
 
@@ -109,7 +109,7 @@ jobs:
 
   setup-and-test:
     needs: wait-for-images
-    runs-on: ${{ vars.GH_RUNNER_EXTRA_POWER_UBUNTU_LATEST || 'ubuntu-24.04' }}
+    runs-on: ${{ vars.UBUNTU_2404_4CPU_16GB || 'ubuntu-24.04' }}
     name: "Runtime Test (${{matrix.focus}})"
     env:
       # GitHub doesn't provide a way to retrieve the name of a job, so we have
@@ -125,12 +125,12 @@ jobs:
         include:
           - focus: "privileged"
             # renovate: datasource=docker depName=quay.io/lvh-images/kind
-            lvhImage: "6.18-20260720.023802"
+            lvhImage: "6.18-20260921.012558"
 
     timeout-minutes: 50
     steps:
       - name: Set commit status to pending
-        uses: cilium/actions/set-commit-status@fe0702f5df0d8e44d48f1baa226c023b73ff6b5e # main
+        uses: cilium/actions/set-commit-status@687b48a0547e534dd7270d5069a5ab7967c0e907 # main
         with:
           sha: ${{ inputs.SHA || github.sha }}
 
@@ -173,7 +173,7 @@ jobs:
           allow-unsafe-pr-checkout: true
 
       - name: Provision LVH VMs
-        uses: cilium/little-vm-helper@5ae749011735fd77f30f38add52f1a53a5568671 # v0.0.30
+        uses: cilium/little-vm-helper@f86d344aca812dda5aef167867a9a0a90ca6cca5 # v0.0.31
         with:
           test-name: runtime-tests
           install-dependencies: true
@@ -182,7 +182,7 @@ jobs:
           images-folder-parent: "/tmp"
           cpu: 4
           # renovate: datasource=github-tags depName=cilium/little-vm-helper
-          lvh-version: "v0.0.30"
+          lvh-version: "v0.0.31"
           mem: 14G
 
       # Load Golang cache build from GitHub
@@ -196,25 +196,30 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-go-unit-tests-cache-
 
-      - name: Create cache directories if they don't exist
-        if: ${{ steps.go-cache.outputs.cache-hit != 'true' && matrix.focus == 'privileged' }}
+      # A restore-keys match delivers the tarballs just as an exact key match does.
+      - name: Move Go cache into the host mount
+        id: deliver-go-cache
+        if: ${{ matrix.focus == 'privileged' }}
         shell: bash
-        run: |
-          mkdir -p /tmp/.cache/go/.cache/go-build
-          mkdir -p /tmp/.cache/go/pkg
-
-      - name: Move Go cache to local directories
-        if: ${{ steps.go-cache.outputs.cache-hit == 'true' && matrix.focus == 'privileged' }}
         env:
           GOCACHE: "/tmp/.cache/go/.cache/go-build"
           GOMODCACHE: "/tmp/.cache/go/pkg"
         run: |
-          mv "${GOCACHE}/go-build-cache.tar.zst" ./go-build-cache.tar.zst || true
-          mv "${GOMODCACHE}/go-mod-cache.tar.zst" ./go-mod-cache.tar.zst || true
+          mkdir -p "${GOCACHE}" "${GOMODCACHE}"
+          delivered=true
+          for spec in "${GOCACHE}/go-build-cache.tar.zst" "${GOMODCACHE}/go-mod-cache.tar.zst"; do
+            if ! mv "${spec}" "./$(basename "${spec}")"; then
+              echo "::warning::${spec} is not in the restored cache"
+              delivered=false
+            fi
+          done
+          # The restored tree, so that a key holding the wrong layout names itself.
+          [ "${delivered}" = true ] || find /tmp/.cache/go -maxdepth 3 | head -50
+          echo "delivered=${delivered}" >> "$GITHUB_OUTPUT"
 
       - name: Login to docker registry for CI image pull
         if: ${{ vars.DOCKER_AUTH_REQUIRED == 'true' }}
-        uses: docker/login-action@371161bbe7024a29a25c5e19bfcbc0804fe9ad2c # v4.5.2
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           registry: ${{ vars.DOCKER_READ_HOST }}
           username: ${{ vars.DOCKER_READ_USERNAME }}
@@ -228,7 +233,7 @@ jobs:
 
       - name: Setup runtime
         timeout-minutes: 10
-        uses: cilium/little-vm-helper@5ae749011735fd77f30f38add52f1a53a5568671 # v0.0.30
+        uses: cilium/little-vm-helper@f86d344aca812dda5aef167867a9a0a90ca6cca5 # v0.0.31
         with:
           provision: 'false'
           cmd: |
@@ -258,7 +263,7 @@ jobs:
         id: prepare-tests
         if: ${{ matrix.focus == 'privileged' }}
         timeout-minutes: 10
-        uses: cilium/little-vm-helper@5ae749011735fd77f30f38add52f1a53a5568671 # v0.0.30
+        uses: cilium/little-vm-helper@f86d344aca812dda5aef167867a9a0a90ca6cca5 # v0.0.31
         with:
           provision: 'false'
           cmd: |
@@ -277,24 +282,31 @@ jobs:
             mkdir -p /go-caches
             tar --use-compress-program=zstd -xpf /host/go-build-cache.tar.zst --same-owner -C /go-caches || true
             tar --use-compress-program=zstd -xpf /host/go-mod-cache.tar.zst --same-owner -C /go-caches || true
-            ls -la /go-caches/go-build || true
+            # An unreported extraction failure here silently costs the whole build cache.
+            if [ -z "$(ls -A /go-caches/go-build 2>/dev/null)" ]; then
+              echo "::warning::no Go build cache in the VM, every package compiles cold"
+            else
+              du -sh /go-caches/go-build /go-caches/pkg
+            fi
 
       - name: Privileged unit tests
         id: run-tests
         if: ${{ matrix.focus == 'privileged' }}
         timeout-minutes: 40
-        uses: cilium/little-vm-helper@5ae749011735fd77f30f38add52f1a53a5568671 # v0.0.30
+        uses: cilium/little-vm-helper@f86d344aca812dda5aef167867a9a0a90ca6cca5 # v0.0.31
         with:
           provision: 'false'
           cmd: |
             cd /host
             make TMPDIR=/var/tmp GOCACHE="/go-caches/go-build" GOMODCACHE="/go-caches/pkg" SKIP_COVERAGE=1 LOG_CODEOWNERS=1 JUNIT_PATH="test/${{ env.job_name }}.xml" tests-privileged-only GO=go${{ env.go-version }}
 
+      # Gated on what actually reached the guest, not on the cache-hit boolean: a
+      # key whose content lacks the tarballs must still be refreshed.
       - name: Copy Go cache to host
         id: copy-go-cache
-        if: ${{ steps.go-cache.outputs.cache-hit != 'true' && matrix.focus == 'privileged' }}
+        if: ${{ steps.deliver-go-cache.outputs.delivered != 'true' && matrix.focus == 'privileged' }}
         timeout-minutes: 10
-        uses: cilium/little-vm-helper@5ae749011735fd77f30f38add52f1a53a5568671 # v0.0.30
+        uses: cilium/little-vm-helper@f86d344aca812dda5aef167867a9a0a90ca6cca5 # v0.0.31
         with:
           provision: 'false'
           cmd: |
@@ -303,17 +315,16 @@ jobs:
             tar --use-compress-program=zstd -cpf /host/go-mod-cache.tar.zst -C /go-caches pkg || true
 
       - name: Move Go cache to local directories
-        if: ${{ steps.go-cache.outputs.cache-hit != 'true' && matrix.focus == 'privileged' }}
+        if: ${{ steps.deliver-go-cache.outputs.delivered != 'true' && matrix.focus == 'privileged' }}
         env:
           GOCACHE: "/tmp/.cache/go/.cache/go-build"
           GOMODCACHE: "/tmp/.cache/go/pkg"
         run: |
-          ls -lah "./go-build-cache.tar.zst" || true
-          ls -lah "./go-mod-cache.tar.zst" || true
-          mv ./go-build-cache.tar.zst "${GOCACHE}" || true
-          mv ./go-mod-cache.tar.zst "${GOMODCACHE}" || true
-          ls -lah "${GOCACHE}" || true
-          ls -lah "${GOMODCACHE}" || true
+          # Both are directories, so the tarballs keep their names inside them.
+          mkdir -p "${GOCACHE}" "${GOMODCACHE}"
+          mv ./go-build-cache.tar.zst "${GOCACHE}/"
+          mv ./go-mod-cache.tar.zst "${GOMODCACHE}/"
+          ls -lah "${GOCACHE}/go-build-cache.tar.zst" "${GOMODCACHE}/go-mod-cache.tar.zst"
 
 
       - name: Fetch JUnits
@@ -359,6 +370,7 @@ jobs:
           name: cilium-junits
           pattern: cilium-junits-*
           token: ${{ secrets.GITHUB_TOKEN }}
+          separate-directories: true
 
   commit-status-final:
     if: ${{ always() }}
@@ -367,7 +379,7 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - name: Set final commit status
-        uses: cilium/actions/set-commit-status@fe0702f5df0d8e44d48f1baa226c023b73ff6b5e # main
+        uses: cilium/actions/set-commit-status@687b48a0547e534dd7270d5069a5ab7967c0e907 # main
         with:
           sha: ${{ inputs.SHA || github.sha }}
           status: ${{ needs.setup-and-test.result }}

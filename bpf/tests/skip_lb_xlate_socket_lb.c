@@ -9,12 +9,11 @@
 
 #define ENABLE_IPV4 1
 #define ENABLE_IPV6 1
-#undef ENABLE_HEALTH_CHECK
 
 #define BACKEND_PORT 7000
 #define NETNS_COOKIE 5000
 #define NETNS_COOKIE2 5001
-#define HOST_NETNS_COOKIE 0
+#define HOST_NETNS_COOKIE 42
 #define DST_PORT 6000
 #define V6_BACKEND1 v6_pod_one
 #define V6_SVC_ONE v6_node_one
@@ -28,7 +27,13 @@
 static __always_inline
 int test_get_netns_cookie(__maybe_unused const struct bpf_sock_addr *addr)
 {
-	struct bpf_sock *sk = addr->sk;
+	struct bpf_sock *sk;
+
+	/* ctx_in_hostns() may call this with NULL for its runtime-config fallback. */
+	if (!addr)
+		return HOST_NETNS_COOKIE;
+
+	sk = addr->sk;
 
 	if (!sk)
 		return 0;
@@ -45,6 +50,8 @@ int test_get_netns_cookie(__maybe_unused const struct bpf_sock_addr *addr)
 #include "bpf_sock.c"
 
 ASSIGN_CONFIG(bool, enable_lrp, true)
+
+ASSIGN_CONFIG(__u64, host_netns_cookie, HOST_NETNS_COOKIE)
 
 #include "lib/common.h"
 #include "lib/ipcache.h"

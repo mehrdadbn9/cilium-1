@@ -7,7 +7,6 @@ import (
 	"context"
 	"log/slog"
 	"maps"
-	"reflect"
 	"slices"
 	"strings"
 
@@ -28,18 +27,29 @@ import (
 	controllerruntime "github.com/cilium/cilium/operator/pkg/controller-runtime"
 	"github.com/cilium/cilium/pkg/annotation"
 	mcsapitypes "github.com/cilium/cilium/pkg/clustermesh/mcsapi/types"
+	"github.com/cilium/cilium/pkg/clustermesh/operator"
 	"github.com/cilium/cilium/pkg/k8s/utils"
 	"github.com/cilium/cilium/pkg/logging/logfields"
+	"github.com/cilium/cilium/pkg/shortener"
 )
 
 const (
 	// endpointSliceLocalMCSAPIControllerName is a unique value used with LabelManagedBy to indicate
 	// the component managing an EndpointSlice.
 	endpointSliceLocalMCSAPIControllerName = "endpointslice-local-mcsapi-controller.cilium.io"
-	localEndpointSliceLabel                = annotation.ServicePrefix + "/local-endpointslice"
-	derivedEndpointSliceByLocalNameIndex   = "mcs.cilium.io/derived-endpointslice-by-local-name"
-	malformedDerivedEndpointSlicePrefix    = "@malformed-derived|"
+	// localEndpointSliceLabel is kept for upgrade and downgrade compatibility and can be removed in Cilium 1.22.
+	localEndpointSliceLabel              = annotation.ServicePrefix + "/local-endpointslice"
+	localEndpointSliceNameAnnotation     = annotation.ServicePrefix + "/local-endpointslice"
+	derivedEndpointSliceByLocalNameIndex = "mcs.cilium.io/derived-endpointslice-by-local-name"
+	malformedDerivedEndpointSlicePrefix  = "@malformed-derived|"
 )
+
+func getLocalEndpointSliceName(derivedEpSlice *discoveryv1.EndpointSlice) string {
+	if name := derivedEpSlice.Annotations[localEndpointSliceNameAnnotation]; name != "" {
+		return name
+	}
+	return derivedEpSlice.Labels[localEndpointSliceLabel]
+}
 
 func derivedEndpointSliceByLocalNameIndexFunc(obj client.Object) []string {
 	epSlice := obj.(*discoveryv1.EndpointSlice)
@@ -47,7 +57,7 @@ func derivedEndpointSliceByLocalNameIndexFunc(obj client.Object) []string {
 		return nil
 	}
 
-	localName := epSlice.Labels[localEndpointSliceLabel]
+	localName := getLocalEndpointSliceName(epSlice)
 	if localName == "" {
 		return nil
 	}
@@ -82,18 +92,26 @@ func newMCSAPIEndpointSliceMirrorReconciler(mgr ctrl.Manager, logger *slog.Logge
 }
 
 func getLocalEndpointSliceKey(derivedEpSlice *discoveryv1.EndpointSlice) *types.NamespacedName {
-	if derivedEpSlice.Labels[localEndpointSliceLabel] == "" {
+	localName := getLocalEndpointSliceName(derivedEpSlice)
+	if localName == "" {
 		return nil
 	}
 	return &types.NamespacedName{
-		Name:      derivedEpSlice.Labels[localEndpointSliceLabel],
+		Name:      localName,
 		Namespace: derivedEpSlice.Namespace,
 	}
 }
 
 func getLocalDerivedEndpointSliceKey(localEpSlice *discoveryv1.EndpointSlice) types.NamespacedName {
-	name := strings.TrimRight(getDerivedServiceName(localEpSlice)+"-"+getSuffix(localEpSlice), "-")
-	return types.NamespacedName{Name: name, Namespace: localEpSlice.Namespace}
+	// get the EndpointSlice name without its Service name prefix
+	suffix := strings.TrimPrefix(localEpSlice.Name, localEpSlice.Labels[discoveryv1.LabelServiceName])
+	suffix = strings.TrimLeft(suffix, "-.")
+
+	name := strings.TrimRight(getDerivedServiceName(localEpSlice)+"-"+suffix, "-")
+	return types.NamespacedName{
+		Name:      shortener.ShortenDNSSubdomainK8sName(name),
+		Namespace: localEpSlice.Namespace,
+	}
 }
 
 func (r *mcsAPIEndpointSliceMirrorReconciler) getLocalEndpointSlice(ctx context.Context, key types.NamespacedName) (*discoveryv1.EndpointSlice, error) {
@@ -135,8 +153,8 @@ func (r *mcsAPIEndpointSliceMirrorReconciler) getAndCleanupDerivedEndpointSlice(
 			derivedEpSlice = &epSlice
 			continue
 		}
-		if err := r.Client.Delete(ctx, &epSlice); err != nil {
-			return nil, client.IgnoreNotFound(err)
+		if err := client.IgnoreNotFound(r.Client.Delete(ctx, &epSlice)); err != nil {
+			return nil, err
 		}
 	}
 	return derivedEpSlice, nil
@@ -162,18 +180,17 @@ func (r *mcsAPIEndpointSliceMirrorReconciler) shouldMirrorLocalEndpointSlice(
 		return false, client.IgnoreNotFound(err)
 	}
 
-	// Only mirrors EndpointSlice compatible with the derived Service IP family
 	valIPFamilies, ok := derivedService.Annotations[annotation.SupportedIPFamilies]
 	ipFamilies, err := mcsapitypes.IPFamiliesFromString(valIPFamilies)
 	if !ok || err != nil {
-		// Fallback to service IPFamilies if the annotation is not set.
-		// This is likely because we are upgrading to Cilium 1.19
-		ipFamilies = derivedService.Spec.IPFamilies
-	}
-	if !slices.Contains(ipFamilies, corev1.IPFamily(localEpSlice.AddressType)) {
+		r.Logger.Warn(
+			"Derived Service has no supported ip families annotation or is invalid",
+			logfields.Request, client.ObjectKeyFromObject(localEpSlice),
+			logfields.Error, err,
+		)
 		return false, nil
 	}
-	return true, nil
+	return slices.Contains(ipFamilies, corev1.IPFamily(localEpSlice.AddressType)), nil
 }
 
 // getFilteredPorts returns a filtered version of the local EndpointSlice ports
@@ -254,11 +271,16 @@ func (r *mcsAPIEndpointSliceMirrorReconciler) updateDerivedEndpointSlice(
 	derivedEpSlice.Labels[discoveryv1.LabelServiceName] = derivedService.Name
 	derivedEpSlice.Labels[mcsapiv1beta1.LabelSourceCluster] = r.clusterName
 	derivedEpSlice.Labels[discoveryv1.LabelManagedBy] = endpointSliceLocalMCSAPIControllerName
+	if len(localEpSlice.Name) <= 63 {
+		derivedEpSlice.Labels[localEndpointSliceLabel] = localEpSlice.Name
+	} else {
+		delete(derivedEpSlice.Labels, localEndpointSliceLabel)
+	}
 
 	if derivedEpSlice.Annotations == nil {
 		derivedEpSlice.Annotations = map[string]string{}
 	}
-	derivedEpSlice.Labels[localEndpointSliceLabel] = localEpSlice.Name
+	derivedEpSlice.Annotations[localEndpointSliceNameAnnotation] = localEpSlice.Name
 
 	derivedEpSlice.AddressType = localEpSlice.AddressType
 
@@ -441,40 +463,15 @@ func (r *mcsAPIEndpointSliceMirrorReconciler) getEndpointSliceFromServiceRequest
 	return requests
 }
 
-// getSuffix return the name of the EndpointSlice trimmed by its generatedName
-func getSuffix(endpointSlice *discoveryv1.EndpointSlice) string {
-	suffix := strings.TrimPrefix(endpointSlice.Name, endpointSlice.Labels[discoveryv1.LabelServiceName])
-	suffixLen := min(40, len(suffix))
-	suffix = strings.TrimLeft(suffix[len(suffix)-suffixLen:], "-.")
-	return suffix
-}
-
 func (r *mcsAPIEndpointSliceMirrorReconciler) needUpdate(
 	localEpSlice, derivedEpSlice *discoveryv1.EndpointSlice, derivedService *corev1.Service,
 	filteredPorts []discoveryv1.EndpointPort,
 ) bool {
+	if derivedEpSlice.Annotations[localEndpointSliceNameAnnotation] != localEpSlice.Name {
+		return true
+	}
+
 	desiredDerivedEndpointSlice := r.newDerivedEndpointSlice(localEpSlice, derivedService, filteredPorts)
 
-	if !maps.Equal(derivedEpSlice.Labels, desiredDerivedEndpointSlice.Labels) {
-		return true
-	}
-	if len(derivedEpSlice.OwnerReferences) != 1 &&
-		derivedEpSlice.OwnerReferences[0].UID != derivedService.UID {
-		return true
-	}
-	if derivedEpSlice.AddressType != desiredDerivedEndpointSlice.AddressType {
-		return true
-	}
-
-	equalsEndpoint := func(a, b discoveryv1.Endpoint) bool {
-		return reflect.DeepEqual(a, b)
-	}
-	if !slices.EqualFunc(derivedEpSlice.Endpoints, desiredDerivedEndpointSlice.Endpoints, equalsEndpoint) {
-		return true
-	}
-
-	equalsEndpointPort := func(a, b discoveryv1.EndpointPort) bool {
-		return reflect.DeepEqual(a, b)
-	}
-	return !slices.EqualFunc(derivedEpSlice.Ports, desiredDerivedEndpointSlice.Ports, equalsEndpointPort)
+	return !operator.EndpointSliceEqualsForMirroring(derivedEpSlice, desiredDerivedEndpointSlice)
 }

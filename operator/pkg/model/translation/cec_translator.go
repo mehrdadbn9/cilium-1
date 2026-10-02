@@ -50,8 +50,9 @@ type ListenerConfig struct {
 }
 
 type ClusterConfig struct {
-	IdleTimeoutSeconds int  `json:"idle_timeout_seconds,omitempty"`
-	UseAppProtocol     bool `json:"use_app_protocol,omitempty"`
+	IdleTimeoutSeconds       int  `json:"idle_timeout_seconds,omitempty"`
+	MaxRequestsPerConnection int  `json:"max_requests_per_connection,omitempty"`
+	UseAppProtocol           bool `json:"use_app_protocol,omitempty"`
 }
 
 type RouteConfig struct {
@@ -185,7 +186,7 @@ func (i *cecTranslator) desiredServicesWithPortsCombined(namespace string, name 
 	return []*ciliumv2.ServiceListener{
 		{
 			Namespace: namespace,
-			Name:      shortener.ShortenK8sResourceName(name),
+			Name:      shortener.ShortenDNSLabelK8sName(name),
 			Ports:     ports,
 		},
 	}, nil
@@ -194,7 +195,7 @@ func (i *cecTranslator) desiredServicesWithPortsCombined(namespace string, name 
 // desiredServicesWithPortsSplit returns per-port ServiceListeners for HTTPS and
 // TLS passthrough, plus one shared entry for plaintext HTTP ports.
 func (i *cecTranslator) desiredServicesWithPortsSplit(namespace string, name string, m *model.Model) ([]*ciliumv2.ServiceListener, error) {
-	shortenedName := shortener.ShortenK8sResourceName(name)
+	shortenedName := shortener.ShortenDNSLabelK8sName(name)
 	var result []*ciliumv2.ServiceListener
 
 	// All TLS passthrough ports are excluded from the plaintext HTTP port list,
@@ -292,13 +293,7 @@ func (i *cecTranslator) desiredResources(m *model.Model) ([]ciliumv2.XDSResource
 }
 
 func (i *cecTranslator) shouldUseOriginalSourceAddress(m *model.Model) bool {
-	for _, l := range m.HTTP {
-		if l.Gamma {
-			return true
-		}
-	}
-
-	return false
+	return m.IsGamma()
 }
 
 func (i *cecTranslator) desiredNodeSelector() *slim_metav1.LabelSelector {

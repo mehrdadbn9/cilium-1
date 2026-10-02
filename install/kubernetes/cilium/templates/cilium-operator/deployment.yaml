@@ -50,8 +50,9 @@ spec:
         cilium.io/cilium-configmap-checksum: {{ include (print $.Template.BasePath "/cilium-configmap.yaml") . | sha256sum | quote }}
         {{- end }}
         {{- if and .Values.operator.prometheus.enabled (not .Values.operator.prometheus.serviceMonitor.enabled) }}
-        prometheus.io/port: {{ .Values.operator.prometheus.port | quote }}
-        prometheus.io/scrape: "true"
+        {{- with include "cilium.prometheusAnnotations" (list .Values.operator.prometheus.port .Values.operator.podAnnotations) }}
+        {{- . | nindent 8 }}
+        {{- end }}
         {{- end }}
         {{- with .Values.operator.podAnnotations }}
         {{- toYaml . | nindent 8 }}
@@ -104,10 +105,8 @@ spec:
             fieldRef:
               apiVersion: v1
               fieldPath: metadata.namespace
-        {{- if or .Values.clustermesh.enableEndpointSliceSynchronization .Values.clustermesh.mcsapi.enabled }}
         - name: CILIUM_CLUSTERMESH_CONFIG
           value: /var/lib/cilium/clustermesh/
-        {{- end }}
         - name: CILIUM_DEBUG
           valueFrom:
             configMapKeyRef:
@@ -199,7 +198,7 @@ spec:
           hostPort: 9234
         {{- end }}
         {{- if .Values.operator.prometheus.enabled }}
-        - name: prometheus
+        - name: {{ .Values.operator.prometheus.portName | quote }}
           containerPort: {{ .Values.operator.prometheus.port }}
         {{- if .Values.operator.hostNetwork }}
           hostPort: {{ .Values.operator.prometheus.port }}
@@ -243,12 +242,10 @@ spec:
           readOnly: true
         {{- end }}
         {{- end }}
-        {{- if or .Values.clustermesh.enableEndpointSliceSynchronization .Values.clustermesh.mcsapi.enabled }}
         {{- if not .Values.clustermesh.apiserver.tls.disableDefaultVolumes }}
         - name: clustermesh-secrets
           mountPath: /var/lib/cilium/clustermesh
           readOnly: true
-        {{- end }}
         {{- end }}
         {{- if .Values.kubeConfigPath }}
         - name: kube-config
@@ -378,7 +375,6 @@ spec:
       {{- with .Values.operator.extraVolumes }}
       {{- toYaml . | nindent 6 }}
       {{- end }}
-      {{- if or .Values.clustermesh.enableEndpointSliceSynchronization .Values.clustermesh.mcsapi.enabled }}
         # To read the clustermesh configuration and TLS certificates
       {{- if not .Values.clustermesh.apiserver.tls.disableDefaultVolumes }}
       - name: clustermesh-secrets
@@ -435,7 +431,6 @@ spec:
               - key: {{ .Values.tls.caBundle.key }}
                 path: local-etcd-client-ca.crt
           {{- end }}
-      {{- end }}
       {{- end }}
       {{- if and .Values.operator.prometheus.enabled .Values.operator.prometheus.tls.enabled }}
       # To read the prometheus configuration

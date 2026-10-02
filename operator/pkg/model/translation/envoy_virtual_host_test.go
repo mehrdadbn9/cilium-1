@@ -14,6 +14,7 @@ import (
 	envoy_config_route_v3 "github.com/envoyproxy/go-control-plane/envoy/config/route/v3"
 	envoy_extensions_filters_http_cors_v3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/cors/v3"
 	extauthzv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/ext_authz/v3"
+	statefulsessionv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/stateful_session/v3"
 	envoy_type_matcher_v3 "github.com/envoyproxy/go-control-plane/envoy/type/matcher/v3"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -573,6 +574,136 @@ func Test_pathPrefixMutation(t *testing.T) {
 	})
 }
 
+func Test_pathFullReplaceMutation(t *testing.T) {
+	t.Run("no full path replace", func(t *testing.T) {
+		route := &envoy_config_route_v3.Route_Route{
+			Route: &envoy_config_route_v3.RouteAction{},
+		}
+		res := pathFullReplaceMutation(nil)(route)
+		require.Equal(t, route, res)
+
+		res = pathFullReplaceMutation(&model.HTTPURLRewriteFilter{})(route)
+		require.Equal(t, route, res)
+
+		res = pathFullReplaceMutation(&model.HTTPURLRewriteFilter{Path: &model.StringMatch{}})(route)
+		require.Equal(t, route, res)
+	})
+
+	t.Run("with simple full path replace", func(t *testing.T) {
+		route := &envoy_config_route_v3.Route_Route{
+			Route: &envoy_config_route_v3.RouteAction{},
+		}
+		rewrite := &model.HTTPURLRewriteFilter{
+			Path: &model.StringMatch{
+				Exact: "/new-path",
+			},
+		}
+
+		res := pathFullReplaceMutation(rewrite)(route)
+		require.Equal(t, &envoy_type_matcher_v3.RegexMatchAndSubstitute{
+			Pattern: &envoy_type_matcher_v3.RegexMatcher{
+				Regex: "^/.*$",
+			},
+			Substitution: "/new-path",
+		}, res.Route.RegexRewrite)
+	})
+
+	t.Run("with full path replace containing backreferences", func(t *testing.T) {
+		route := &envoy_config_route_v3.Route_Route{
+			Route: &envoy_config_route_v3.RouteAction{},
+		}
+		rewrite := &model.HTTPURLRewriteFilter{
+			Path: &model.StringMatch{
+				Exact: `/foo/\1`,
+			},
+		}
+
+		res := pathFullReplaceMutation(rewrite)(route)
+		require.Equal(t, &envoy_type_matcher_v3.RegexMatchAndSubstitute{
+			Pattern: &envoy_type_matcher_v3.RegexMatcher{
+				Regex: "^/.*$",
+			},
+			Substitution: `/foo/\\1`,
+		}, res.Route.RegexRewrite)
+	})
+
+	t.Run("with full path replace containing whole match backreference 0", func(t *testing.T) {
+		route := &envoy_config_route_v3.Route_Route{
+			Route: &envoy_config_route_v3.RouteAction{},
+		}
+		rewrite := &model.HTTPURLRewriteFilter{
+			Path: &model.StringMatch{
+				Exact: `/prefix/\0/suffix`,
+			},
+		}
+
+		res := pathFullReplaceMutation(rewrite)(route)
+		require.Equal(t, &envoy_type_matcher_v3.RegexMatchAndSubstitute{
+			Pattern: &envoy_type_matcher_v3.RegexMatcher{
+				Regex: "^/.*$",
+			},
+			Substitution: `/prefix/\\0/suffix`,
+		}, res.Route.RegexRewrite)
+	})
+
+	t.Run("with full path replace containing trailing backslash", func(t *testing.T) {
+		route := &envoy_config_route_v3.Route_Route{
+			Route: &envoy_config_route_v3.RouteAction{},
+		}
+		rewrite := &model.HTTPURLRewriteFilter{
+			Path: &model.StringMatch{
+				Exact: `/foo\`,
+			},
+		}
+
+		res := pathFullReplaceMutation(rewrite)(route)
+		require.Equal(t, &envoy_type_matcher_v3.RegexMatchAndSubstitute{
+			Pattern: &envoy_type_matcher_v3.RegexMatcher{
+				Regex: "^/.*$",
+			},
+			Substitution: `/foo\\`,
+		}, res.Route.RegexRewrite)
+	})
+
+	t.Run("with full path replace containing consecutive backslashes", func(t *testing.T) {
+		route := &envoy_config_route_v3.Route_Route{
+			Route: &envoy_config_route_v3.RouteAction{},
+		}
+		rewrite := &model.HTTPURLRewriteFilter{
+			Path: &model.StringMatch{
+				Exact: `/foo\\bar`,
+			},
+		}
+
+		res := pathFullReplaceMutation(rewrite)(route)
+		require.Equal(t, &envoy_type_matcher_v3.RegexMatchAndSubstitute{
+			Pattern: &envoy_type_matcher_v3.RegexMatcher{
+				Regex: "^/.*$",
+			},
+			Substitution: `/foo\\\\bar`,
+		}, res.Route.RegexRewrite)
+	})
+
+	t.Run("with full path replace containing multiple backslashes", func(t *testing.T) {
+		route := &envoy_config_route_v3.Route_Route{
+			Route: &envoy_config_route_v3.RouteAction{},
+		}
+		rewrite := &model.HTTPURLRewriteFilter{
+			Path: &model.StringMatch{
+				Exact: `\1\2\3\g\k`,
+			},
+		}
+
+		res := pathFullReplaceMutation(rewrite)(route)
+		require.Equal(t, &envoy_type_matcher_v3.RegexMatchAndSubstitute{
+			Pattern: &envoy_type_matcher_v3.RegexMatcher{
+				Regex: "^/.*$",
+			},
+			Substitution: `\\1\\2\\3\\g\\k`,
+		}, res.Route.RegexRewrite)
+	})
+}
+
 func Test_requestMirrorMutation(t *testing.T) {
 	t.Run("no mirror", func(t *testing.T) {
 		route := &envoy_config_route_v3.Route_Route{
@@ -743,7 +874,7 @@ func Test_envoyHTTPRoutes(t *testing.T) {
 				},
 			},
 		}
-		res := envoyHTTPRoutes(httpRoutes, []string{"*"}, true, 80, nil)
+		res := envoyHTTPRoutes(httpRoutes, []string{"*"}, true, 80, nil, false)
 		require.Len(t, res, 2)
 		// Redirect Route
 		require.NotNil(t, res[0])
@@ -786,7 +917,7 @@ func Test_envoyHTTPRoutes(t *testing.T) {
 				},
 			},
 		}
-		res := envoyHTTPRoutes(httpRoutes, []string{"*"}, true, 80, nil)
+		res := envoyHTTPRoutes(httpRoutes, []string{"*"}, true, 80, nil, false)
 		require.Len(t, res, 2)
 		sort.Stable(SortableRoute(res))
 		// Backend Route
@@ -837,7 +968,7 @@ func Test_envoyHTTPRoutes(t *testing.T) {
 			},
 		}
 
-		res := envoyHTTPRoutes(httpRoutes, []string{"*"}, true, 80, nil)
+		res := envoyHTTPRoutes(httpRoutes, []string{"*"}, true, 80, nil, false)
 		require.Len(t, res, 2)
 
 		sort.Stable(SortableRoute(res))
@@ -894,7 +1025,7 @@ func Test_envoyHTTPRoutes(t *testing.T) {
 				},
 			},
 		}
-		res := envoyHTTPRoutes(httpRoutes, []string{"*"}, true, 80, nil)
+		res := envoyHTTPRoutes(httpRoutes, []string{"*"}, true, 80, nil, false)
 		require.Len(t, res, 1)
 		require.NotNil(t, res[0])
 		require.NotNil(t, res[0].GetDirectResponse())
@@ -917,7 +1048,7 @@ func Test_envoyHTTPRoutes(t *testing.T) {
 			},
 		}
 
-		res := envoyHTTPRoutes(httpRoutes, []string{"*"}, true, 80, nil)
+		res := envoyHTTPRoutes(httpRoutes, []string{"*"}, true, 80, nil, false)
 
 		require.Len(t, res, 1)
 		weightedClusters := res[0].GetRoute().GetWeightedClusters()
@@ -944,7 +1075,7 @@ func Test_envoyHTTPRoutes(t *testing.T) {
 			},
 		}
 
-		res := envoyHTTPRoutes(httpRoutes, []string{"*"}, true, 80, nil)
+		res := envoyHTTPRoutes(httpRoutes, []string{"*"}, true, 80, nil, false)
 
 		require.Len(t, res, 2)
 		require.Equal(t, "default:backend-v1:8080", res[0].GetRoute().GetCluster())
@@ -968,12 +1099,163 @@ func Test_envoyHTTPRoutes(t *testing.T) {
 			},
 		}
 
-		res := envoyHTTPRoutes(httpRoutes, []string{"*"}, true, 80, nil)
+		res := envoyHTTPRoutes(httpRoutes, []string{"*"}, true, 80, nil, false)
 
 		require.Len(t, res, 2)
 		require.NotNil(t, res[0].GetDirectResponse())
 		require.Equal(t, uint32(500), res[0].GetDirectResponse().GetStatus())
 		require.Equal(t, "default:backend-v2:8080", res[1].GetRoute().GetCluster())
+	})
+	t.Run("fail closed direct response takes precedence over backend", func(t *testing.T) {
+		httpRoutes := []model.HTTPRoute{
+			{
+				PathMatch: model.StringMatch{Prefix: "/"},
+				DirectResponse: &model.DirectResponse{
+					StatusCode: 500,
+				},
+				Backends: []model.Backend{
+					backend("backend", 8080),
+				},
+			},
+		}
+
+		res := envoyHTTPRoutes(httpRoutes, []string{"*"}, true, 80, nil, false)
+
+		require.Len(t, res, 1)
+		require.NotNil(t, res[0].GetDirectResponse())
+		require.Equal(t, uint32(500), res[0].GetDirectResponse().GetStatus())
+		require.Nil(t, res[0].GetRoute())
+	})
+
+	t.Run("backend route configures stateful sessions", func(t *testing.T) {
+		httpRoutes := []model.HTTPRoute{
+			{
+				PathMatch: model.StringMatch{Prefix: "/api"},
+				Backends: []model.Backend{
+					backend("backend", 8080),
+				},
+				SessionPersistence: &model.HTTPSessionPersistence{
+					Cookie: &model.HTTPCookieSessionPersistence{
+						Name: "gateway-session",
+						Path: "/api",
+					},
+				},
+			},
+		}
+
+		res := envoyHTTPRoutes(httpRoutes, []string{"*"}, false, 80, nil, true)
+		require.Len(t, res, 1)
+		entry, ok := res[0].GetTypedPerFilterConfig()["envoy.filters.http.stateful_session"]
+		require.True(t, ok)
+		perRoute := &statefulsessionv3.StatefulSessionPerRoute{}
+		require.NoError(t, proto.Unmarshal(entry.Value, perRoute))
+		require.NotNil(t, perRoute.GetStatefulSession())
+	})
+
+	t.Run("request redirect disables stateful sessions", func(t *testing.T) {
+		httpRoutes := []model.HTTPRoute{
+			{
+				PathMatch: model.StringMatch{Prefix: "/"},
+				RequestRedirect: &model.HTTPRequestRedirectFilter{
+					Scheme:     ptr.To("https"),
+					StatusCode: ptr.To(302),
+				},
+				SessionPersistence: &model.HTTPSessionPersistence{
+					Cookie: &model.HTTPCookieSessionPersistence{
+						Name: "gateway-session",
+						Path: "/",
+					},
+				},
+			},
+		}
+		res := envoyHTTPRoutes(httpRoutes, []string{"*"}, false, 80, nil, true)
+
+		require.Len(t, res, 1)
+		entry, ok := res[0].GetTypedPerFilterConfig()["envoy.filters.http.stateful_session"]
+		require.True(t, ok)
+		perRoute := &statefulsessionv3.StatefulSessionPerRoute{}
+		require.NoError(t, proto.Unmarshal(entry.Value, perRoute))
+		require.True(t, perRoute.GetDisabled())
+	})
+
+	t.Run("backend route without persistence disables stateful sessions", func(t *testing.T) {
+		httpRoutes := []model.HTTPRoute{
+			{
+				PathMatch: model.StringMatch{Prefix: "/"},
+				Backends: []model.Backend{
+					{Name: "backend", Namespace: "default", Port: &model.BackendPort{Port: 8080}},
+				},
+			},
+		}
+		res := envoyHTTPRoutes(httpRoutes, []string{"*"}, false, 80, nil, true)
+
+		require.Len(t, res, 1)
+		entry, ok := res[0].GetTypedPerFilterConfig()["envoy.filters.http.stateful_session"]
+		require.True(t, ok)
+		perRoute := &statefulsessionv3.StatefulSessionPerRoute{}
+		require.NoError(t, proto.Unmarshal(entry.Value, perRoute))
+		require.True(t, perRoute.GetDisabled())
+	})
+}
+
+// Test_envoyHTTPRoutes_disablesExtAuthzOnNoBackendResponse verifies that the
+// synthetic 500 generated for a rule with no resolvable backend does not invoke
+// the external authorization service, even though the rule declares one.
+func Test_envoyHTTPRoutes_disablesExtAuthzOnNoBackendResponse(t *testing.T) {
+	auth := &model.HTTPExternalAuthFilter{
+		Backend:  model.Backend{Name: "authz", Namespace: "ns", Port: &model.BackendPort{Port: 9000}},
+		Protocol: model.ExternalAuthProtocolGRPC,
+	}
+	filterName := ExtAuthzFilterName(extAuthzFilterKey(auth))
+
+	t.Run("auth filter is disabled on the synthetic response", func(t *testing.T) {
+		httpRoutes := []model.HTTPRoute{
+			{
+				PathMatch:      model.StringMatch{Prefix: "/"},
+				ExternalAuth:   auth,
+				DirectResponse: &model.DirectResponse{StatusCode: 500},
+			},
+		}
+
+		res := envoyHTTPRoutes(httpRoutes, []string{"*"}, false, 80, []*model.HTTPExternalAuthFilter{auth}, false)
+		require.Len(t, res, 1)
+		require.Equal(t, uint32(500), res[0].GetDirectResponse().GetStatus())
+
+		entry, ok := res[0].TypedPerFilterConfig[filterName]
+		require.True(t, ok, "auth filter must be explicitly disabled on the synthetic response")
+		perRoute := &extauthzv3.ExtAuthzPerRoute{}
+		require.NoError(t, proto.Unmarshal(entry.Value, perRoute))
+		require.True(t, perRoute.GetDisabled())
+	})
+
+	t.Run("non-external per-route config is retained", func(t *testing.T) {
+		httpRoutes := []model.HTTPRoute{
+			{
+				PathMatch:      model.StringMatch{Prefix: "/"},
+				ExternalAuth:   auth,
+				CORS:           &model.HTTPCORSFilter{AllowOrigins: []string{"https://example.com"}},
+				DirectResponse: &model.DirectResponse{StatusCode: 500},
+			},
+		}
+
+		res := envoyHTTPRoutes(httpRoutes, []string{"*"}, false, 80, []*model.HTTPExternalAuthFilter{auth}, false)
+		require.Len(t, res, 1)
+		require.Contains(t, res[0].TypedPerFilterConfig, "envoy.filters.http.cors")
+	})
+
+	t.Run("routes that do serve a backend keep their auth filter", func(t *testing.T) {
+		httpRoutes := []model.HTTPRoute{
+			{
+				PathMatch:    model.StringMatch{Prefix: "/"},
+				ExternalAuth: auth,
+				Backends:     []model.Backend{{Name: "backend-v1", Namespace: "default", Port: &model.BackendPort{Port: 8080}}},
+			},
+		}
+
+		res := envoyHTTPRoutes(httpRoutes, []string{"*"}, false, 80, []*model.HTTPExternalAuthFilter{auth}, false)
+		require.Len(t, res, 1)
+		require.NotContains(t, res[0].TypedPerFilterConfig, filterName,
+			"auth filter must stay enabled on a route that reaches a backend")
 	})
 }
 
@@ -988,7 +1270,7 @@ func Test_envoyHTTPSRoutes_disablesExtAuthzFilters(t *testing.T) {
 		{PathMatch: model.StringMatch{Prefix: "/"}},
 	}
 
-	result := envoyHTTPSRoutes(routes, []string{"example.com"}, false, authFilters)
+	result := envoyHTTPSRoutes(routes, []string{"example.com"}, false, authFilters, false)
 	require.Len(t, result, 1)
 
 	// The redirect route must disable all auth filters so that redirect requests
@@ -1033,7 +1315,7 @@ func Test_envoyHTTPRoutes_differentAuthFilters(t *testing.T) {
 		},
 	}
 
-	res := envoyHTTPRoutes(httpRoutes, []string{"*"}, false, 80, allAuthFilters)
+	res := envoyHTTPRoutes(httpRoutes, []string{"*"}, false, 80, allAuthFilters, false)
 	require.Len(t, res, 2, "routes with different auth filters must not be merged")
 
 	filterNameA := ExtAuthzFilterName(extAuthzFilterKey(authA))
@@ -1062,9 +1344,52 @@ func Test_envoyHTTPSRoutes_noAuthFilters(t *testing.T) {
 	routes := []model.HTTPRoute{
 		{PathMatch: model.StringMatch{Prefix: "/"}},
 	}
-	result := envoyHTTPSRoutes(routes, []string{"example.com"}, false, nil)
+	result := envoyHTTPSRoutes(routes, []string{"example.com"}, false, nil, false)
 	require.Len(t, result, 1)
 	require.Nil(t, result[0].TypedPerFilterConfig, "redirect route must not set TypedPerFilterConfig when there are no auth filters")
+}
+
+func Test_envoyHTTPSRoutes_statefulSessionDisabled(t *testing.T) {
+	httpsRoutes := []model.HTTPRoute{
+		{
+			PathMatch: model.StringMatch{Prefix: "/"},
+			SessionPersistence: &model.HTTPSessionPersistence{
+				Cookie: &model.HTTPCookieSessionPersistence{
+					Name: "gateway-session",
+					Path: "/",
+				},
+			},
+		},
+	}
+	res := envoyHTTPSRoutes(httpsRoutes, []string{"example.com"}, false, nil, true)
+
+	require.Len(t, res, 1)
+	entry, ok := res[0].GetTypedPerFilterConfig()["envoy.filters.http.stateful_session"]
+	require.True(t, ok)
+	perRoute := &statefulsessionv3.StatefulSessionPerRoute{}
+	require.NoError(t, proto.Unmarshal(entry.Value, perRoute))
+	require.True(t, perRoute.GetDisabled(), "HTTPS redirect route must disable stateful sessions because it does not select a backend")
+}
+
+func Test_envoyHTTPRouteDirectResponse_statefulSessionDisabled(t *testing.T) {
+	httpRoute := model.HTTPRoute{
+		PathMatch:      model.StringMatch{Prefix: "/"},
+		DirectResponse: &model.DirectResponse{StatusCode: 500},
+		SessionPersistence: &model.HTTPSessionPersistence{
+			Cookie: &model.HTTPCookieSessionPersistence{
+				Name: "gateway-session",
+				Path: "/",
+			},
+		},
+	}
+	res := envoyHTTPRouteDirectResponse(httpRoute, []string{"*"}, false, nil, true)
+
+	require.NotNil(t, res)
+	entry, ok := res.GetTypedPerFilterConfig()["envoy.filters.http.stateful_session"]
+	require.True(t, ok)
+	perRoute := &statefulsessionv3.StatefulSessionPerRoute{}
+	require.NoError(t, proto.Unmarshal(entry.Value, perRoute))
+	require.True(t, perRoute.GetDisabled(), "direct response route must disable stateful sessions because it does not select a backend")
 }
 
 func Test_getCORSStringMatcher(t *testing.T) {

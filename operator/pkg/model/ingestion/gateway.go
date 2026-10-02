@@ -5,6 +5,8 @@ package ingestion
 
 import (
 	"cmp"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"log/slog"
 	"slices"
@@ -141,7 +143,6 @@ type Input struct {
 	TCPRoutes           []gatewayv1.TCPRoute
 	UDPRoutes           []gatewayv1.UDPRoute
 	ReferenceGrants     []gatewayv1.ReferenceGrant
-	Namespaces          []corev1.Namespace
 	Services            []corev1.Service
 	ServiceImports      []mcsapiv1beta1.ServiceImport
 	BackendTLSPolicyMap helpers.BackendTLSPolicyServiceMap
@@ -177,26 +178,7 @@ func GatewayAPI(log *slog.Logger, input Input) *model.Model {
 		}
 	}
 
-	namespaceLabels := helpers.NewNamespaceLabelIndex(input.Namespaces)
 	listeners := input.MergedListeners
-	// When MergedListeners is not provided, build it from the direct
-	// Gateway-listeners
-	if listeners == nil {
-		gwSource := model.FullyQualifiedResource{
-			Name:      input.Gateway.GetName(),
-			Namespace: input.Gateway.GetNamespace(),
-			Group:     gatewayv1.GroupVersion.Group,
-			Version:   gatewayv1.GroupVersion.Version,
-			Kind:      "Gateway",
-			UID:       string(input.Gateway.GetUID()),
-		}
-		for _, l := range input.Gateway.Spec.Listeners {
-			listeners = append(listeners, ListenerWithContext{
-				Listener: l,
-				Source:   gwSource,
-			})
-		}
-	}
 
 	// Find all the listener host names, so that we can match them with the routes
 	// Gateway API spec guarantees that the hostnames are unique across all listeners
@@ -219,17 +201,8 @@ func GatewayAPI(log *slog.Logger, input Input) *model.Model {
 
 			var httpRoutes []model.HTTPRoute
 
-			// (ajs) Note well, we are using the existence of AllowedNamespace
-			// as a hint that this listener has already performed filtering for
-			// routes based on AllowedNamespaces. We need to refactor this type
-			// of assumption to not apply only to ListenerSets, and be a true
-			// invariant expected by this code path. That is, move all such
-			// validation out of the ingestion codepath and into a combined
-			// validate-and-record status phase of the reconcile pipeline.
-			namespacesPreFiltered := l.AllowedNamespaces != nil
-
-			httpRoutes = append(httpRoutes, toHTTPRoutes(log, l.Listener, l.Source.Namespace, namespaceLabels, namespacesPreFiltered, listenerHostnamesByProtocol, filteredHTTPRoutes, input.Services, input.ServiceImports, input.ReferenceGrants, input.BackendTLSPolicyMap)...)
-			httpRoutes = append(httpRoutes, toGRPCRoutes(l.Listener, l.Source.Namespace, namespaceLabels, namespacesPreFiltered, listenerHostnamesByProtocol, filteredGRPCRoutes, input.Services, input.ServiceImports, input.ReferenceGrants)...)
+			httpRoutes = append(httpRoutes, toHTTPRoutes(log, l.Listener, listenerHostnamesByProtocol, filteredHTTPRoutes, input.Services, input.ServiceImports, input.ReferenceGrants, input.BackendTLSPolicyMap)...)
+			httpRoutes = append(httpRoutes, toGRPCRoutes(l.Listener, listenerHostnamesByProtocol, filteredGRPCRoutes, input.Services, input.ServiceImports, input.ReferenceGrants)...)
 			m.HTTP = append(m.HTTP, model.HTTPListener{
 				Name:                       string(l.Name),
 				Sources:                    []model.FullyQualifiedResource{l.Source},
@@ -248,32 +221,30 @@ func GatewayAPI(log *slog.Logger, input Input) *model.Model {
 					Sources:        []model.FullyQualifiedResource{l.Source},
 					Port:           uint32(l.Port),
 					Hostname:       toHostname(l.Hostname),
-					Routes:         toTLSRoutes(l.Listener, l.Source.Namespace, namespaceLabels, namespacesPreFiltered, listenerHostnamesByProtocol, l.FilterTLSRoutes(input.TLSRoutes), input.Services, input.ServiceImports, input.ReferenceGrants),
+					Routes:         toTLSRoutes(l.Listener, listenerHostnamesByProtocol, l.FilterTLSRoutes(input.TLSRoutes), input.Services, input.ServiceImports, input.ReferenceGrants),
 					Infrastructure: infra,
 					Service:        toServiceModel(input.GatewayClassConfig),
 				})
 			}
 
 		case gatewayv1.TCPProtocolType:
-			namespacesPreFiltered := l.AllowedNamespaces != nil
 			m.L4 = append(m.L4, model.L4Listener{
 				Name:           string(l.Name),
 				Sources:        []model.FullyQualifiedResource{l.Source},
 				Port:           uint32(l.Port),
 				Protocol:       model.L4ProtocolTCP,
-				Routes:         toTCPRoutes(l.Listener, l.Source.Namespace, namespaceLabels, namespacesPreFiltered, l.FilterTCPRoutes(input.TCPRoutes), input.Services, input.ServiceImports, input.ReferenceGrants),
+				Routes:         toTCPRoutes(l.Listener, l.FilterTCPRoutes(input.TCPRoutes), input.Services, input.ServiceImports, input.ReferenceGrants),
 				Infrastructure: infra,
 				Service:        toServiceModel(input.GatewayClassConfig),
 			})
 
 		case gatewayv1.UDPProtocolType:
-			namespacesPreFiltered := l.AllowedNamespaces != nil
 			m.L4 = append(m.L4, model.L4Listener{
 				Name:           string(l.Name),
 				Sources:        []model.FullyQualifiedResource{l.Source},
 				Port:           uint32(l.Port),
 				Protocol:       model.L4ProtocolUDP,
-				Routes:         toUDPRoutes(l.Listener, l.Source.Namespace, namespaceLabels, namespacesPreFiltered, l.FilterUDPRoutes(input.UDPRoutes), input.Services, input.ServiceImports, input.ReferenceGrants),
+				Routes:         toUDPRoutes(l.Listener, l.FilterUDPRoutes(input.UDPRoutes), input.Services, input.ServiceImports, input.ReferenceGrants),
 				Infrastructure: infra,
 				Service:        toServiceModel(input.GatewayClassConfig),
 			})
@@ -331,9 +302,6 @@ func getBackendServiceName(namespace string, services []corev1.Service, serviceI
 
 func toHTTPRoutes(log *slog.Logger,
 	listener gatewayv1.Listener,
-	gatewayNamespace string,
-	namespaceLabels helpers.NamespaceLabelIndex,
-	namespacesPreFiltered bool,
 	listenerHostnamesByProtocol map[gatewayv1.ProtocolType][]string,
 	input []gatewayv1.HTTPRoute,
 	services []corev1.Service,
@@ -344,10 +312,6 @@ func toHTTPRoutes(log *slog.Logger,
 	var httpRoutes []model.HTTPRoute
 	for _, r := range input {
 		if !parentRefsMatchListener(r.Spec.ParentRefs, listener) {
-			continue
-		}
-
-		if !namespacesPreFiltered && !helpers.IsListenerNamespaceAllowed(listener, r.GetNamespace(), gatewayNamespace, namespaceLabels) {
 			continue
 		}
 
@@ -383,63 +347,37 @@ func extractRoutes(logger *slog.Logger,
 		var backendHTTPFilters []*model.BackendHTTPFilter
 		bes := make([]model.Backend, 0, len(rule.BackendRefs))
 		for _, be := range rule.BackendRefs {
-			if !helpers.IsBackendReferenceAllowed(hr.GetNamespace(), be.BackendRef, helpers.GatewayV1GVK("HTTPRoute"), grants) {
+			toAppend, svc, ok := resolveBackendRef(hr.GetNamespace(), be.BackendRef, gatewayv1.SchemeGroupVersion.WithKind("HTTPRoute"), services, serviceImports, grants)
+			if !ok {
 				continue
 			}
-			svcName, err := getBackendServiceName(helpers.NamespaceDerefOr(be.Namespace, hr.Namespace), services, serviceImports, be.BackendObjectReference)
-			if err != nil {
+			var include bool
+			toAppend, include = addBackendTLSDetails(logger, toAppend, svc, btlspMap)
+			if !include {
 				continue
 			}
-			if svcName != string(be.Name) {
-				be = *be.DeepCopy()
-				be.BackendRef.BackendObjectReference = gatewayv1beta1.BackendObjectReference{
-					Name:      gatewayv1beta1.ObjectName(svcName),
-					Port:      be.Port,
-					Namespace: be.Namespace,
+			bes = append(bes, toAppend)
+			for _, f := range be.Filters {
+				switch f.Type {
+				case gatewayv1.HTTPRouteFilterRequestHeaderModifier:
+					backendHTTPFilters = append(backendHTTPFilters, &model.BackendHTTPFilter{
+						Name: fmt.Sprintf("%s:%s:%d", toAppend.Namespace, toAppend.Name, toAppend.Port.Port),
+						RequestHeaderFilter: &model.HTTPHeaderFilter{
+							HeadersToAdd:    toHTTPHeaders(f.RequestHeaderModifier.Add),
+							HeadersToSet:    toHTTPHeaders(f.RequestHeaderModifier.Set),
+							HeadersToRemove: f.RequestHeaderModifier.Remove,
+						},
+					})
+				case gatewayv1.HTTPRouteFilterResponseHeaderModifier:
+					backendHTTPFilters = append(backendHTTPFilters, &model.BackendHTTPFilter{
+						Name: fmt.Sprintf("%s:%s:%d", toAppend.Namespace, toAppend.Name, toAppend.Port.Port),
+						ResponseHeaderModifier: &model.HTTPHeaderFilter{
+							HeadersToAdd:    toHTTPHeaders(f.ResponseHeaderModifier.Add),
+							HeadersToSet:    toHTTPHeaders(f.ResponseHeaderModifier.Set),
+							HeadersToRemove: f.ResponseHeaderModifier.Remove,
+						},
+					})
 				}
-			}
-			if be.BackendRef.Port == nil {
-				// must have port for Service reference
-				continue
-			}
-			svc := getServiceSpec(string(be.Name), helpers.NamespaceDerefOr(be.Namespace, hr.Namespace), services)
-			if svc != nil {
-				toAppend := backendToModelBackend(*svc, be.BackendRef, hr.Namespace)
-				var include bool
-				toAppend, include = addBackendTLSDetails(logger, toAppend, svc, btlspMap)
-				if !include {
-					continue
-				}
-				bes = append(bes, toAppend)
-				for _, f := range be.Filters {
-					switch f.Type {
-					case gatewayv1.HTTPRouteFilterRequestHeaderModifier:
-						backendHTTPFilters = append(backendHTTPFilters, &model.BackendHTTPFilter{
-							Name: fmt.Sprintf("%s:%s:%d", helpers.NamespaceDerefOr(be.Namespace, hr.Namespace), be.Name, uint32(*be.Port)),
-							RequestHeaderFilter: &model.HTTPHeaderFilter{
-								HeadersToAdd:    toHTTPHeaders(f.RequestHeaderModifier.Add),
-								HeadersToSet:    toHTTPHeaders(f.RequestHeaderModifier.Set),
-								HeadersToRemove: f.RequestHeaderModifier.Remove,
-							},
-						})
-					case gatewayv1.HTTPRouteFilterResponseHeaderModifier:
-						backendHTTPFilters = append(backendHTTPFilters, &model.BackendHTTPFilter{
-							Name: fmt.Sprintf("%s:%s:%d", helpers.NamespaceDerefOr(be.Namespace, hr.Namespace), be.Name, uint32(*be.Port)),
-							ResponseHeaderModifier: &model.HTTPHeaderFilter{
-								HeadersToAdd:    toHTTPHeaders(f.ResponseHeaderModifier.Add),
-								HeadersToSet:    toHTTPHeaders(f.ResponseHeaderModifier.Set),
-								HeadersToRemove: f.ResponseHeaderModifier.Remove,
-							},
-						})
-					}
-				}
-			}
-		}
-
-		var dr *model.DirectResponse
-		if len(bes) == 0 {
-			dr = &model.DirectResponse{
-				StatusCode: 500,
 			}
 		}
 
@@ -449,6 +387,7 @@ func extractRoutes(logger *slog.Logger,
 		var rewriteFilter *model.HTTPURLRewriteFilter
 		var requestMirrors []*model.HTTPRequestMirror
 		var externalAuth *model.HTTPExternalAuthFilter
+		var externalAuthInvalid bool
 		var requestCORS *model.HTTPCORSFilter
 
 		for _, f := range rule.Filters {
@@ -474,39 +413,25 @@ func extractRoutes(logger *slog.Logger,
 					continue
 				}
 
-				if !helpers.IsBackendReferenceAllowed(hr.GetNamespace(),
-					gatewayv1.BackendRef{BackendObjectReference: f.RequestMirror.BackendRef},
-					helpers.GatewayV1GVK("HTTPRoute"), grants) {
-					continue
-				}
-
-				namespace := helpers.NamespaceDerefOr(f.RequestMirror.BackendRef.Namespace, hr.Namespace)
-				svcName, err := getBackendServiceName(namespace, services, serviceImports, f.RequestMirror.BackendRef)
-				if err != nil {
-					continue
-				}
-
-				mirror := f.RequestMirror.DeepCopy()
-				if svcName != string(mirror.BackendRef.Name) {
-					mirror.BackendRef = gatewayv1.BackendObjectReference{
-						Name:      gatewayv1.ObjectName(svcName),
-						Namespace: mirror.BackendRef.Namespace,
-						Port:      mirror.BackendRef.Port,
-					}
-				}
-
-				svc := getServiceSpec(svcName, namespace, services)
-				if svc != nil {
-					requestMirrors = append(requestMirrors, toHTTPRequestMirror(*svc, mirror, hr.Namespace))
+				backend, _, ok := resolveBackendRef(hr.GetNamespace(), gatewayv1.BackendRef{BackendObjectReference: f.RequestMirror.BackendRef}, gatewayv1.SchemeGroupVersion.WithKind("HTTPRoute"), services, serviceImports, grants)
+				if ok {
+					requestMirrors = append(requestMirrors, toHTTPRequestMirror(backend, f.RequestMirror))
 				}
 			case gatewayv1.HTTPRouteFilterExternalAuth:
-				if f.ExternalAuth != nil {
-					beRef := gatewayv1.BackendRef{BackendObjectReference: f.ExternalAuth.BackendRef}
-					if !helpers.IsBackendReferenceAllowed(hr.GetNamespace(), beRef, helpers.GatewayV1GVK("HTTPRoute"), grants) {
-						break
-					}
+				if f.ExternalAuth == nil {
+					continue
 				}
+
+				beRef := gatewayv1.BackendRef{BackendObjectReference: f.ExternalAuth.BackendRef}
+				if !helpers.IsBackendReferenceAllowed(hr.GetNamespace(), beRef, helpers.GatewayV1GVK("HTTPRoute"), grants) {
+					externalAuthInvalid = true
+					continue
+				}
+
 				externalAuth = toHTTPExternalAuthFilter(logger, f.ExternalAuth, hr.Namespace, services, serviceImports, btlspMap)
+				if externalAuth == nil {
+					externalAuthInvalid = true
+				}
 			case gatewayv1.HTTPRouteFilterCORS:
 				ac := false
 				if f.CORS.AllowCredentials != nil {
@@ -522,6 +447,19 @@ func extractRoutes(logger *slog.Logger,
 					// Local tests can bypass this, ensuring we always get a default.
 					MaxAge: cmp.Or(f.CORS.MaxAge, int32(5)),
 				}
+			}
+		}
+		var dr *model.DirectResponse
+
+		if len(bes) == 0 && requestRedirectFilter == nil {
+			dr = &model.DirectResponse{
+				StatusCode: 500,
+			}
+		}
+
+		if externalAuthInvalid {
+			dr = &model.DirectResponse{
+				StatusCode: 500,
 			}
 		}
 
@@ -541,14 +479,16 @@ func extractRoutes(logger *slog.Logger,
 				Timeout:                toTimeout(rule.Timeouts),
 				Retry:                  toHTTPRetry(rule.Retry),
 				CORS:                   requestCORS,
+				SessionPersistence:     toHTTPSessionPersistence(rule.SessionPersistence, helpers.HTTPRouteKind, hr.Namespace, hr.Name, ruleIndex, model.StringMatch{}),
 			})
 		}
 
 		for matchIndex, match := range rule.Matches {
+			pathMatch := toPathMatch(match)
 			httpRoutes = append(httpRoutes, model.HTTPRoute{
 				SourceRule:             sourceHTTPRouteRule(hr, ruleIndex, matchIndex),
 				Hostnames:              hostnames,
-				PathMatch:              toPathMatch(match),
+				PathMatch:              pathMatch,
 				HeadersMatch:           toHeaderMatch(match),
 				QueryParamsMatch:       toQueryMatch(match),
 				Method:                 (*string)(match.Method),
@@ -564,6 +504,7 @@ func extractRoutes(logger *slog.Logger,
 				Timeout:                toTimeout(rule.Timeouts),
 				Retry:                  toHTTPRetry(rule.Retry),
 				CORS:                   requestCORS,
+				SessionPersistence:     toHTTPSessionPersistence(rule.SessionPersistence, helpers.HTTPRouteKind, hr.Namespace, hr.Name, ruleIndex, pathMatch),
 			})
 		}
 	}
@@ -757,9 +698,6 @@ func toHTTPRetry(retry *gatewayv1.HTTPRouteRetry) *model.HTTPRetry {
 }
 
 func toGRPCRoutes(listener gatewayv1beta1.Listener,
-	gatewayNamespace string,
-	namespaceLabels helpers.NamespaceLabelIndex,
-	namespacesPreFiltered bool,
 	listenerHostnamesByProtocol map[gatewayv1.ProtocolType][]string,
 	input []gatewayv1.GRPCRoute,
 	services []corev1.Service,
@@ -769,10 +707,6 @@ func toGRPCRoutes(listener gatewayv1beta1.Listener,
 	var grpcRoutes []model.HTTPRoute
 	for _, r := range input {
 		if !parentRefsMatchListener(r.Spec.ParentRefs, listener) {
-			continue
-		}
-
-		if !namespacesPreFiltered && !helpers.IsListenerNamespaceAllowed(listener, r.GetNamespace(), gatewayNamespace, namespaceLabels) {
 			continue
 		}
 
@@ -794,31 +728,11 @@ func toGRPCRoutes(listener gatewayv1beta1.Listener,
 
 func extractGRPCRoutes(hostnames []string, grpcr gatewayv1.GRPCRoute, services []corev1.Service, serviceImports []mcsapiv1beta1.ServiceImport, grants []gatewayv1.ReferenceGrant) []model.HTTPRoute {
 	var grpcRoutes []model.HTTPRoute
-	for _, rule := range grpcr.Spec.Rules {
+	for ruleIndex, rule := range grpcr.Spec.Rules {
 		bes := make([]model.Backend, 0, len(rule.BackendRefs))
 		for _, be := range rule.BackendRefs {
-			if !helpers.IsBackendReferenceAllowed(grpcr.GetNamespace(), be.BackendRef, helpers.GatewayV1GVK("GRPCRoute"), grants) {
-				continue
-			}
-			svcName, err := getBackendServiceName(helpers.NamespaceDerefOr(be.Namespace, grpcr.Namespace), services, serviceImports, be.BackendObjectReference)
-			if err != nil {
-				continue
-			}
-			if svcName != string(be.Name) {
-				be = *be.DeepCopy()
-				be.BackendObjectReference = gatewayv1beta1.BackendObjectReference{
-					Name:      gatewayv1beta1.ObjectName(svcName),
-					Port:      be.Port,
-					Namespace: be.Namespace,
-				}
-			}
-			if be.BackendRef.Port == nil {
-				// must have port for Service reference
-				continue
-			}
-			svc := getServiceSpec(string(be.Name), helpers.NamespaceDerefOr(be.Namespace, grpcr.Namespace), services)
-			if svc != nil {
-				bes = append(bes, backendToModelBackend(*svc, be.BackendRef, grpcr.Namespace))
+			if backend, _, ok := resolveBackendRef(grpcr.GetNamespace(), be.BackendRef, gatewayv1.SchemeGroupVersion.WithKind("GRPCRoute"), services, serviceImports, grants); ok {
+				bes = append(bes, backend)
 			}
 		}
 
@@ -852,30 +766,9 @@ func extractGRPCRoutes(hostnames []string, grpcr gatewayv1.GRPCRoute, services [
 					continue
 				}
 
-				if !helpers.IsBackendReferenceAllowed(grpcr.GetNamespace(),
-					gatewayv1.BackendRef{BackendObjectReference: f.RequestMirror.BackendRef},
-					helpers.GatewayV1GVK("GRPCRoute"), grants) {
-					continue
-				}
-
-				namespace := helpers.NamespaceDerefOr(f.RequestMirror.BackendRef.Namespace, grpcr.Namespace)
-				svcName, err := getBackendServiceName(namespace, services, serviceImports, f.RequestMirror.BackendRef)
-				if err != nil {
-					continue
-				}
-
-				mirror := f.RequestMirror.DeepCopy()
-				if svcName != string(mirror.BackendRef.Name) {
-					mirror.BackendRef = gatewayv1.BackendObjectReference{
-						Name:      gatewayv1.ObjectName(svcName),
-						Namespace: mirror.BackendRef.Namespace,
-						Port:      mirror.BackendRef.Port,
-					}
-				}
-
-				svc := getServiceSpec(svcName, namespace, services)
-				if svc != nil {
-					requestMirrors = append(requestMirrors, toHTTPRequestMirror(*svc, mirror, grpcr.Namespace))
+				backend, _, ok := resolveBackendRef(grpcr.GetNamespace(), gatewayv1.BackendRef{BackendObjectReference: f.RequestMirror.BackendRef}, gatewayv1.SchemeGroupVersion.WithKind("GRPCRoute"), services, serviceImports, grants)
+				if ok {
+					requestMirrors = append(requestMirrors, toHTTPRequestMirror(backend, f.RequestMirror))
 				}
 			}
 		}
@@ -888,13 +781,15 @@ func extractGRPCRoutes(hostnames []string, grpcr gatewayv1.GRPCRoute, services [
 				RequestHeaderFilter:    requestHeaderFilter,
 				ResponseHeaderModifier: responseHeaderFilter,
 				RequestMirrors:         requestMirrors,
+				SessionPersistence:     toHTTPSessionPersistence(rule.SessionPersistence, helpers.GRPCRouteKind, grpcr.Namespace, grpcr.Name, ruleIndex, model.StringMatch{}),
 			})
 		}
 
 		for _, match := range rule.Matches {
+			pathMatch := toGRPCPathMatch(match)
 			grpcRoutes = append(grpcRoutes, model.HTTPRoute{
 				Hostnames:              hostnames,
-				PathMatch:              toGRPCPathMatch(match),
+				PathMatch:              pathMatch,
 				HeadersMatch:           toGRPCHeaderMatch(match),
 				Backends:               bes,
 				DirectResponse:         dr,
@@ -902,6 +797,7 @@ func extractGRPCRoutes(hostnames []string, grpcr gatewayv1.GRPCRoute, services [
 				ResponseHeaderModifier: responseHeaderFilter,
 				RequestMirrors:         requestMirrors,
 				IsGRPC:                 true,
+				SessionPersistence:     toHTTPSessionPersistence(rule.SessionPersistence, helpers.GRPCRouteKind, grpcr.Namespace, grpcr.Name, ruleIndex, pathMatch),
 			})
 		}
 	}
@@ -909,14 +805,10 @@ func extractGRPCRoutes(hostnames []string, grpcr gatewayv1.GRPCRoute, services [
 	return grpcRoutes
 }
 
-func toTLSRoutes(listener gatewayv1beta1.Listener, gatewayNamespace string, namespaceLabels helpers.NamespaceLabelIndex, namespacesPreFiltered bool, listenerHostnamesByProtocol map[gatewayv1.ProtocolType][]string, input []gatewayv1.TLSRoute, services []corev1.Service, serviceImports []mcsapiv1beta1.ServiceImport, grants []gatewayv1.ReferenceGrant) []model.TLSPassthroughRoute {
+func toTLSRoutes(listener gatewayv1beta1.Listener, listenerHostnamesByProtocol map[gatewayv1.ProtocolType][]string, input []gatewayv1.TLSRoute, services []corev1.Service, serviceImports []mcsapiv1beta1.ServiceImport, grants []gatewayv1.ReferenceGrant) []model.TLSPassthroughRoute {
 	var tlsRoutes []model.TLSPassthroughRoute
 	for _, r := range input {
 		if !parentRefsMatchListener(r.Spec.ParentRefs, listener) {
-			continue
-		}
-
-		if !namespacesPreFiltered && !helpers.IsListenerNamespaceAllowed(listener, r.GetNamespace(), gatewayNamespace, namespaceLabels) {
 			continue
 		}
 
@@ -934,24 +826,8 @@ func toTLSRoutes(listener gatewayv1beta1.Listener, gatewayNamespace string, name
 		for _, rule := range r.Spec.Rules {
 			bes := make([]model.Backend, 0, len(rule.BackendRefs))
 			for _, be := range rule.BackendRefs {
-				if !helpers.IsBackendReferenceAllowed(r.GetNamespace(), be, helpers.GatewayV1GVK("TLSRoute"), grants) {
-					continue
-				}
-				svcName, err := getBackendServiceName(helpers.NamespaceDerefOr(be.Namespace, r.Namespace), services, serviceImports, be.BackendObjectReference)
-				if err != nil {
-					continue
-				}
-				if svcName != string(be.Name) {
-					be = *be.DeepCopy()
-					be.BackendObjectReference = gatewayv1beta1.BackendObjectReference{
-						Name:      gatewayv1beta1.ObjectName(svcName),
-						Port:      be.Port,
-						Namespace: be.Namespace,
-					}
-				}
-				svc := getServiceSpec(string(be.Name), helpers.NamespaceDerefOr(be.Namespace, r.Namespace), services)
-				if svc != nil {
-					bes = append(bes, backendToModelBackend(*svc, be, r.Namespace))
+				if backend, _, ok := resolveBackendRef(r.GetNamespace(), be, gatewayv1.SchemeGroupVersion.WithKind("TLSRoute"), services, serviceImports, grants); ok {
+					bes = append(bes, backend)
 				}
 			}
 
@@ -997,9 +873,6 @@ func sortL4RoutesByAge[T any](routes []T, meta func(T) metav1.ObjectMeta) {
 }
 
 func toTCPRoutes(listener gatewayv1beta1.Listener,
-	gatewayNamespace string,
-	namespaceLabels helpers.NamespaceLabelIndex,
-	namespacesPreFiltered bool,
 	input []gatewayv1.TCPRoute,
 	services []corev1.Service,
 	serviceImports []mcsapiv1beta1.ServiceImport,
@@ -1013,9 +886,6 @@ func toTCPRoutes(listener gatewayv1beta1.Listener,
 	// Accepted=True (handled by the status reconciler) but route no traffic.
 	attached := make([]gatewayv1.TCPRoute, 0, len(input))
 	for _, r := range input {
-		if !namespacesPreFiltered && !helpers.IsListenerNamespaceAllowed(listener, r.GetNamespace(), gatewayNamespace, namespaceLabels) {
-			continue
-		}
 		if parentRefsMatchListener(r.Spec.ParentRefs, listener) {
 			attached = append(attached, r)
 		}
@@ -1031,24 +901,8 @@ func toTCPRoutes(listener gatewayv1beta1.Listener,
 		for _, rule := range r.Spec.Rules {
 			bes := make([]model.Backend, 0, len(rule.BackendRefs))
 			for _, be := range rule.BackendRefs {
-				if !helpers.IsBackendReferenceAllowed(r.GetNamespace(), be, helpers.GatewayV1GVK("TCPRoute"), grants) {
-					continue
-				}
-				svcName, err := getBackendServiceName(helpers.NamespaceDerefOr(be.Namespace, r.Namespace), services, serviceImports, be.BackendObjectReference)
-				if err != nil {
-					continue
-				}
-				if svcName != string(be.Name) {
-					be = *be.DeepCopy()
-					be.BackendObjectReference = gatewayv1beta1.BackendObjectReference{
-						Name:      gatewayv1beta1.ObjectName(svcName),
-						Port:      be.Port,
-						Namespace: be.Namespace,
-					}
-				}
-				svc := getServiceSpec(string(be.Name), helpers.NamespaceDerefOr(be.Namespace, r.Namespace), services)
-				if svc != nil {
-					bes = append(bes, backendToModelBackend(*svc, be, r.Namespace))
+				if backend, _, ok := resolveBackendRef(r.GetNamespace(), be, gatewayv1.SchemeGroupVersion.WithKind("TCPRoute"), services, serviceImports, grants); ok {
+					bes = append(bes, backend)
 				}
 			}
 
@@ -1061,9 +915,6 @@ func toTCPRoutes(listener gatewayv1beta1.Listener,
 }
 
 func toUDPRoutes(listener gatewayv1beta1.Listener,
-	gatewayNamespace string,
-	namespaceLabels helpers.NamespaceLabelIndex,
-	namespacesPreFiltered bool,
 	input []gatewayv1.UDPRoute,
 	services []corev1.Service,
 	serviceImports []mcsapiv1beta1.ServiceImport,
@@ -1072,9 +923,6 @@ func toUDPRoutes(listener gatewayv1beta1.Listener,
 	// Keep only the oldest attaching UDPRoute. See toTCPRoutes for the rationale.
 	attached := make([]gatewayv1.UDPRoute, 0, len(input))
 	for _, r := range input {
-		if !namespacesPreFiltered && !helpers.IsListenerNamespaceAllowed(listener, r.GetNamespace(), gatewayNamespace, namespaceLabels) {
-			continue
-		}
 		if parentRefsMatchListener(r.Spec.ParentRefs, listener) {
 			attached = append(attached, r)
 		}
@@ -1090,24 +938,8 @@ func toUDPRoutes(listener gatewayv1beta1.Listener,
 		for _, rule := range r.Spec.Rules {
 			bes := make([]model.Backend, 0, len(rule.BackendRefs))
 			for _, be := range rule.BackendRefs {
-				if !helpers.IsBackendReferenceAllowed(r.GetNamespace(), be, helpers.GatewayV1GVK("UDPRoute"), grants) {
-					continue
-				}
-				svcName, err := getBackendServiceName(helpers.NamespaceDerefOr(be.Namespace, r.Namespace), services, serviceImports, be.BackendObjectReference)
-				if err != nil {
-					continue
-				}
-				if svcName != string(be.Name) {
-					be = *be.DeepCopy()
-					be.BackendObjectReference = gatewayv1beta1.BackendObjectReference{
-						Name:      gatewayv1beta1.ObjectName(svcName),
-						Port:      be.Port,
-						Namespace: be.Namespace,
-					}
-				}
-				svc := getServiceSpec(string(be.Name), helpers.NamespaceDerefOr(be.Namespace, r.Namespace), services)
-				if svc != nil {
-					bes = append(bes, backendToModelBackend(*svc, be, r.Namespace))
+				if backend, _, ok := resolveBackendRef(r.GetNamespace(), be, gatewayv1.SchemeGroupVersion.WithKind("UDPRoute"), services, serviceImports, grants); ok {
+					bes = append(bes, backend)
 				}
 			}
 
@@ -1232,7 +1064,7 @@ func toHTTPExternalAuthFilter(log *slog.Logger, ea *gatewayv1.HTTPExternalAuthFi
 	return filter
 }
 
-func toHTTPRequestMirror(svc corev1.Service, mirror *gatewayv1.HTTPRequestMirrorFilter, ns string) *model.HTTPRequestMirror {
+func toHTTPRequestMirror(backend model.Backend, mirror *gatewayv1.HTTPRequestMirrorFilter) *model.HTTPRequestMirror {
 	var n, d int32 = 100, 100
 
 	switch {
@@ -1246,7 +1078,7 @@ func toHTTPRequestMirror(svc corev1.Service, mirror *gatewayv1.HTTPRequestMirror
 	}
 
 	return &model.HTTPRequestMirror{
-		Backend:     ptr.To(backendRefToModelBackend(svc, mirror.BackendRef, ns)),
+		Backend:     ptr.To(backend),
 		Numerator:   n,
 		Denominator: d,
 	}
@@ -1275,6 +1107,38 @@ func getServiceImport(svcName, svcNamespace string, serviceImports []mcsapiv1bet
 		}
 	}
 	return nil
+}
+
+func resolveBackendRef(routeNamespace string, be gatewayv1.BackendRef, routeGVK schema.GroupVersionKind, services []corev1.Service, serviceImports []mcsapiv1beta1.ServiceImport, grants []gatewayv1.ReferenceGrant) (model.Backend, *corev1.Service, bool) {
+	if !helpers.IsBackendReferenceAllowed(routeNamespace, be, routeGVK, grants) {
+		return model.Backend{}, nil, false
+	}
+
+	backendNamespace := helpers.NamespaceDerefOr(be.Namespace, routeNamespace)
+	svcName, err := getBackendServiceName(backendNamespace, services, serviceImports, be.BackendObjectReference)
+	if err != nil {
+		return model.Backend{}, nil, false
+	}
+
+	if svcName != string(be.Name) {
+		be = *be.DeepCopy()
+		be.BackendObjectReference = gatewayv1beta1.BackendObjectReference{
+			Name:      gatewayv1beta1.ObjectName(svcName),
+			Port:      be.Port,
+			Namespace: be.Namespace,
+		}
+	}
+
+	if be.Port == nil {
+		return model.Backend{}, nil, false
+	}
+
+	svc := getServiceSpec(string(be.Name), helpers.NamespaceDerefOr(be.Namespace, routeNamespace), services)
+	if svc == nil {
+		return model.Backend{}, nil, false
+	}
+
+	return backendToModelBackend(*svc, be, routeNamespace), svc, true
 }
 
 func backendToModelBackend(svc corev1.Service, be gatewayv1.BackendRef, defaultNamespace string) model.Backend {
@@ -1522,4 +1386,40 @@ func toStringSlice[S ~string](s []S) []string {
 		res = append(res, string(h))
 	}
 	return res
+}
+
+func toHTTPSessionPersistence(sp *gatewayv1.SessionPersistence, kind, namespace, routeName string, ruleIndex int, pathMatch model.StringMatch) *model.HTTPSessionPersistence {
+	if sp == nil {
+		return nil
+	}
+
+	sessionName := defaultSessionName(kind, namespace, routeName, ruleIndex)
+	if sp.SessionName != nil {
+		sessionName = *sp.SessionName
+	}
+
+	cookiePath := ""
+	switch {
+	case pathMatch.Exact != "":
+		cookiePath = pathMatch.Exact
+	case pathMatch.Prefix != "":
+		cookiePath = pathMatch.Prefix
+	default:
+		cookiePath = "/"
+	}
+
+	return &model.HTTPSessionPersistence{
+		Cookie: &model.HTTPCookieSessionPersistence{
+			Name:     sessionName,
+			Path:     cookiePath,
+			Secure:   true,
+			HTTPOnly: true,
+			SameSite: "Strict",
+		},
+	}
+}
+
+func defaultSessionName(kind, namespace, routeName string, ruleIndex int) string {
+	sum := sha256.Sum256(fmt.Appendf(nil, "%s/%s/%s/%d", kind, namespace, routeName, ruleIndex))
+	return fmt.Sprintf("cilium-gw-session-%s", hex.EncodeToString(sum[:8]))
 }

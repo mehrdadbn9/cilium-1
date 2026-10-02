@@ -10,6 +10,9 @@ import (
 	"sort"
 	"strings"
 
+	"golang.org/x/text/cases"
+	"golang.org/x/text/language"
+
 	"github.com/go-openapi/strfmt"
 	versionapi "k8s.io/apimachinery/pkg/version"
 
@@ -20,7 +23,6 @@ import (
 	"github.com/cilium/cilium/pkg/datapath/linux/probes"
 	datapathOption "github.com/cilium/cilium/pkg/datapath/option"
 	datapathTables "github.com/cilium/cilium/pkg/datapath/tables"
-	"github.com/cilium/cilium/pkg/identity"
 	iputil "github.com/cilium/cilium/pkg/ip"
 	k8smetrics "github.com/cilium/cilium/pkg/k8s/metrics"
 	"github.com/cilium/cilium/pkg/loadbalancer"
@@ -40,6 +42,8 @@ import (
 type StatusCollector interface {
 	GetStatus(brief bool, requireK8sConnectivity bool) models.StatusResponse
 }
+
+var titleCaser = cases.Title(language.English, cases.NoLower)
 
 type statusCollector struct {
 	statusCollectMutex lock.RWMutex
@@ -329,7 +333,7 @@ func (d *statusCollector) getKubeProxyReplacementStatus(ctx context.Context) *mo
 		}
 		if d.statusParams.LBConfig.LBMode == loadbalancer.LBModeHybrid {
 			//nolint:staticcheck
-			features.NodePort.Mode = strings.Title(d.statusParams.LBConfig.LBMode)
+			features.NodePort.Mode = titleCaser.String(d.statusParams.LBConfig.LBMode)
 		}
 		features.NodePort.Algorithm = models.KubeProxyReplacementFeaturesNodePortAlgorithmRandom
 		if d.statusParams.LBConfig.LBAlgorithm == loadbalancer.LBAlgorithmMaglev {
@@ -342,7 +346,7 @@ func (d *statusCollector) getKubeProxyReplacementStatus(ctx context.Context) *mo
 		if d.statusParams.DaemonConfig.NodePortAcceleration == option.NodePortAccelerationGeneric {
 			features.NodePort.Acceleration = models.KubeProxyReplacementFeaturesNodePortAccelerationGeneric
 		} else {
-			features.NodePort.Acceleration = strings.Title(d.statusParams.DaemonConfig.NodePortAcceleration)
+			features.NodePort.Acceleration = titleCaser.String(d.statusParams.DaemonConfig.NodePortAcceleration)
 		}
 		features.NodePort.PortMin = int64(d.statusParams.LBConfig.NodePortMin)
 		features.NodePort.PortMax = int64(d.statusParams.LBConfig.NodePortMax)
@@ -413,10 +417,6 @@ func (d *statusCollector) getBPFMapStatus() *models.BPFMapStatus {
 	return &models.BPFMapStatus{
 		DynamicSizeRatio: d.statusParams.DaemonConfig.BPFMapsDynamicSizeRatio,
 		Maps: []*models.BPFMapProperties{
-			{
-				Name: "Auth",
-				Size: int64(d.statusParams.DaemonConfig.AuthMapEntries),
-			},
 			{
 				Name: "Non-TCP connection tracking",
 				Size: int64(d.statusParams.DaemonConfig.CTMapEntriesGlobalAny),
@@ -507,8 +507,8 @@ func (d *statusCollector) getBPFMapStatus() *models.BPFMapStatus {
 
 func (d *statusCollector) getIdentityRange() *models.IdentityRange {
 	s := &models.IdentityRange{
-		MinIdentity: int64(identity.GetMinimalAllocationIdentity(d.statusParams.ClusterInfo.ID)),
-		MaxIdentity: int64(identity.GetMaximumAllocationIdentity(d.statusParams.ClusterInfo.ID)),
+		MinIdentity: int64(d.statusParams.ClusterInfo.MinimalAllocationIdentity()),
+		MaxIdentity: int64(d.statusParams.ClusterInfo.MaximumAllocationIdentity()),
 	}
 
 	return s
@@ -704,7 +704,7 @@ func (d *statusCollector) getProbes() []Probe {
 				// 2048  | 1m15s
 				// 8192  | 1m30s
 				// 16384 | 1m32s
-				return d.statusParams.NodeManager.ClusterSizeDependantInterval(10 * time.Second)
+				return d.statusParams.ClusterSizeDependantInterval(10 * time.Second)
 			},
 			Probe: func(ctx context.Context) (any, error) {
 				return d.getK8sStatus(), nil
@@ -951,26 +951,6 @@ func (d *statusCollector) getProbes() []Probe {
 				if status.Err == nil {
 					if s, ok := status.Data.(*models.KubeProxyReplacement); ok {
 						d.statusResponse.KubeProxyReplacement = s
-					}
-				}
-			},
-		},
-		{
-			Name: "auth-cert-provider",
-			Probe: func(ctx context.Context) (any, error) {
-				if d.statusParams.AuthManager == nil {
-					return &models.Status{State: models.StatusStateDisabled}, nil
-				}
-
-				return d.statusParams.AuthManager.CertProviderStatus(), nil
-			},
-			OnStatusUpdate: func(status Status) {
-				d.statusCollectMutex.Lock()
-				defer d.statusCollectMutex.Unlock()
-
-				if status.Err == nil {
-					if s, ok := status.Data.(*models.Status); ok {
-						d.statusResponse.AuthCertificateProvider = s
 					}
 				}
 			},

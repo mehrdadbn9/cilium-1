@@ -37,6 +37,14 @@ type BPFLXC struct {
 	EnablePolicyAccounting bool `config:"enable_policy_accounting"`
 	// Masquerade traffic to remote nodes.
 	EnableRemoteNodeMasquerade bool `config:"enable_remote_node_masquerade"`
+	// Enable source IP verification for endpoint egress.
+	EnableSIPVerification bool `config:"enable_sip_verification"`
+	// Reply with ICMP to traffic to a service with no backends.
+	EnableServiceNoBackendResponse bool `config:"enable_service_no_backend_response"`
+	// Enable socket-based LB for E/W traffic.
+	EnableSocketLBFull bool `config:"enable_socket_lb_full"`
+	// Enable VTEP integration.
+	EnableVTEP bool `config:"enable_vtep"`
 	// The endpoint's security ID.
 	EndpointID uint16 `config:"endpoint_id"`
 	// The endpoint's IPv4 address.
@@ -45,7 +53,7 @@ type BPFLXC struct {
 	EndpointIPv6 types.V6Addr `config:"endpoint_ipv6"`
 	// The endpoint's network namespace cookie.
 	EndpointNetNSCookie uint64 `config:"endpoint_netns_cookie"`
-	// Ephemeral port range minimun.
+	// Ephemeral port range minimum.
 	EphemeralMin uint16 `config:"ephemeral_min"`
 	// The host endpoint ID.
 	HostEPID uint16 `config:"host_ep_id"`
@@ -79,7 +87,7 @@ type BPFLXC struct {
 
 func NewBPFLXC(node Node) *BPFLXC {
 	return &BPFLXC{false, 0x0, false, false, false, false, false, false, false, false,
-		false, false, 0x0, cast[types.V4Addr]([]byte{0x0, 0x0, 0x0, 0x0}),
+		false, false, false, false, false, false, 0x0, cast[types.V4Addr]([]byte{0x0, 0x0, 0x0, 0x0}),
 		cast[types.V6Addr]([]byte{0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0}),
 		0x0, 0x0, 0x0, false, 0x0,
 		cast[types.MACAddr]([]byte{0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0}),

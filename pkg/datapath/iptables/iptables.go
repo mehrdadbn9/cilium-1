@@ -6,9 +6,9 @@ package iptables
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
-	"net"
 	"net/netip"
 	"os"
 	"regexp"
@@ -22,11 +22,11 @@ import (
 	"github.com/cilium/statedb"
 	"github.com/mattn/go-shellwords"
 	"github.com/vishvananda/netlink"
+	"go4.org/netipx"
 	"k8s.io/utils/clock"
 
 	"github.com/cilium/cilium/daemon/cmd/cni"
 	"github.com/cilium/cilium/pkg/byteorder"
-	"github.com/cilium/cilium/pkg/cidr"
 	"github.com/cilium/cilium/pkg/command/exec"
 	"github.com/cilium/cilium/pkg/container/set"
 	"github.com/cilium/cilium/pkg/datapath/iptables/ipset"
@@ -64,6 +64,14 @@ const (
 	feederDescription     = "cilium-feeder:"
 	encryptionDescription = "cilium-encryption-notrack:"
 )
+
+// formatComment returns the iptables match labelling a rule as cilium's, taking
+// action ("NOTRACK", "ACCEPT") on the traffic described by descr. The comment is
+// part of the rule spec, so a rule can only be deleted with the same comment it
+// was inserted with.
+func formatComment(action, descr string) []string {
+	return []string{"-m", "comment", "--comment", fmt.Sprintf("cilium: %s for %s", action, descr)}
+}
 
 // Minimum iptables versions supporting the -w and -w<seconds> flags
 var (
@@ -1129,7 +1137,9 @@ func (m *manager) addProxyRules(prog runnable, ip string, proxyPort uint16, name
 }
 
 func (m *manager) endpointNoTrackRules(prog runnable, cmd string, IP string, port *lb.L4Addr) error {
-	var err error
+	const noTrackNodeLocalDNS = "node-local-dns"
+
+	var errs []error
 
 	protocol := strings.ToLower(port.Protocol)
 	p := strconv.FormatUint(uint64(port.Port), 10)
@@ -1144,119 +1154,54 @@ func (m *manager) endpointNoTrackRules(prog runnable, cmd string, IP string, por
 	// 3. From a hostNetwork pod to the node-local-dns pod
 	// 4. From the node-local-dns pod to a hostNetwork pod
 
-	// 1. The following 2 rules cover packets from non-host pod to node-local-dns
-	if err = prog.runProg([]string{
-		"-t", "raw",
-		cmd, ciliumPreRawChain,
-		"-p", protocol,
-		"-d", IP,
-		"--dport", p,
-		"-j", "CT",
-		"--notrack"}); err != nil {
-		m.logger.Warn("Failed to enforce endpoint notrack", logfields.Error, err)
-	}
-	if err = prog.runProg([]string{
-		"-t", "filter",
-		cmd, ciliumForwardChain,
-		"-p", protocol,
-		"-d", IP,
-		"--dport",
-		p, "-j",
-		"ACCEPT"}); err != nil {
-		m.logger.Warn("Failed to enforce endpoint notrack", logfields.Error, err)
-	}
+	toEndpoint := []string{"-d", IP, "--dport", p}
+	fromEndpoint := []string{"-s", IP, "--sport", p}
 
-	// 2. The following 2 rules cover packets from node-local-dns to
-	// non-host pod
-	if err = prog.runProg([]string{
-		"-t", "raw",
-		cmd, ciliumPreRawChain,
-		"-p", protocol,
-		"-s", IP,
-		"--sport", p,
-		"-j", "CT",
-		"--notrack"}); err != nil {
-		m.logger.Warn("Failed to enforce endpoint notrack", logfields.Error, err)
-	}
-	if err = prog.runProg([]string{
-		"-t", "filter",
-		cmd, ciliumForwardChain,
-		"-p", protocol,
-		"-s", IP,
-		"--sport",
-		p, "-j",
-		"ACCEPT"}); err != nil {
-		m.logger.Warn("Failed to enforce endpoint notrack", logfields.Error, err)
-	}
+	notrack := slices.Concat(
+		formatComment("NOTRACK", noTrackNodeLocalDNS),
+		[]string{"-j", "CT", "--notrack"})
+	accept := slices.Concat(
+		formatComment("ACCEPT", noTrackNodeLocalDNS),
+		[]string{"-j", "ACCEPT"})
 
-	// 3. The following 2 rules cover packets from host namespaced pod to
-	// node-local-dns
-	if err = prog.runProg([]string{
-		"-t", "raw",
-		cmd, ciliumOutputRawChain,
-		"-p", protocol,
-		"-d", IP,
-		"--dport", p,
-		"-j", "CT",
-		"--notrack"}); err != nil {
-		m.logger.Warn("Failed to enforce endpoint notrack", logfields.Error, err)
-	}
-	if err = prog.runProg([]string{
-		"-t", "filter",
-		cmd, ciliumOutputChain,
-		"-p", protocol,
-		"-d", IP,
-		"--dport", p,
-		"-j", "ACCEPT"}); err != nil {
-		m.logger.Warn("Failed to enforce endpoint notrack", logfields.Error, err)
-	}
+	for _, rule := range []struct {
+		table  string
+		chain  string
+		match  []string
+		action []string
+	}{
+		// 1. From a non-host pod to node-local-dns.
+		{"raw", ciliumPreRawChain, toEndpoint, notrack},
+		{"filter", ciliumForwardChain, toEndpoint, accept},
 
-	// 4. The following rule (and the prerouting rule in case 2)
-	// covers packets from node-local-dns to host namespaced pod
-	if err = prog.runProg([]string{
-		"-t", "filter",
-		cmd, ciliumInputChain,
-		"-p", protocol,
-		"-s", IP,
-		"--sport",
-		p, "-j",
-		"ACCEPT"}); err != nil {
-		m.logger.Warn("Failed to enforce endpoint notrack", logfields.Error, err)
-	}
+		// 2. From node-local-dns to a non-host pod.
+		{"raw", ciliumPreRawChain, fromEndpoint, notrack},
+		{"filter", ciliumForwardChain, fromEndpoint, accept},
 
-	// The following rules are kept for compatibility with host-namespaced
-	// node-local-dns if user already deploys in the legacy mode without
-	// LRP.
-	if err = prog.runProg([]string{
-		"-t", "raw",
-		cmd, ciliumOutputRawChain,
-		"-p", protocol,
-		"-s", IP,
-		"--sport", p,
-		"-j", "CT",
-		"--notrack"}); err != nil {
-		m.logger.Warn("Failed to enforce endpoint notrack", logfields.Error, err)
+		// 3. From a host namespaced pod to node-local-dns.
+		{"raw", ciliumOutputRawChain, toEndpoint, notrack},
+		{"filter", ciliumOutputChain, toEndpoint, accept},
+
+		// 4. From node-local-dns to a host namespaced pod, together with the
+		// prerouting rule of case 2.
+		{"filter", ciliumInputChain, fromEndpoint, accept},
+
+		// The following rules are kept for compatibility with host-namespaced
+		// node-local-dns if user already deploys in the legacy mode without
+		// LRP.
+		{"raw", ciliumOutputRawChain, fromEndpoint, notrack},
+		{"filter", ciliumOutputChain, fromEndpoint, accept},
+		{"filter", ciliumInputChain, toEndpoint, accept},
+	} {
+		if err := prog.runProg(slices.Concat(
+			[]string{"-t", rule.table, cmd, rule.chain, "-p", protocol},
+			rule.match,
+			rule.action)); err != nil {
+			m.logger.Warn("Failed to enforce endpoint notrack", logfields.Error, err)
+			errs = append(errs, err)
+		}
 	}
-	if err = prog.runProg([]string{
-		"-t", "filter",
-		cmd, ciliumOutputChain,
-		"-p", protocol,
-		"-s", IP,
-		"--sport", p,
-		"-j", "ACCEPT"}); err != nil {
-		m.logger.Warn("Failed to enforce endpoint notrack", logfields.Error, err)
-	}
-	if err = prog.runProg([]string{
-		"-t", "filter",
-		cmd, ciliumInputChain,
-		"-p", protocol,
-		"-d", IP,
-		"--dport",
-		p, "-j",
-		"ACCEPT"}); err != nil {
-		m.logger.Warn("Failed to enforce endpoint notrack", logfields.Error, err)
-	}
-	return err
+	return errors.Join(errs...)
 }
 
 // InstallNoTrackRules is explicitly called when a pod has valid "policy.cilium.io/no-track-port" annotation.
@@ -1484,22 +1429,24 @@ func (m *manager) installForwardChainRulesIpX(prog runnable, ifName, localDelive
 	return nil
 }
 
+// isDefaultRoutePrefix reports whether p is the default route of its family,
+// i.e. 0.0.0.0/0 or ::/0. The zero Prefix is not a default route.
+func isDefaultRoutePrefix(p netip.Prefix) bool {
+	return p.Addr().IsUnspecified() && p.Bits() == 0
+}
+
 func (m *manager) installMasqueradeRules(
 	prog iptablesInterface, nativeDevices []string,
-	localDeliveryInterface, snatDstExclusionCIDR, allocRange, hostMasqueradeIP string,
+	localDeliveryInterface string, snatDstExclusionCIDR netip.Prefix,
+	allocRange, hostMasqueradeIP string,
 ) error {
 	devices := nativeDevices
 
-	if prog.getMode() == "nft" {
-		if _, exclusionCIDR, err := net.ParseCIDR(snatDstExclusionCIDR); err == nil {
-			maskSize, _ := exclusionCIDR.Mask.Size()
-			if exclusionCIDR.IP.IsUnspecified() && maskSize == 0 {
-				if prog == m.ip6tables {
-					return fmt.Errorf("nf_tables does not support ::/0 exclusion, set --%s=false", option.EnableIPv6Masquerade)
-				}
-				return fmt.Errorf("nf_tables does not support 0.0.0.0/0 exclusion, set --%s=false", option.EnableIPv4Masquerade)
-			}
+	if prog.getMode() == "nft" && isDefaultRoutePrefix(snatDstExclusionCIDR) {
+		if prog == m.ip6tables {
+			return fmt.Errorf("nf_tables does not support ::/0 exclusion, set --%s=false", option.EnableIPv6Masquerade)
 		}
+		return fmt.Errorf("nf_tables does not support 0.0.0.0/0 exclusion, set --%s=false", option.EnableIPv4Masquerade)
 	}
 
 	if m.sharedCfg.NodeIpsetNeeded {
@@ -1544,7 +1491,7 @@ func (m *manager) installMasqueradeRules(
 		//     range
 		// * Non-tunnel mode:
 		//   * May not be targeted to an IP in the cluster range
-		cmds := allEgressMasqueradeCmds(allocRange, snatDstExclusionCIDR, m.sharedCfg.MasqueradeInterfaces,
+		cmds := allEgressMasqueradeCmds(allocRange, snatDstExclusionCIDR.String(), m.sharedCfg.MasqueradeInterfaces,
 			m.cfg.IPTablesRandomFully)
 		for _, cmd := range cmds {
 			if err := prog.runProg(cmd); err != nil {
@@ -1644,7 +1591,7 @@ func (m *manager) installMasqueradeRules(
 
 func (m *manager) installMasqueradeRouteSourceRules(
 	prog runnable, routes []netlink.Route, linkByIndex func(int) (netlink.Link, error),
-	devices []string, snatDstExclusionCIDR, allocRange string,
+	devices []string, snatDstExclusionCIDR netip.Prefix, allocRange string,
 ) error {
 	slices.SortFunc(routes, func(a, b netlink.Route) int {
 		aPfx, bPfx := 0, 0
@@ -1687,8 +1634,14 @@ func (m *manager) installMasqueradeRouteSourceRules(
 			// -o device.
 			match = true
 		}
-		_, exclusionCIDR, err := net.ParseCIDR(snatDstExclusionCIDR)
-		if !match || r.Src == nil || (err == nil && cidr.Equal(r.Dst, exclusionCIDR)) {
+		// dst is the zero Prefix for a route without a destination (the
+		// kernel reports the default route that way), which never compares
+		// equal to a valid exclusion CIDR and is not a default-route prefix.
+		var dst netip.Prefix
+		if r.Dst != nil {
+			dst, _ = netipx.FromStdIPNet(r.Dst)
+		}
+		if !match || r.Src == nil || (dst.IsValid() && dst == snatDstExclusionCIDR) {
 			continue
 		}
 		progArgs := []string{
@@ -1696,10 +1649,10 @@ func (m *manager) installMasqueradeRouteSourceRules(
 			"-A", ciliumPostNatChain,
 			"-s", allocRange,
 		}
-		if cidr.Equal(r.Dst, cidr.ZeroNet(r.Family)) {
+		if isDefaultRoutePrefix(dst) {
 			progArgs = append(
 				progArgs,
-				"!", "-d", snatDstExclusionCIDR)
+				"!", "-d", snatDstExclusionCIDR.String())
 		} else {
 			progArgs = append(
 				progArgs,
@@ -1854,7 +1807,7 @@ func (m *manager) installRules(state desiredState) error {
 		if m.sharedCfg.IptablesMasqueradingIPv4Enabled && state.localNodeInfo.internalIPv4.IsValid() {
 			if err := m.installMasqueradeRules(m.ip4tables, state.devices.UnsortedList(), localDeliveryInterface,
 				m.remoteSNATDstAddrExclusionCIDR(state.localNodeInfo.ipv4NativeRoutingCIDR, state.localNodeInfo.ipv4AllocCIDR),
-				state.localNodeInfo.ipv4AllocCIDR,
+				state.localNodeInfo.ipv4AllocCIDR.String(),
 				state.localNodeInfo.internalIPv4.String(),
 			); err != nil {
 				return fmt.Errorf("cannot install masquerade rules: %w", err)
@@ -1870,7 +1823,7 @@ func (m *manager) installRules(state desiredState) error {
 		if m.sharedCfg.IptablesMasqueradingIPv6Enabled && state.localNodeInfo.internalIPv6.IsValid() {
 			if err := m.installMasqueradeRules(m.ip6tables, state.devices.UnsortedList(), localDeliveryInterface,
 				m.remoteSNATDstAddrExclusionCIDR(state.localNodeInfo.ipv6NativeRoutingCIDR, state.localNodeInfo.ipv6AllocCIDR),
-				state.localNodeInfo.ipv6AllocCIDR,
+				state.localNodeInfo.ipv6AllocCIDR.String(),
 				state.localNodeInfo.internalIPv6.String(),
 			); err != nil {
 				return fmt.Errorf("cannot install masquerade rules: %w", err)
@@ -1895,8 +1848,8 @@ func (m *manager) installRules(state desiredState) error {
 	}
 
 	podsCIDR := state.localNodeInfo.ipv4NativeRoutingCIDR
-	if m.sharedCfg.InstallNoConntrackIptRules && podsCIDR != "" {
-		if err := m.addNoTrackPodTrafficRules(m.ip4tables, podsCIDR); err != nil {
+	if m.sharedCfg.InstallNoConntrackIptRules && podsCIDR.IsValid() {
+		if err := m.addNoTrackPodTrafficRules(m.ip4tables, podsCIDR.String()); err != nil {
 			return fmt.Errorf("cannot install pod traffic no CT rules: %w", err)
 		}
 	}
@@ -1935,8 +1888,8 @@ func (m *manager) installRules(state desiredState) error {
 	return nil
 }
 
-func (m *manager) remoteSNATDstAddrExclusionCIDR(nativeRoutingCIDR, allocCIDR string) string {
-	if nativeRoutingCIDR != "" {
+func (m *manager) remoteSNATDstAddrExclusionCIDR(nativeRoutingCIDR, allocCIDR netip.Prefix) netip.Prefix {
+	if nativeRoutingCIDR.IsValid() {
 		// ip{v4,v6}-native-routing-cidr is set, so use it
 		return nativeRoutingCIDR
 	}
@@ -2290,7 +2243,12 @@ func groupL4AddrsByProto(ports []lb.L4Addr) map[lb.L4Type][]uint16 {
 	return result
 }
 
-// replaceNoTrackHostPortRules replaces noTrackHostPort rules on a state change. the new ruleset is added, and the previous one is removed.
+// replaceNoTrackHostPortRules replaces noTrackHostPort rules on a state change.
+// Install all changed protocols before removing old rules so a cross-protocol
+// update does not leave a gap in which neither ruleset is installed. This
+// deliberately allows a short overlap where both rulesets match. If
+// installation fails, the old rules remain and full reconciliation retries
+// the desired state.
 func (m *manager) replaceNoTrackHostPortRules(oldPorts, newPorts map[lb.L4Type][]uint16) error {
 	for _, proto := range noTrackSupportedProtos {
 		oldP := set.NewSet(oldPorts[proto]...)
@@ -2304,6 +2262,15 @@ func (m *manager) replaceNoTrackHostPortRules(oldPorts, newPorts map[lb.L4Type][
 			if err := m.installHostNoTrackRules(proto, newP.AsSlice()); err != nil {
 				return err
 			}
+		}
+	}
+
+	for _, proto := range noTrackSupportedProtos {
+		oldP := set.NewSet(oldPorts[proto]...)
+		newP := set.NewSet(newPorts[proto]...)
+
+		if newP.Equal(oldP) {
+			continue
 		}
 
 		if !oldP.Empty() {

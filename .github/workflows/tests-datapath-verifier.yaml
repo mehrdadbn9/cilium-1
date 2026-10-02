@@ -57,7 +57,7 @@ concurrency:
 
 env:
   # renovate: datasource=golang-version depName=go
-  go-version: 1.26.5
+  go-version: 1.27.1
 
 jobs:
   echo-inputs:
@@ -74,12 +74,12 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - name: Set initial commit status
-        uses: cilium/actions/set-commit-status@fe0702f5df0d8e44d48f1baa226c023b73ff6b5e # main
+        uses: cilium/actions/set-commit-status@687b48a0547e534dd7270d5069a5ab7967c0e907 # main
         with:
           sha: ${{ inputs.SHA || github.sha }}
 
   setup-and-test:
-    runs-on: ${{ vars.GH_RUNNER_EXTRA_POWER_UBUNTU_LATEST || 'ubuntu-24.04' }}
+    runs-on: ${{ vars.UBUNTU_2404_4CPU_16GB || 'ubuntu-24.04' }}
     name: Setup & Test
     strategy:
       fail-fast: false
@@ -106,7 +106,7 @@ jobs:
     timeout-minutes: 60
     steps:
       - name: Set commit status to pending
-        uses: cilium/actions/set-commit-status@fe0702f5df0d8e44d48f1baa226c023b73ff6b5e # main
+        uses: cilium/actions/set-commit-status@687b48a0547e534dd7270d5069a5ab7967c0e907 # main
         with:
           sha: ${{ inputs.SHA || github.sha }}
 
@@ -144,23 +144,23 @@ jobs:
           KERNEL="${{ matrix.kernel }}"
           case "$KERNEL" in
             # renovate: datasource=docker depName=quay.io/lvh-images/complexity-test
-            "5.15") FULL_KERNEL="5.15-20260720.023802" ;;
+            "5.15") FULL_KERNEL="5.15-20260921.012558" ;;
             # renovate: datasource=docker depName=quay.io/lvh-images/complexity-test
-            "6.1") FULL_KERNEL="6.1-20260720.023802" ;;
+            "6.1") FULL_KERNEL="6.1-20260921.012558" ;;
             # renovate: datasource=docker depName=quay.io/lvh-images/complexity-test
-            "6.6") FULL_KERNEL="6.6-20260720.023802" ;;
+            "6.6") FULL_KERNEL="6.6-20260921.012558" ;;
             # renovate: datasource=docker depName=quay.io/lvh-images/complexity-test
-            "6.12") FULL_KERNEL="6.12-20260720.023802" ;;
+            "6.12") FULL_KERNEL="6.12-20260921.012558" ;;
             # renovate: datasource=docker depName=quay.io/lvh-images/complexity-test
-            "6.18") FULL_KERNEL="6.18-20260720.023802" ;;
+            "6.18") FULL_KERNEL="6.18-20260921.012558" ;;
             # renovate: datasource=docker depName=quay.io/lvh-images/complexity-test
-            "bpf-next") FULL_KERNEL="bpf-next-20260720.023802" ;;
+            "bpf-next") FULL_KERNEL="bpf-next-20260921.012558" ;;
             *) FULL_KERNEL="$KERNEL" ;;
           esac
           echo "full=${FULL_KERNEL}" >> $GITHUB_OUTPUT
 
       - name: Provision LVH VMs
-        uses: cilium/little-vm-helper@5ae749011735fd77f30f38add52f1a53a5568671 # v0.0.30
+        uses: cilium/little-vm-helper@f86d344aca812dda5aef167867a9a0a90ca6cca5 # v0.0.31
         with:
           test-name: datapath-bpf-complexity
           image: 'complexity-test'
@@ -169,7 +169,7 @@ jobs:
           images-folder-parent: "/tmp"
           cpu: 4
           # renovate: datasource=github-tags depName=cilium/little-vm-helper
-          lvh-version: "v0.0.30"
+          lvh-version: "v0.0.31"
           install-dependencies: 'true'
           cmd: |
             for i in {1..5}; do curl "https://golang.org" > /dev/null 2>&1 && break || sleep 5; echo "Waiting for systemd-resolved to be ready..."; done
@@ -192,27 +192,8 @@ jobs:
             go clean -cache -modcache
             rm -rf /usr/local/go
 
-            # The LVH image ships with LLVM taken from a release Cilium version.
-            # Replace it with the one extracted from the cilium-builder image.
-            /host/base/contrib/scripts/extract-llvm.sh /var/tmp/llvm
-            mv /var/tmp/llvm/usr/local/bin/{clang,llc} /bin/
-            rm -r /var/tmp/llvm
-
-      - name: Run verifier tests (on base branch)
-        uses: cilium/little-vm-helper@5ae749011735fd77f30f38add52f1a53a5568671 # v0.0.30
-        with:
-          provision: 'false'
-          cmd: |
-            cd /host/base
-            export TMPDIR=/var/tmp
-            export GOCACHE=/host/gocache
-            mkdir -p /host/datapath-verifier /host/gocache
-            # Run with cgo disabled, LVH images don't ship with gcc.
-            CGO_ENABLED=0 PRIVILEGED_TESTS=true go${{ env.go-version }} test -v -timeout=25m ./pkg/datapath/loader -run "TestPrivilegedVerifier" --cilium-base-path /host/base --kernel-version ${{ matrix.ci-kernel }} --kernel-name ${{ matrix.kernel-name }} --result-dir /host/datapath-verifier
-            mv /host/datapath-verifier/verifier-complexity.json /host/datapath-verifier/verifier-complexity-base.json
-
       - name: Run verifier tests (on PR branch)
-        uses: cilium/little-vm-helper@5ae749011735fd77f30f38add52f1a53a5568671 # v0.0.30
+        uses: cilium/little-vm-helper@f86d344aca812dda5aef167867a9a0a90ca6cca5 # v0.0.31
         if: ${{ github.event_name == 'workflow_dispatch' }}
         with:
           provision: 'false'
@@ -221,9 +202,37 @@ jobs:
             export TMPDIR=/var/tmp
             export GOCACHE=/host/gocache
             mkdir -p /host/datapath-verifier /host/gocache
+
+            # The LVH image ships with LLVM taken from a release Cilium version.
+            # Replace it with the one pinned by the PR branch, so that a change
+            # to the LLVM version is reflected in the complexity diff.
+            /host/pull/contrib/scripts/extract-llvm.sh /var/tmp/llvm
+            mv /var/tmp/llvm/usr/local/bin/{clang,llc} /bin/
+            rm -r /var/tmp/llvm
+
             # Run with cgo disabled, LVH images don't ship with gcc.
             CGO_ENABLED=0 PRIVILEGED_TESTS=true go${{ env.go-version }} test -v -timeout=25m ./pkg/datapath/loader -run "TestPrivilegedVerifier" --cilium-base-path /host/pull --kernel-version ${{ matrix.ci-kernel }} --kernel-name ${{ matrix.kernel-name }} --result-dir /host/datapath-verifier
             mv /host/datapath-verifier/verifier-complexity.json /host/datapath-verifier/verifier-complexity-pull.json
+
+      - name: Run verifier tests (on base branch)
+        uses: cilium/little-vm-helper@f86d344aca812dda5aef167867a9a0a90ca6cca5 # v0.0.31
+        with:
+          provision: 'false'
+          cmd: |
+            cd /host/base
+            export TMPDIR=/var/tmp
+            export GOCACHE=/host/gocache
+            mkdir -p /host/datapath-verifier /host/gocache
+
+            # Use the LLVM version pinned by the base branch, which may differ
+            # from the one used for the PR branch above.
+            /host/base/contrib/scripts/extract-llvm.sh /var/tmp/llvm
+            mv /var/tmp/llvm/usr/local/bin/{clang,llc} /bin/
+            rm -r /var/tmp/llvm
+
+            # Run with cgo disabled, LVH images don't ship with gcc.
+            CGO_ENABLED=0 PRIVILEGED_TESTS=true go${{ env.go-version }} test -v -timeout=25m ./pkg/datapath/loader -run "TestPrivilegedVerifier" --cilium-base-path /host/base --kernel-version ${{ matrix.ci-kernel }} --kernel-name ${{ matrix.kernel-name }} --result-dir /host/datapath-verifier
+            mv /host/datapath-verifier/verifier-complexity.json /host/datapath-verifier/verifier-complexity-base.json
 
       - name: Upload artifacts
         if: ${{ always() }}
@@ -286,7 +295,7 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - name: Set final commit status
-        uses: cilium/actions/set-commit-status@fe0702f5df0d8e44d48f1baa226c023b73ff6b5e # main
+        uses: cilium/actions/set-commit-status@687b48a0547e534dd7270d5069a5ab7967c0e907 # main
         with:
           sha: ${{ inputs.SHA || github.sha }}
           status: ${{ needs.setup-and-test.result == 'success' && needs.merge-and-diff.result || needs.setup-and-test.result }}

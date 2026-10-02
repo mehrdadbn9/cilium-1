@@ -16,7 +16,6 @@ import (
 	"github.com/cilium/cilium/api/v1/models"
 	daemonapi "github.com/cilium/cilium/api/v1/server/restapi/daemon"
 	"github.com/cilium/cilium/daemon/cmd/cni"
-	"github.com/cilium/cilium/pkg/auth"
 	"github.com/cilium/cilium/pkg/clustermesh"
 	cmtypes "github.com/cilium/cilium/pkg/clustermesh/types"
 	"github.com/cilium/cilium/pkg/datapath/connector"
@@ -39,7 +38,6 @@ import (
 	"github.com/cilium/cilium/pkg/maps/policymap"
 	monitoragent "github.com/cilium/cilium/pkg/monitor/agent"
 	"github.com/cilium/cilium/pkg/node"
-	nodemanager "github.com/cilium/cilium/pkg/node/manager"
 	"github.com/cilium/cilium/pkg/option"
 	"github.com/cilium/cilium/pkg/promise"
 	"github.com/cilium/cilium/pkg/proxy"
@@ -81,7 +79,6 @@ type statusParams struct {
 
 	DaemonConfigPromise promise.Promise[*option.DaemonConfig]
 
-	AuthManager      *auth.AuthManager
 	BigTCPConfig     bigtcp.Config
 	BandwidthManager bandwidth.Manager
 	CiliumHealth     health.CiliumHealthManager
@@ -101,7 +98,9 @@ type statusParams struct {
 	MaglevConfig     maglev.Config
 	MonitorAgent     monitoragent.Agent
 	NodeLocalStore   *node.LocalNodeStore
-	NodeManager      nodemanager.NodeManager
+
+	ClusterSizeDependantInterval node.ClusterSizeDependantIntervalFunc
+
 	PolicyMapFactory policymap.Factory
 	TunnelConfig     tunnel.Config
 	WireguardAgent   wgTypes.Agent

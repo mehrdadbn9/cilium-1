@@ -8,8 +8,8 @@ import (
 	"fmt"
 	"net/netip"
 
-	"github.com/cilium/cilium/operator/pkg/ipam/allocator/clusterpool/cidralloc"
 	"github.com/cilium/cilium/pkg/ipam"
+	"github.com/cilium/cilium/pkg/ipam/cidralloc"
 )
 
 var (
@@ -32,9 +32,6 @@ func occupyCIDR(allocators []cidralloc.CIDRAllocator, cidr netip.Prefix) error {
 	for _, alloc := range allocators {
 		if !alloc.InRange(cidr) {
 			continue
-		}
-		if alloc.IsFull() {
-			return errPoolEmpty
 		}
 		allocated, err := alloc.IsAllocated(cidr)
 		if err != nil {

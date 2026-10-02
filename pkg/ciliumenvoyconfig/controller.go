@@ -7,9 +7,11 @@ import (
 	"context"
 	"fmt"
 	"iter"
+	"log/slog"
 	"maps"
 	"slices"
 	"strconv"
+	"sync"
 
 	"github.com/cilium/hive/cell"
 	"github.com/cilium/hive/job"
@@ -22,20 +24,25 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/sets"
 
-	"github.com/cilium/cilium/pkg/endpoint/regeneration"
-	"github.com/cilium/cilium/pkg/hive"
 	ciliumv2 "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2"
 	"github.com/cilium/cilium/pkg/loadbalancer"
 	"github.com/cilium/cilium/pkg/loadbalancer/writer"
+	"github.com/cilium/cilium/pkg/logging/logfields"
 	"github.com/cilium/cilium/pkg/option"
 	"github.com/cilium/cilium/pkg/policy/api"
 	"github.com/cilium/cilium/pkg/time"
 )
 
+// maxSyncWaitTime is the amount of time to wait for CECs to be synced to Envoy before
+// allowing endpoint regeneration to proceed. This is the maximum delay introduced by the
+// CEC processing to the initial endpoint generation.
+const maxSyncWaitTime = time.Minute
+
 type cecControllerParams struct {
 	cell.In
 
 	DB             *statedb.DB
+	Logger         *slog.Logger
 	JobGroup       job.Group
 	ExpConfig      loadbalancer.Config
 	DaemonConfig   *option.DaemonConfig
@@ -64,15 +71,25 @@ type cecControllerParams struct {
 //			       XDS Server
 type cecController struct {
 	cecControllerParams
+
+	initialized func(statedb.WriteTxn)
 }
 
 func registerCECController(params cecControllerParams) {
 	if !params.DaemonConfig.EnableL7Proxy || !params.DaemonConfig.EnableEnvoyConfig {
 		return
 	}
+
+	// Register an initializer on EnvoyResources table, this is completed once initial
+	// CEC resources are processed.
+	wtxn := params.DB.WriteTxn(params.EnvoyResources)
+	envoyResourcesInitialized := params.EnvoyResources.RegisterInitializer(wtxn, "CECController")
+	wtxn.Commit()
 	c := &cecController{
 		cecControllerParams: params,
+		initialized:         envoyResourcesInitialized,
 	}
+
 	params.JobGroup.Add(job.OneShot("controller", c.processLoop))
 }
 
@@ -114,6 +131,27 @@ func (c *cecController) processLoop(ctx context.Context, health cell.Health) err
 		featureMetrics: c.FeatureMetrics,
 	}
 
+	initWg := sync.WaitGroup{}
+	waitCtx, waitCancel := context.WithTimeout(ctx, maxSyncWaitTime)
+	defer waitCancel()
+
+	initWg.Go(func() {
+		// Wait for load balancing tables like services, frontends and backends to be initialized.
+		if err := c.Writer.WaitForInitializers(waitCtx); err != nil {
+			c.Logger.Warn("Failed to wait for loadbalancing initializers", logfields.Error, err)
+		}
+	})
+	initWg.Go(func() {
+		_, initDone := c.CECs.Initialized(c.DB.ReadTxn())
+		select {
+		case <-waitCtx.Done():
+			c.Logger.Warn("Failed to wait for CEC table", logfields.Error, waitCtx.Err())
+		case <-initDone:
+		}
+	})
+	initWg.Wait()
+
+	c.Logger.Debug("CEC and loadbalancing tables initialized, starting processing loop")
 	for {
 		t0 := time.Now()
 
@@ -143,6 +181,13 @@ func (c *cecController) processLoop(ctx context.Context, health cell.Health) err
 		//     Resources.Endpoints: backendsToLoadAssignments(backends),
 		//   }
 		backendProcessor.process(wtxn, closedWatches, allWatches)
+
+		// Indicate that initial resource processing is complete.
+		if c.initialized != nil {
+			c.Logger.Debug("CEC envoy resources table initialized")
+			c.initialized(wtxn)
+			c.initialized = nil
+		}
 
 		// Commit the new desired envoy resources. The changes will be picked up by the
 		// reconciler and pushed to Envoy.
@@ -419,8 +464,8 @@ func computeLoadAssignments(
 		}
 	}
 
-	// Keep track of number of active and terminating backends and only use
-	// terminating backends if active are not available.
+	// Keep track of number of active backends. Terminating backends are included
+	// as DRAINING when active backends exist, or as fallbacks when they do not.
 	numActive, numTerminating := 0, 0
 
 	for be := range backends {
@@ -492,10 +537,6 @@ func computeLoadAssignments(
 		var lbEndpoints []*envoy_config_endpoint.LbEndpoint
 		for _, addr := range slices.Sorted(maps.Keys(bes)) {
 			be := bes[addr]
-			if numActive != 0 && be.State == loadbalancer.BackendStateTerminating {
-				// We can skip terminating backends since active backends exist.
-				continue
-			}
 
 			// The below is to make sure that UDP and SCTP are not allowed instead of comparing with lb.TCP
 			// The reason is to avoid extra dependencies with ongoing work to differentiate protocols in datapath,
@@ -504,7 +545,7 @@ func computeLoadAssignments(
 				continue
 			}
 
-			lbEndpoints = append(lbEndpoints, &envoy_config_endpoint.LbEndpoint{
+			lbEp := &envoy_config_endpoint.LbEndpoint{
 				HostIdentifier: &envoy_config_endpoint.LbEndpoint_Endpoint{
 					Endpoint: &envoy_config_endpoint.Endpoint{
 						Address: &envoy_config_core.Address{
@@ -519,7 +560,15 @@ func computeLoadAssignments(
 						},
 					},
 				},
-			})
+			}
+			if be.State == loadbalancer.BackendStateTerminating && numActive > 0 {
+				// Keep terminating backends in the EDS set as DRAINING so Envoy
+				// stops sending new connections while allowing in-flight requests
+				// to complete. Hard-removing them causes immediate connection
+				// resets on endpoint churn.
+				lbEp.HealthStatus = envoy_config_core.HealthStatus_DRAINING
+			}
+			lbEndpoints = append(lbEndpoints, lbEp)
 		}
 
 		endpoints := []*envoy_config_endpoint.LocalityLbEndpoints{{LbEndpoints: lbEndpoints}}
@@ -540,59 +589,4 @@ func computeLoadAssignments(
 		}
 	}
 	return
-}
-
-// maxSyncWaitTime is the amount of time to wait for CECs to be synced to Envoy before
-// allowing endpoint regeneration to proceed. This is the maximum delay introduced by the
-// CEC processing to the initial endpoint generation.
-const maxSyncWaitTime = time.Minute
-
-// registerRegenerationWait registers initializer to block the endpoint regeneration
-// before we've reconciled to Envoy.
-func registerRegenerationWait(p cecControllerParams, fence regeneration.Fence) {
-	if !p.DaemonConfig.EnableL7Proxy || !p.DaemonConfig.EnableEnvoyConfig {
-		return
-	}
-	fence.Add("ciliumenvoyconfig", initWaitFunc(p))
-}
-
-func initWaitFunc(p cecControllerParams) hive.WaitFunc {
-	return func(ctx context.Context) error {
-		ctx, cancel := context.WithTimeout(ctx, maxSyncWaitTime)
-		defer cancel()
-
-		// Wait until the table has been populated.
-		_, initWatch := p.EnvoyResources.Initialized(p.DB.ReadTxn())
-		select {
-		case <-ctx.Done():
-			return nil
-		case <-initWatch:
-		}
-
-		// Wait for all initial resources to have been synced to Envoy.
-		seen := sets.New[EnvoyResourceName]()
-		for {
-			ers, watch := p.EnvoyResources.AllWatch(p.DB.ReadTxn())
-			done := true
-			for er := range ers {
-				if seen.Has(er.Name) {
-					continue
-				}
-				if er.Status.Kind == reconciler.StatusKindPending {
-					done = false
-					break
-				}
-				seen.Insert(er.Name)
-			}
-			if done {
-				break
-			}
-			select {
-			case <-ctx.Done():
-				return nil
-			case <-watch:
-			}
-		}
-		return nil
-	}
 }

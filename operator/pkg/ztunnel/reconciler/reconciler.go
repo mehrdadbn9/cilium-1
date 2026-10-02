@@ -13,7 +13,7 @@ import (
 	"github.com/cilium/statedb"
 	"github.com/cilium/statedb/reconciler"
 
-	"github.com/cilium/cilium/operator/auth/spire"
+	"github.com/cilium/cilium/operator/pkg/ztunnel/spire"
 	"github.com/cilium/cilium/pkg/logging/logfields"
 	"github.com/cilium/cilium/pkg/ztunnel/table"
 )
@@ -22,7 +22,7 @@ import (
 // will re-reconcile it on transient SPIRE failures.
 func requeueNamespace(db *statedb.DB, enrolledTbl statedb.RWTable[*table.EnrolledNamespace], namespace string) {
 	txn := db.WriteTxn(enrolledTbl)
-	ns, _, found := enrolledTbl.Get(txn, table.EnrolledNamespacesNameIndex.Query(namespace))
+	ns, _, found := enrolledTbl.Get(txn, table.EnrolledNamespaceByName(namespace))
 	if found {
 		clone := ns.Clone()
 		clone.Status = reconciler.StatusPending()
@@ -198,7 +198,7 @@ func (ops *EnrollmentReconciler) Start(cell.HookContext) error {
 					}
 				} else {
 					ops.logger.Debug("ServiceAccount added/updated", logfields.Name, sa.Name)
-					_, _, found := ops.enrolledNamespaceTable.Get(ops.db.ReadTxn(), table.EnrolledNamespacesNameIndex.Query(sa.Namespace))
+					_, _, found := ops.enrolledNamespaceTable.Get(ops.db.ReadTxn(), table.EnrolledNamespaceByName(sa.Namespace))
 					if !found {
 						ops.logger.Debug("Namespace not enrolled for mTLS", logfields.K8sNamespace, sa.Namespace)
 						continue

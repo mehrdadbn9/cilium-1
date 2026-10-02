@@ -22,6 +22,7 @@ import (
 	cmtypes "github.com/cilium/cilium/pkg/clustermesh/types"
 	"github.com/cilium/cilium/pkg/identity"
 	"github.com/cilium/cilium/pkg/ipcache/types"
+	ipcachetypes "github.com/cilium/cilium/pkg/ipcache/types"
 	"github.com/cilium/cilium/pkg/labels"
 	"github.com/cilium/cilium/pkg/option"
 	"github.com/cilium/cilium/pkg/source"
@@ -124,15 +125,15 @@ func TestInjectLabels(t *testing.T) {
 	assert.NotNil(t, id1)
 	assert.True(t, id1.Labels.HasRemoteNodeLabel())
 	assert.True(t, id1.Labels.HasKubeAPIServerLabel())
-	assert.True(t, id1.Labels.Has(labels.ParseLabel("cidr:10.0.0.4/32")))
-	assert.False(t, id1.Labels.Has(labels.ParseLabel("cidr:10.0.0.5/32")))
+	assert.True(t, id1.Labels.HasLabel(labels.ParseLabel("cidr:10.0.0.4/32")))
+	assert.False(t, id1.Labels.HasLabel(labels.ParseLabel("cidr:10.0.0.5/32")))
 
 	id2 := s.IPIdentityCache.IdentityAllocator.LookupIdentityByID(ctx, nid2)
 	assert.NotNil(t, id2)
 	assert.True(t, id2.Labels.HasRemoteNodeLabel())
 	assert.False(t, id2.Labels.HasKubeAPIServerLabel())
-	assert.False(t, id2.Labels.Has(labels.ParseLabel("cidr:10.0.0.4/32")))
-	assert.True(t, id2.Labels.Has(labels.ParseLabel("cidr:10.0.0.5/32")))
+	assert.False(t, id2.Labels.HasLabel(labels.ParseLabel("cidr:10.0.0.4/32")))
+	assert.True(t, id2.Labels.HasLabel(labels.ParseLabel("cidr:10.0.0.5/32")))
 
 	// Remove remote-node label, ensure transition to local cidr identity space
 	s.IPIdentityCache.metadata.remove(inClusterPrefix, "node-uid", overrideIdentity(false), labels.LabelRemoteNode)
@@ -150,15 +151,15 @@ func TestInjectLabels(t *testing.T) {
 	assert.NotNil(t, id1)
 	assert.False(t, id1.Labels.HasRemoteNodeLabel())
 	assert.True(t, id1.Labels.HasKubeAPIServerLabel())
-	assert.True(t, id1.Labels.Has(labels.ParseLabel("cidr:10.0.0.4/32")))
-	assert.False(t, id1.Labels.Has(labels.ParseLabel("cidr:10.0.0.5/32")))
+	assert.True(t, id1.Labels.HasLabel(labels.ParseLabel("cidr:10.0.0.4/32")))
+	assert.False(t, id1.Labels.HasLabel(labels.ParseLabel("cidr:10.0.0.5/32")))
 
 	id2 = s.IPIdentityCache.IdentityAllocator.LookupIdentityByID(ctx, nid2)
 	assert.NotNil(t, id2)
 	assert.False(t, id2.Labels.HasRemoteNodeLabel())
 	assert.False(t, id2.Labels.HasKubeAPIServerLabel())
-	assert.False(t, id2.Labels.Has(labels.ParseLabel("cidr:10.0.0.4/32")))
-	assert.True(t, id2.Labels.Has(labels.ParseLabel("cidr:10.0.0.5/32")))
+	assert.False(t, id2.Labels.HasLabel(labels.ParseLabel("cidr:10.0.0.4/32")))
+	assert.True(t, id2.Labels.HasLabel(labels.ParseLabel("cidr:10.0.0.5/32")))
 
 	// Clean up.
 	s.IPIdentityCache.metadata.remove(inClusterPrefix, "node-uid-cidr", overrideIdentity(false), labels.Labels{})
@@ -267,7 +268,7 @@ func TestUpdateLocalNode(t *testing.T) {
 		t.Helper()
 		id := s.PolicyHandler.identities[identity.ReservedIdentityHost]
 		assert.NotNil(t, id)
-		assert.Equal(t, lbls.LabelArray(), id)
+		assert.Equal(t, lbls, id)
 	}
 
 	injectLabels := func(ip cmtypes.PrefixCluster) {
@@ -380,7 +381,7 @@ func TestInjectExisting(t *testing.T) {
 	// Ensure the SelectorCache has the correct labels
 	selectorID := s.PolicyHandler.identities[id.ID]
 	assert.NotNil(t, selectorID)
-	assert.True(t, selectorID.Contains(labels.LabelKubeAPIServer.LabelArray()))
+	assert.True(t, selectorID.Contains(labels.LabelKubeAPIServer))
 }
 
 func TestFilterMetadataByLabels(t *testing.T) {
@@ -671,6 +672,203 @@ func TestUpsertMetadataTunnelPeerAndEncryptKey(t *testing.T) {
 	ip, key = s.IPIdentityCache.getHostIPCacheRLocked(inClusterPrefix.String())
 	assert.Equal(t, "192.168.1.101", ip.String())
 	assert.Equal(t, uint8(6), key)
+}
+
+// TestAllMetadata tests inserting and removing all kinds of metadata
+func TestAllMetadata(t *testing.T) {
+	s := setupIPCacheTestSuite(t)
+
+	tp1 := ipcachetypes.TunnelPeer{Addr: netip.MustParseAddr("1.1.1.1")}
+	tp2 := ipcachetypes.TunnelPeer{Addr: netip.MustParseAddr("1.1.1.2")}
+
+	ec1 := ipcachetypes.EncryptKey(1)
+	ec2 := ipcachetypes.EncryptKey(2)
+
+	ri1 := ipcachetypes.RequestedIdentity(1)
+	ri2 := ipcachetypes.RequestedIdentity(2)
+
+	epf1 := ipcachetypes.EndpointFlags{}
+	epf1.SetRemoteCluster(true)
+
+	epf2 := ipcachetypes.EndpointFlags{}
+	epf2.SetSkipTunnel(true)
+
+	steps := []struct {
+		add    IPMetadata
+		del    IPMetadata
+		result *resourceInfo
+	}{
+		{
+			add: labels.LabelIngress,
+			result: &resourceInfo{
+				labels: labels.LabelIngress,
+			},
+		},
+		{
+			add: labels.LabelHealth,
+			result: &resourceInfo{
+				labels: labels.LabelHealth,
+			},
+		},
+		{
+			add: overrideIdentity(true),
+			result: &resourceInfo{
+				labels:           labels.LabelHealth,
+				identityOverride: true,
+			},
+		},
+		{
+			add: tp1,
+			result: &resourceInfo{
+				labels:           labels.LabelHealth,
+				identityOverride: true,
+				tunnelPeer:       tp1,
+			},
+		}, {
+			add: tp2,
+			result: &resourceInfo{
+				labels:           labels.LabelHealth,
+				identityOverride: true,
+				tunnelPeer:       tp2,
+			},
+		}, {
+			add: ec1,
+			result: &resourceInfo{
+				labels:           labels.LabelHealth,
+				identityOverride: true,
+				tunnelPeer:       tp2,
+				encryptKey:       ec1,
+			},
+		}, {
+			add: ec2,
+			result: &resourceInfo{
+				labels:           labels.LabelHealth,
+				identityOverride: true,
+				tunnelPeer:       tp2,
+				encryptKey:       ec2,
+			},
+		}, {
+			add: ri1,
+			result: &resourceInfo{
+				labels:            labels.LabelHealth,
+				identityOverride:  true,
+				tunnelPeer:        tp2,
+				encryptKey:        ec2,
+				requestedIdentity: ri1,
+			},
+		}, {
+			add: ri2,
+			result: &resourceInfo{
+				labels:            labels.LabelHealth,
+				identityOverride:  true,
+				tunnelPeer:        tp2,
+				encryptKey:        ec2,
+				requestedIdentity: ri2,
+			},
+		}, {
+			add: epf1,
+			result: &resourceInfo{
+				labels:            labels.LabelHealth,
+				identityOverride:  true,
+				tunnelPeer:        tp2,
+				encryptKey:        ec2,
+				endpointFlags:     epf1,
+				requestedIdentity: ri2,
+			},
+		}, {
+			add: epf2,
+			result: &resourceInfo{
+				labels:            labels.LabelHealth,
+				identityOverride:  true,
+				tunnelPeer:        tp2,
+				encryptKey:        ec2,
+				endpointFlags:     epf2,
+				requestedIdentity: ri2,
+			},
+		},
+		{
+			del: epf2,
+			result: &resourceInfo{
+				labels:            labels.LabelHealth,
+				identityOverride:  true,
+				tunnelPeer:        tp2,
+				encryptKey:        ec2,
+				requestedIdentity: ri2,
+			},
+		},
+		{
+			del: ri2,
+			result: &resourceInfo{
+				labels:           labels.LabelHealth,
+				identityOverride: true,
+				tunnelPeer:       tp2,
+				encryptKey:       ec2,
+			},
+		},
+		{
+			del: ec2,
+			result: &resourceInfo{
+				labels:           labels.LabelHealth,
+				identityOverride: true,
+				tunnelPeer:       tp2,
+			},
+		},
+		{
+			del: tp2,
+			result: &resourceInfo{
+				labels:           labels.LabelHealth,
+				identityOverride: true,
+			},
+		},
+		{
+			del: overrideIdentity(false),
+			result: &resourceInfo{
+				labels: labels.LabelHealth,
+			},
+		},
+		{
+			del:    labels.LabelHealth,
+			result: nil,
+		},
+		{
+			add: labels.LabelHealth,
+			result: &resourceInfo{
+				labels: labels.LabelHealth,
+			},
+		},
+		{
+			add: overrideIdentity(true),
+			result: &resourceInfo{
+				labels:           labels.LabelHealth,
+				identityOverride: true,
+			},
+		},
+		{
+			add: tp1,
+			result: &resourceInfo{
+				labels:           labels.LabelHealth,
+				identityOverride: true,
+				tunnelPeer:       tp1,
+			},
+		},
+		{
+			del:    ipcachetypes.AllMetadata{},
+			result: nil,
+		},
+	}
+	for i, step := range steps {
+		if step.add != nil {
+			s.IPIdentityCache.metadata.upsertLocked(inClusterPrefix, source.CustomResource, "test", step.add)
+		}
+		if step.del != nil {
+			s.IPIdentityCache.metadata.remove(inClusterPrefix, "test", step.del)
+		}
+		if step.result != nil {
+			step.result.source = source.CustomResource
+		}
+		require.Equal(t, step.result, s.IPIdentityCache.metadata.getLocked(inClusterPrefix), "step %d", i)
+	}
+
 }
 
 // TestRequestIdentity checks that the identity restoration mechanism works as expected:
@@ -1172,12 +1370,12 @@ func TestUpsertMetadataCIDRGroup(t *testing.T) {
 
 func newMockUpdater() *mockUpdater {
 	return &mockUpdater{
-		identities: make(map[identity.NumericIdentity]labels.LabelArray),
+		identities: make(map[identity.NumericIdentity]labels.Labels),
 	}
 }
 
 type mockUpdater struct {
-	identities map[identity.NumericIdentity]labels.LabelArray
+	identities map[identity.NumericIdentity]labels.Labels
 }
 
 func (m *mockUpdater) UpdateIdentities(added, deleted identity.IdentityMap) <-chan struct{} {
@@ -1539,6 +1737,79 @@ func TestIPCacheCIDRResourceConsolidation(t *testing.T) {
 		}),
 	))
 	assert.Nil(t, s.IPIdentityCache.metadata.get(cidr))
+}
+
+// TestIPCacheCIDRResourceConsolidationNonCanonical is a test for CIDR reference
+// counting with non-canonical prefixes. Ensures deleting a policy for 10.0.0.1/24
+// does not release the shared canonical identity for 10.0.0.0/24.
+func TestIPCacheCIDRResourceConsolidationNonCanonical(t *testing.T) {
+	s := setupIPCacheTestSuite(t)
+
+	// ns-A expresses the network with host bits set; ns-B uses the canonical
+	// (masked) form. Both collapse onto the same canonical prefix 10.0.0.0/24.
+	nsAPrefix := cmtypes.NewLocalPrefixCluster(netip.MustParsePrefix("10.0.0.1/24"))
+	nsBPrefix := cmtypes.NewLocalPrefixCluster(netip.MustParsePrefix("10.0.0.0/24"))
+	canonical := canonicalPrefix(nsAPrefix)
+	assert.Equal(t, canonical, canonicalPrefix(nsBPrefix))
+
+	nsAResource := types.NewResourceID(types.ResourceKindCNP, "ns-a", "policy-a")
+	nsBResource := types.NewResourceID(types.ResourceKindCNP, "ns-b", "policy-b")
+
+	// ns-A adds 10.0.0.1/24.
+	assert.NoError(t, s.IPIdentityCache.WaitForRevision(
+		context.TODO(), s.IPIdentityCache.UpsertMetadataBatch(MU{
+			Prefix:   nsAPrefix,
+			Source:   source.Generated,
+			Resource: nsAResource,
+			Metadata: []IPMetadata{labels.GetCIDRLabels(nsAPrefix.AsPrefix())},
+			IsCIDR:   true,
+		}),
+	))
+	// ns-B adds 10.0.0.0/24 (same canonical network, different raw prefix).
+	assert.NoError(t, s.IPIdentityCache.WaitForRevision(
+		context.TODO(), s.IPIdentityCache.UpsertMetadataBatch(MU{
+			Prefix:   nsBPrefix,
+			Source:   source.Generated,
+			Resource: nsBResource,
+			Metadata: []IPMetadata{labels.GetCIDRLabels(nsBPrefix.AsPrefix())},
+			IsCIDR:   true,
+		}),
+	))
+
+	// Both references must collapse onto one canonical counter key (count 2)
+	// with a single consolidated metadata entry.
+	assert.Equal(t, 2, s.IPIdentityCache.metadata.prefixRefCounter[canonical])
+	assert.NotNil(t, s.IPIdentityCache.metadata.get(canonical))
+
+	// ns-A's policy is deleted. Before the fix, the counter was keyed by the
+	// raw prefix 10.0.0.1/24, so this dropped that key to 0, tore down the
+	// shared canonical entry, and released the identity still used by ns-B.
+	assert.NoError(t, s.IPIdentityCache.WaitForRevision(
+		context.TODO(), s.IPIdentityCache.RemoveMetadataBatch(MU{
+			Prefix:   nsAPrefix,
+			Source:   source.Generated,
+			Resource: nsAResource,
+			Metadata: []IPMetadata{labels.Labels{}},
+			IsCIDR:   true,
+		}),
+	))
+	// ns-B must be unaffected: the entry survives with a refcount of 1.
+	assert.Equal(t, 1, s.IPIdentityCache.metadata.prefixRefCounter[canonical])
+	assert.NotNil(t, s.IPIdentityCache.metadata.get(canonical),
+		"deleting ns-A's CIDR policy must not release the identity still used by ns-B")
+
+	// ns-B's policy is deleted; only now is the shared entry truly removed.
+	assert.NoError(t, s.IPIdentityCache.WaitForRevision(
+		context.TODO(), s.IPIdentityCache.RemoveMetadataBatch(MU{
+			Prefix:   nsBPrefix,
+			Source:   source.Generated,
+			Resource: nsBResource,
+			Metadata: []IPMetadata{labels.Labels{}},
+			IsCIDR:   true,
+		}),
+	))
+	assert.Zero(t, s.IPIdentityCache.metadata.prefixRefCounter[canonical])
+	assert.Nil(t, s.IPIdentityCache.metadata.get(canonical))
 }
 
 func BenchmarkManyResources(b *testing.B) {

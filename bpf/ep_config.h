@@ -12,7 +12,4 @@
 #ifndef SKIP_DEBUG
 #define DEBUG
 #endif
-#define DROP_NOTIFY
 #define TRACE_NOTIFY
-
-#define LOCAL_DELIVERY_METRICS

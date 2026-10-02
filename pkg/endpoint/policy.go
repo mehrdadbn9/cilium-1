@@ -48,9 +48,21 @@ var (
 	errPolicyComputationNotFound      = errors.New("policy computation result not found in statedb")
 )
 
-// PreviousMapState returns an empty policy.MapState with preallocated map sizes from the current one.
-func (e *Endpoint) PreviousMapState() *policy.MapState {
-	return e.desiredPolicy.GetMapState()
+// PreviousMapStateSizes returns the map sizes of the endpoint's current desired policy map state,
+// used as capacity hints when computing a new policy.
+//
+// The endpoint lock must not be held, as it is taken here to synchronize with the incremental
+// updates ApplyPolicyMapChanges applies to the current map state.
+func (e *Endpoint) PreviousMapStateSizes() policy.MapStateSizes {
+	if err := e.rlockAlive(); err != nil {
+		return policy.MapStateSizes{}
+	}
+	defer e.runlock()
+
+	if e.desiredPolicy == nil {
+		return policy.MapStateSizes{}
+	}
+	return e.desiredPolicy.GetMapState().Sizes()
 }
 
 // GetIngressNamedPort returns one port for the given name.
@@ -228,7 +240,10 @@ func (e *Endpoint) regeneratePolicy(stats *regenerationStatistics, datapathRegen
 			fmt.Errorf("failed waiting for policy computation result: %w", err))
 	} else if pcr != nil {
 		selectorPolicy = pcr.NewPolicy
-		result.policyRevision = pcr.Revision
+		// The realized revision is how far forward this policy is known to be
+		// correct, which is what waiters (e.g. the policy-revision wait in the
+		// connectivity tests) compare against.
+		result.policyRevision = pcr.CurrentAtRevision
 		err = pcr.Err
 	}
 	// Release the hold taken in waitForPolicyComputationResult. On success
@@ -252,7 +267,7 @@ func (e *Endpoint) regeneratePolicy(stats *regenerationStatistics, datapathRegen
 		stats.proxyConfiguration.Start()
 		desiredRedirects, stats.missingProxyRedirectsCount, rf = e.addNewRedirects(selectorPolicy, datapathRegenCtxt.proxyWaitGroup)
 		stats.proxyConfiguration.End(true)
-		datapathRegenCtxt.revertStack.Push(rf)
+		datapathRegenCtxt.revertibles.AddRevert(rf)
 
 		// Add a finalize function to clear out stale redirects. This will be called after
 		// new redirects have been acknowledged, and policy maps and NetworkPolicy have been
@@ -261,7 +276,7 @@ func (e *Endpoint) regeneratePolicy(stats *regenerationStatistics, datapathRegen
 		if e.desiredPolicy != nil {
 			previousRedirects = e.desiredPolicy.Redirects
 		}
-		datapathRegenCtxt.finalizeList.Append(func() {
+		datapathRegenCtxt.revertibles.AddFinalize(func() {
 			// At the point of this call, traffic is no longer redirected to the proxy
 			// for now-obsolete redirects, since we synced the updated policy map above.
 			// It's now safe to remove the redirects from the proxy's configuration.
@@ -289,11 +304,15 @@ func (e *Endpoint) waitForPolicyComputationResult(
 
 	for {
 		computeResult, _, watch, found := e.policyFetcher.GetIdentityPolicyByIdentity(securityIdentity)
-		if found && computeResult.Revision >= wantedRevision {
+		// CurrentAtRevision, not Revision: a policy computed at an older
+		// revision is still the right one to use if no later update selected
+		// this identity.
+		if found && computeResult.CurrentAtRevision >= wantedRevision {
 			if computeResult.NewPolicy.AddHold() {
 				e.getLogger().Debug(
 					"Retrieved identity policy from statedb",
 					logfields.PolicyRevision, computeResult.Revision,
+					logfields.PolicyRevisionCurrentAt, computeResult.CurrentAtRevision,
 				)
 				return &computeResult, nil
 			}
@@ -309,6 +328,7 @@ func (e *Endpoint) waitForPolicyComputationResult(
 				"Policy computation result has stale revision, waiting for update",
 				logfields.Identity, securityIdentity.ID,
 				logfields.PolicyRevision, computeResult.Revision,
+				logfields.PolicyRevisionCurrentAt, computeResult.CurrentAtRevision,
 				logfields.PolicyRevisionNext, wantedRevision,
 			)
 		} else {
@@ -325,12 +345,17 @@ func (e *Endpoint) waitForPolicyComputationResult(
 			continue
 		case <-timeout.C:
 			if found {
-				return nil, fmt.Errorf("%w: got rev=%d, want rev=%d",
+				return nil, fmt.Errorf("%w: identity=%d got rev=%d currentAt=%d, want rev=%d",
 					errPolicyComputationStaleRevision,
+					securityIdentity.ID,
 					computeResult.Revision,
+					computeResult.CurrentAtRevision,
 					wantedRevision)
 			}
-			return nil, errPolicyComputationNotFound
+			return nil, fmt.Errorf("%w: identity=%d, want rev=%d",
+				errPolicyComputationNotFound,
+				securityIdentity.ID,
+				wantedRevision)
 		}
 	}
 }
@@ -403,7 +428,7 @@ func (e *Endpoint) setDesiredPolicy(datapathRegenCtxt *datapathRegenerationConte
 		// Revert by changing back to the old realized policy in case of any error
 		// This is needed to be able to recover to a known good state, as
 		// e.realizedPolicy is set when endpoint regeneration has succeeded.
-		datapathRegenCtxt.revertStack.Push(func() error {
+		datapathRegenCtxt.revertibles.AddRevert(func() error {
 			// Do nothing if e.policyMap was not initialized already
 			if e.policyMap != nil && e.desiredPolicy != e.realizedPolicy {
 				desiredPolicyMapLen := e.desiredPolicy.Len()
@@ -564,8 +589,7 @@ func (e *Endpoint) regenerate(ctx *regenerationContext) (retErr error) {
 	revision, err = e.regenerateBPF(ctx)
 
 	// Write full verifier log to the endpoint directory.
-	var ve *ebpf.VerifierError
-	if errors.As(err, &ve) {
+	if ve, ok := errors.AsType[*ebpf.VerifierError](err); ok {
 		p := path.Join(tmpDir, "verifier.log")
 		f, err := os.Create(p)
 		if err != nil {
@@ -699,8 +723,7 @@ func (e *Endpoint) updateRegenerationStatistics(ctx *regenerationContext, err er
 			scopedLog.Warn("Regeneration of endpoint failed", logAttrs...)
 		}
 
-		var regenErr *regenerationError
-		if errors.As(err, &regenErr) {
+		if regenErr, ok := errors.AsType[*regenerationError](err); ok {
 			stats.regenFailureReason = regenErr.GetReason()
 		} else {
 			stats.regenFailureReason = regenerationFailureReasonUnknown
@@ -837,7 +860,20 @@ func (e *Endpoint) UpdatePolicy(idsToRegen *set.Set[identityPkg.NumericIdentity]
 	// Otherwise, bump the policy revision directly.
 	if !idsToRegen.Has(secID) {
 		if e.policyRevision == 0 {
-			// We are deferring to the upcoming regen since the endpoint is new.
+			// Unaffected identities are not normally recomputed at toRev. Schedule
+			// this one before making the upcoming regeneration wait for it.
+			if toRev > e.skippedPolicyRevision {
+				if _, err := e.policyFetcher.RecomputeIdentityPolicy(e.SecurityIdentity, toRev); err != nil {
+					e.getLogger().Warn(
+						"Failed to recompute policy for initializing endpoint",
+						logfields.Error, err,
+						logfields.PolicyRevision, toRev,
+					)
+					unlock()
+					return
+				}
+				e.skippedPolicyRevision = toRev
+			}
 			unlock()
 			return
 		}
@@ -1066,8 +1102,8 @@ func (e *Endpoint) ComputeInitialPolicy(regenContext *regenerationContext) (erro
 		e.getLogger().Debug("Regenerate: Initial Envoy NetworkPolicy")
 
 		stats.proxyPolicyCalculation.Start()
-		// Initial NetworkPolicy is not reverted
-		err, _, finalize := e.proxy.UpdateNetworkPolicy(regenContext.parentContext, e, e.desiredPolicy, nil)
+		// Initial NetworkPolicy is not reverted.
+		err, revertible := e.proxy.UpdateNetworkPolicy(regenContext.parentContext, e, e.desiredPolicy, nil)
 		stats.proxyPolicyCalculation.End(err == nil)
 		if err != nil {
 			e.getLogger().Warn(
@@ -1077,8 +1113,8 @@ func (e *Endpoint) ComputeInitialPolicy(regenContext *regenerationContext) (erro
 			// Do not error out so that the policy regeneration is tried again.
 			return nil, release
 		}
-		if finalize != nil {
-			finalize()
+		if revertible != nil {
+			revertible.Finalize()
 		}
 	}
 
@@ -1207,6 +1243,7 @@ func (e *Endpoint) runIPIdentitySync(endpointIP netip.Addr) {
 				metadata := e.FormatGlobalEndpointID()
 				k8sNamespace := e.K8sNamespace
 				k8sPodName := e.K8sPodName
+				k8sPodUID := e.GetK8sPodUID()
 
 				k8sServiceAccount := ""
 				if pod := e.GetPod(); pod != nil {
@@ -1225,6 +1262,7 @@ func (e *Endpoint) runIPIdentitySync(endpointIP netip.Addr) {
 					Metadata:          metadata,
 					K8sNamespace:      k8sNamespace,
 					K8sPodName:        k8sPodName,
+					K8sPodUID:         k8sPodUID,
 					K8sServiceAccount: k8sServiceAccount,
 					NPM:               e.GetK8sPorts(),
 				}

@@ -11,6 +11,7 @@ import (
 	"github.com/cilium/hive/hivetest"
 	"github.com/stretchr/testify/require"
 
+	cmtypes "github.com/cilium/cilium/pkg/clustermesh/types"
 	"github.com/cilium/cilium/pkg/completion"
 	"github.com/cilium/cilium/pkg/crypto/certificatemanager"
 	fakeipsec "github.com/cilium/cilium/pkg/datapath/linux/ipsec/fake"
@@ -69,7 +70,7 @@ func setupRedirectSuite(tb testing.TB) *RedirectSuite {
 	}
 
 	s.do.idmgr = identitymanager.NewIDManager(logger)
-	s.do.repo = policy.NewPolicyRepository(logger, identityCache, nil, envoypolicy.NewEnvoyL7RulesTranslator(logger, certificatemanager.NewMockSecretManagerInline()), s.do.idmgr, testpolicy.NewPolicyMetricsNoop())
+	s.do.repo = policy.NewPolicyRepository(logger, cmtypes.DefaultClusterInfo, identityCache, nil, envoypolicy.NewEnvoyL7RulesTranslator(logger, certificatemanager.NewMockSecretManagerInline()), s.do.idmgr, testpolicy.NewPolicyMetricsNoop())
 	s.do.repo.GetSelectorCache().SetLocalIdentityNotifier(testidentity.NewDummyIdentityNotifier())
 	s.do.fetcher = testcompute.InstantiateCellForTesting(tb, logger, "endpoint", "setupRedirectSuite", s.do.repo, s.do.idmgr)
 
@@ -116,8 +117,8 @@ func (r *RedirectSuiteProxy) RemoveRedirect(id string) {
 }
 
 // UpdateNetworkPolicy does nothing.
-func (r *RedirectSuiteProxy) UpdateNetworkPolicy(ctx context.Context, ep endpoint.EndpointUpdater, policy *policy.EndpointPolicy, wg *completion.WaitGroup) (error, revert.RevertFunc, revert.FinalizeFunc) {
-	return nil, nil, nil
+func (r *RedirectSuiteProxy) UpdateNetworkPolicy(ctx context.Context, ep endpoint.EndpointUpdater, policy *policy.EndpointPolicy, wg *completion.WaitGroup) (error, revert.Revertible) {
+	return nil, nil
 }
 
 // RemoveNetworkPolicy does nothing.
@@ -197,7 +198,7 @@ func (s *RedirectSuite) NewTestEndpoint(t *testing.T) *Endpoint {
 
 	ep.SetPropertyValue(endpointtypes.PropertyFakeEndpoint, false)
 
-	epIdentity, _, err := s.mgr.AllocateIdentity(context.Background(), labelsBar.Labels(), true, identityBar)
+	epIdentity, _, err := s.mgr.AllocateIdentity(context.Background(), labelsBar, true, identityBar)
 	require.NoError(t, err)
 	ep.SetIdentity(epIdentity)
 
@@ -222,14 +223,14 @@ func (s *RedirectSuite) TearDownTest(t *testing.T) {
 var (
 	// Identity, labels, selectors for an endpoint named "foo"
 	identityFoo = identity.NumericIdentity(100)
-	labelsFoo   = labels.ParseSelectLabelArray("foo", "red")
+	labelsFoo   = labels.ParseSelectLabels("foo", "red")
 	selectFoo_  = api.NewESFromLabels(labels.ParseSelectLabel("foo"))
 	selectRed_  = api.NewESFromLabels(labels.ParseSelectLabel("red"))
 	denyFooL3__ = selectFoo_
 
 	identityBar = identity.NumericIdentity(200)
 
-	labelsBar  = labels.ParseSelectLabelArray("bar", "blue")
+	labelsBar  = labels.ParseSelectLabels("bar", "blue")
 	selectBar_ = api.NewESFromLabels(labels.ParseSelectLabel("bar"))
 
 	denyAllL4_ []api.PortDenyRule
@@ -291,7 +292,7 @@ func (s *RedirectSuite) computePolicyForTest(t *testing.T, ep *Endpoint, cmp *co
 	res := s.datapathRegenCtxt.policyResult
 
 	oldDesiredPolicy := ep.desiredPolicy
-	s.datapathRegenCtxt.revertStack.Push(func() error {
+	s.datapathRegenCtxt.revertibles.AddRevert(func() error {
 		ep.desiredPolicy = oldDesiredPolicy
 		return nil
 	})
@@ -299,7 +300,7 @@ func (s *RedirectSuite) computePolicyForTest(t *testing.T, ep *Endpoint, cmp *co
 	ep.setDesiredPolicy(s.datapathRegenCtxt)
 
 	// This will also remove old redirects
-	s.datapathRegenCtxt.finalizeList.Finalize()
+	s.datapathRegenCtxt.revertibles.Finalize()
 }
 
 type LabelArrayListMap map[policy.Key]labels.LabelArrayList
@@ -411,7 +412,7 @@ func TestRedirectWithDeny(t *testing.T) {
 	require.Equal(t, 1+2*len(policy.AllAggregates), ep.desiredPolicy.Len())
 
 	// Pretend that something failed and revert the changes
-	s.datapathRegenCtxt.revertStack.Revert()
+	require.NoError(t, s.datapathRegenCtxt.revertibles.Revert())
 	require.Empty(t, ep.desiredPolicy.Redirects)
 
 	expected = policy.MapStateMap{}
@@ -536,7 +537,7 @@ func TestRedirectWithPriority(t *testing.T) {
 	require.Equal(t, 1+2*len(policy.AllAggregates), ep.desiredPolicy.Len())
 
 	// Pretend that something failed and revert the changes
-	s.datapathRegenCtxt.revertStack.Revert()
+	require.NoError(t, s.datapathRegenCtxt.revertibles.Revert())
 	require.Empty(t, ep.desiredPolicy.Redirects)
 
 	expected = policy.MapStateMap{}
@@ -589,7 +590,7 @@ func TestRedirectWithEqualPriority(t *testing.T) {
 	require.Equal(t, 1+2*len(policy.AllAggregates), ep.desiredPolicy.Len())
 
 	// Pretend that something failed and revert the changes
-	s.datapathRegenCtxt.revertStack.Revert()
+	require.NoError(t, s.datapathRegenCtxt.revertibles.Revert())
 	require.Empty(t, ep.desiredPolicy.Redirects)
 
 	expected = policy.MapStateMap{}

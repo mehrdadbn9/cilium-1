@@ -27,6 +27,7 @@ nodeport_has_nat_conflict_ipv6(const struct __ctx_buff *ctx __maybe_unused,
 {
 #if defined(TUNNEL_MODE) && defined(IS_BPF_OVERLAY)
 	union v6addr router_ip = CONFIG(router_ipv6);
+
 	if (ipv6_addr_equals((union v6addr *)&ip6->saddr, &router_ip)) {
 		ipv6_addr_copy(&target->addr, &router_ip);
 		target->needs_ct = true;
@@ -64,8 +65,7 @@ static __always_inline int nodeport_snat_fwd_ipv6(struct __ctx_buff *ctx,
 	void *data, *data_end;
 	struct ipv6hdr *ip6;
 
-	args->target.min_port = NODEPORT_PORT_MIN_NAT;
-	args->target.max_port = NODEPORT_PORT_MAX_NAT;
+	select_nat_port_range_ipv6(&args->target);
 
 	if (!revalidate_data(ctx, &data, &data_end, &ip6))
 		return DROP_INVALID;
@@ -109,6 +109,11 @@ static __always_inline int nodeport_snat_fwd_ipv6(struct __ctx_buff *ctx,
 apply_snat:
 	ipv6_addr_copy(saddr, &args->tuple.saddr);
 	ret = snat_v6_nat(ctx, fraginfo, l4_off, ext_err);
+	if (CONFIG(nodeport_port_max_nat_ext) &&
+	    ret == DROP_NAT_NO_MAPPING) {
+		swap_nat_port_range_ipv6(&args->target);
+		ret = snat_v6_nat(ctx, fraginfo, l4_off, ext_err);
+	}
 	if (IS_ERR(ret))
 		goto out;
 
@@ -123,22 +128,23 @@ out:
 	return ret;
 }
 
+DEFINE_AUX(union v6addr, snat_fwd_saddr);
+
 __declare_tail(CILIUM_CALL_IPV6_NODEPORT_SNAT_FWD)
 int tail_handle_snat_fwd_ipv6(struct __ctx_buff *ctx)
 {
 	__u32 src_id = ctx_load_and_clear_meta(ctx, CB_SRC_LABEL);
-	union v6addr saddr = {};
+	union v6addr *saddr = AUX(snat_fwd_saddr);
 	int ret;
 	__s8 ext_err = 0;
 	struct snat_v6_args *args = AUX(snat_v6_args);
 
-	memset(args, 0, sizeof(*args));
 	args->trace = (struct trace_ctx){
 		.reason = TRACE_REASON_UNKNOWN,
 		.monitor = 0,
 	};
 
-	ret = nodeport_snat_fwd_ipv6(ctx, &saddr, &ext_err, args);
+	ret = nodeport_snat_fwd_ipv6(ctx, saddr, &ext_err, args);
 	if (IS_ERR(ret))
 		return send_drop_notify_error_ext(ctx, src_id, ret, ext_err, METRIC_EGRESS);
 
@@ -149,7 +155,7 @@ int tail_handle_snat_fwd_ipv6(struct __ctx_buff *ctx)
 	 */
 	if (ret == CTX_ACT_OK)
 		send_trace_notify6(ctx, NODEPORT_OBS_POINT_EGRESS, src_id, UNKNOWN_ID,
-				   &saddr, TRACE_EP_ID_UNKNOWN, CONFIG(interface_ifindex),
+				   saddr, TRACE_EP_ID_UNKNOWN, CONFIG(interface_ifindex),
 				   args->trace.reason, args->trace.monitor);
 
 	return ret;
@@ -295,8 +301,8 @@ nodeport_has_nat_conflict_ipv4(const struct __ctx_buff *ctx __maybe_unused,
 			       struct ipv4_nat_target *target __maybe_unused)
 {
 #if defined(TUNNEL_MODE) && defined(IS_BPF_OVERLAY)
-	if (ip4->saddr == IPV4_GATEWAY) {
-		target->addr = IPV4_GATEWAY;
+	if (ip4->saddr == CONFIG(router_ipv4).be32) {
+		target->addr = ip4->saddr;
 		target->needs_ct = true;
 
 		return true;
@@ -341,9 +347,7 @@ static __always_inline int nodeport_snat_fwd_ipv4(struct __ctx_buff *ctx,
 	fraginfo = ipfrag_encode_ipv4(ip4);
 
 	args = AUX(snat_v4_args);
-	memset(args, 0, sizeof(*args));
-	args->target.min_port = NODEPORT_PORT_MIN_NAT;
-	args->target.max_port = NODEPORT_PORT_MAX_NAT;
+	select_nat_port_range_ipv4(&args->target);
 #if defined(ENABLE_CLUSTER_AWARE_ADDRESSING) && defined(ENABLE_INTER_CLUSTER_SNAT)
 	args->target.cluster_id = cluster_id,
 #endif
@@ -421,6 +425,12 @@ apply_snat:
 	*saddr = args->tuple.saddr;
 	ret = snat_v4_nat(ctx, &args->tuple, ip4, fraginfo, l4_off,
 			  &args->target, trace, ext_err);
+	if (CONFIG(nodeport_port_max_nat_ext) &&
+	    ret == DROP_NAT_NO_MAPPING) {
+		swap_nat_port_range_ipv4(&args->target);
+		ret = snat_v4_nat(ctx, &args->tuple, ip4, fraginfo, l4_off,
+				  &args->target, trace, ext_err);
+	}
 	if (IS_ERR(ret))
 		goto out;
 
@@ -613,7 +623,6 @@ int tail_handle_nat_fwd_ipv4(struct __ctx_buff *ctx)
 }
 #endif /* ENABLE_IPV4 */
 
-#ifdef ENABLE_HEALTH_CHECK
 static __always_inline int
 lb_handle_health(struct __ctx_buff *ctx __maybe_unused, __be16 proto)
 {
@@ -648,7 +657,7 @@ lb_handle_health(struct __ctx_buff *ctx __maybe_unused, __be16 proto)
 			ctx->tc_index |= TC_INDEX_F_SKIP_HEALTH_CHECK;
 		}
 
-		return ctx_redirect(ctx, ENCAP4_IFINDEX, flags);
+		return ctx_redirect(ctx, CONFIG(encap4_ifindex), flags);
 	}
 #endif
 #if defined(ENABLE_IPV6) && DSR_ENCAP_MODE == DSR_ENCAP_IPIP
@@ -674,14 +683,13 @@ lb_handle_health(struct __ctx_buff *ctx __maybe_unused, __be16 proto)
 			ctx->tc_index |= TC_INDEX_F_SKIP_HEALTH_CHECK;
 		}
 
-		return ctx_redirect(ctx, ENCAP6_IFINDEX, flags);
+		return ctx_redirect(ctx, CONFIG(encap6_ifindex), flags);
 	}
 #endif
 	default:
 		return CTX_ACT_OK;
 	}
 }
-#endif /* ENABLE_HEALTH_CHECK */
 
 /* handle_nat_fwd() handles revDNAT, fib_lookup_redirect, and bpf_snat for
  * nodeport. If revdnat_only is set to true, fib_lookup and bpf_snat are

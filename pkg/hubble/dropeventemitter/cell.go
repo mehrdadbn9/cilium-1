@@ -14,7 +14,6 @@ import (
 	flowpb "github.com/cilium/cilium/api/v1/flow"
 	"github.com/cilium/cilium/pkg/endpointmanager"
 	k8sClient "github.com/cilium/cilium/pkg/k8s/client"
-	"github.com/cilium/cilium/pkg/k8s/watchers"
 	"github.com/cilium/cilium/pkg/logging/logfields"
 	"github.com/cilium/cilium/pkg/time"
 )
@@ -53,7 +52,6 @@ var defaultConfig = config{
 	EnableK8sDropEvents:   false,
 	K8sDropEventsInterval: 2 * time.Minute,
 	K8sDropEventsReasons: []string{
-		strings.ToLower(flowpb.DropReason_AUTH_REQUIRED.String()),
 		strings.ToLower(flowpb.DropReason_POLICY_DENIED.String()),
 	},
 	EnableK8sDropEventsExtended: false,
@@ -95,8 +93,7 @@ type params struct {
 
 	Lifecycle cell.Lifecycle
 
-	Clientset  k8sClient.Clientset
-	K8sWatcher *watchers.K8sWatcher
+	Clientset k8sClient.Clientset
 
 	Config config
 
@@ -119,7 +116,7 @@ func newDropEventEmitter(p params) FlowProcessor {
 		logfields.RateLimit, p.Config.K8sDropEventsRateLimit,
 	)
 
-	flowProcessor := new(p.Logger, p.Config.K8sDropEventsInterval, p.Config.K8sDropEventsReasons, p.Config.EnableK8sDropEventsExtended, p.Config.K8sDropEventsRateLimit, p.Clientset, p.K8sWatcher, p.EndpointsLookup)
+	flowProcessor := new(p.Logger, p.Config.K8sDropEventsInterval, p.Config.K8sDropEventsReasons, p.Config.EnableK8sDropEventsExtended, p.Config.K8sDropEventsRateLimit, p.Clientset, p.EndpointsLookup)
 	p.Lifecycle.Append(cell.Hook{
 		OnStop: func(hc cell.HookContext) error {
 			flowProcessor.Shutdown()

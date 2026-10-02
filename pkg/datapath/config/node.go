@@ -4,23 +4,40 @@
 package config
 
 import (
+	"net"
+
 	"github.com/cilium/cilium/pkg/datapath/linux/probes"
-	"github.com/cilium/cilium/pkg/identity"
+	"github.com/cilium/cilium/pkg/datapath/tables"
+	"github.com/cilium/cilium/pkg/datapath/types"
 	"github.com/cilium/cilium/pkg/loadbalancer"
 	"github.com/cilium/cilium/pkg/option"
 )
 
 func NodeConfig(lnc *Config) Node {
 	node := *NewNode()
-	node.ClusterIDBits = identity.GetClusterIDBits()
+	node.ClusterIDBits = lnc.ClusterIDBits
 
 	node.CiliumHostIfIndex = lnc.CiliumHostIfIndex
-	node.CiliumHostMAC.Addr = lnc.CiliumHostMAC.As6()
+	node.CiliumHostMAC.Addr = lnc.CiliumHostMAC
 	node.CiliumNetIfIndex = lnc.CiliumNetIfIndex
-	node.CiliumNetMAC.Addr = lnc.CiliumNetMAC.As6()
+	node.CiliumNetMAC.Addr = lnc.CiliumNetMAC
+
+	node.CTTimeouts = types.CTTimeoutConfig{
+		ConnectionLifetimeTCP:    uint32(option.Config.CTMapEntriesTimeoutTCP.Seconds()),
+		ConnectionLifetimeNonTCP: uint32(option.Config.CTMapEntriesTimeoutAny.Seconds()),
+		ServiceLifetimeTCP:       uint32(option.Config.CTMapEntriesTimeoutSVCTCP.Seconds()),
+		ServiceLifetimeNonTCP:    uint32(option.Config.CTMapEntriesTimeoutSVCAny.Seconds()),
+		ServiceCloseRebalance:    uint32(option.Config.CTMapEntriesTimeoutSVCTCPGrace.Seconds()),
+		SYNTimeout:               uint32(option.Config.CTMapEntriesTimeoutSYN.Seconds()),
+		CloseTimeout:             uint32(option.Config.CTMapEntriesTimeoutFIN.Seconds()),
+	}
 
 	if lnc.ServiceLoopbackIPv4.IsValid() {
 		node.ServiceLoopbackIPv4.Addr = lnc.ServiceLoopbackIPv4.As4()
+	}
+
+	if lnc.CiliumInternalIPv4.IsValid() {
+		node.RouterIPv4.Addr = lnc.CiliumInternalIPv4.As4()
 	}
 
 	if lnc.ServiceLoopbackIPv6.IsValid() {
@@ -33,11 +50,25 @@ func NodeConfig(lnc *Config) Node {
 
 	node.ClusterID = lnc.ClusterID
 	node.MonitorAggregation = uint8(option.Config.Opts.GetValue(option.MonitorAggregation))
+	node.MonitorReportInterval = uint32(option.Config.MonitorAggregationInterval.Seconds())
+	node.MonitorReportFlags = option.Config.MonitorAggregationFlags
 	node.TracePayloadLen = uint32(option.Config.TracePayloadlen)
 	node.TracePayloadLenOverlay = uint32(option.Config.TracePayloadlenOverlay)
 
 	if lnc.DirectRoutingDevice != nil {
 		node.DirectRoutingDevIfIndex = uint32(lnc.DirectRoutingDevice.Index)
+		if option.Config.EnableIPv4 {
+			ipv4 := tables.PreferredIPv4Address(lnc.DirectRoutingDevice.Addrs)
+			if ipv4.IsValid() {
+				node.IPv4DirectRouting.Addr = ipv4.As4()
+			}
+		}
+		if option.Config.EnableIPv6 {
+			ipv6 := tables.PreferredIPv6Address(lnc.DirectRoutingDevice.Addrs)
+			if ipv6.IsValid() {
+				node.IPv6DirectRouting.Addr = ipv6.As16()
+			}
+		}
 	}
 
 	node.SupportsFIBLookupSkipNeigh = probes.HaveFibLookupSkipNeigh() == nil
@@ -71,6 +102,8 @@ func NodeConfig(lnc *Config) Node {
 
 	node.NodeportPortMin = lnc.LBConfig.NodePortMin
 	node.NodeportPortMax = lnc.LBConfig.NodePortMax
+	node.NodeportPortMinNATExt = lnc.LBConfig.NodePortMinNATExt
+	node.NodeportPortMaxNATExt = lnc.LBConfig.NodePortMaxNATExt
 
 	if option.Config.EnableNat46X64Gateway {
 		node.NAT46X64Prefix.Addr = option.Config.IPv6NAT46x64CIDRBase.As4()
@@ -80,12 +113,45 @@ func NodeConfig(lnc *Config) Node {
 		node.IPv4InterClusterSNAT.Addr = lnc.NodeIPv4.As4()
 	}
 
+	if option.Config.EnableBPFMasquerade {
+		if option.Config.EnableIPv4Masquerade {
+			excludeCIDR := lnc.NativeRoutingCIDRIPv4
+			if option.Config.EnableIPMasqAgent {
+				excludeCIDR = option.Config.IPv4NativeRoutingCIDR
+			}
+
+			if excludeCIDR.IsValid() {
+				node.IPv4SNATExclusion.DstAddr.Addr = excludeCIDR.Addr().As4()
+				node.IPv4SNATExclusion.Bits = uint8(excludeCIDR.Bits())
+				node.IPv4SNATExclusion.Enabled = true
+			}
+		}
+
+		if option.Config.EnableIPv6Masquerade {
+			excludeCIDR := lnc.NativeRoutingCIDRIPv6
+			if option.Config.EnableIPMasqAgent {
+				excludeCIDR = option.Config.IPv6NativeRoutingCIDR
+			}
+
+			if excludeCIDR.IsValid() {
+				node.IPv6SNATExclusion.DstAddr.Addr = excludeCIDR.Addr().As16()
+				mask := net.CIDRMask(excludeCIDR.Bits(), excludeCIDR.Addr().BitLen())
+				copy(node.IPv6SNATExclusion.DstMask.Addr[:], mask)
+				node.IPv6SNATExclusion.Enabled = true
+			}
+		}
+	}
+
+	node.Encap4IfIndex = lnc.Encap4IfIndex
+	node.Encap6IfIndex = lnc.Encap6IfIndex
+
 	node.EnableJiffies = option.Config.ClockSource == option.ClockSourceJiffies
 	node.KernelHz = uint32(option.Config.KernelHz)
 
 	node.EnableConntrackAccounting = lnc.EnableConntrackAccounting
 
 	node.DebugLB = option.Config.Opts.IsEnabled(option.DebugLB)
+	node.EnableDropNotify = option.Config.Opts.IsEnabled(option.DropNotify)
 
 	node.HashInit4Seed = lnc.MaglevConfig.SeedJhash0
 	node.HashInit6Seed = lnc.MaglevConfig.SeedJhash1
@@ -102,6 +168,8 @@ func NodeConfig(lnc *Config) Node {
 	node.EnableBPFHostRouting = !option.Config.UnsafeDaemonConfigOption.EnableHostLegacyRouting
 
 	node.EncryptionStrictIngress = option.Config.EnableEncryptionStrictModeIngress
+
+	node.EnableSCTP = option.Config.EnableSCTP
 
 	return node
 }

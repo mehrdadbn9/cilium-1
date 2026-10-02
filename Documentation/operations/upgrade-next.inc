@@ -10,12 +10,37 @@ If you are using the following features in your environment, then you may need
 to take action because of changes to the behavior of these features. Read the
 notes carefully below to understand what to do during upgrade.
 
-* TODO
+* The ``clustermesh.apiserver.tls.authMode`` option is now set by default to
+  ``cluster``. If you are using ``clustermesh.useAPIServer=true`` and
+  ``clustermesh.apiserver.tls.auto.enabled=false``, you should replace the remote
+  certificate in each cluster with a ``remote-<cluster-name>`` Common Name
+  instead of ``remote`` or set ``clustermesh.apiserver.tls.authMode`` back to
+  ``migration`` or ``legacy``. If you have a different configuration, you are
+  not expected to take any action and the transition to
+  ``clustermesh.apiserver.tls.authMode=cluster`` should be fully transparent for you.
+* Cilium mutual authentication support has been removed after deprecation. If
+  you use mutual authentication, remove that configuration before upgrading.
+  Consider using :ref:`encryption_ztunnel` instead.
 
 Informational Notes
 ~~~~~~~~~~~~~~~~~~~
 
-* TODO
+* Annotations in the ``cec.cilium.io/*`` namespace supplied through Gateway or
+  GAMMA infrastructure metadata are no longer propagated to internally
+  generated ``CiliumEnvoyConfig`` resources. They remain on generated Services,
+  where they have no effect, to preserve Gateway API infrastructure metadata
+  propagation. This prevents user-controlled infrastructure metadata from
+  changing proxy and policy behavior.
+* The ``cilium-dbg preflight migrate-identity`` utility is deprecated and scheduled
+  for removal in a subsequent release. Refer to :ref:`kvstore_to_crd_migration` for
+  information on how to leverage the "Double Write" identity allocation mode to
+  migrate from KVStore to CRD identity allocation mode.
+
+* Local EndpointSlices mirrored for MCS-API Services may be recreated during
+  upgrade, briefly interrupting access to backends from this cluster. This only
+  affects EndpointSlice names longer than 40 characters after removing the
+  Service name prefix. EndpointSlices generated from Pods by the
+  kube-controller-manager are unaffected.
 
 Changes to Features
 ~~~~~~~~~~~~~~~~~~~
@@ -25,7 +50,20 @@ New Options
 
 The following options have been introduced in this version of Cilium:
 
-* TODO
+* The Prometheus container port names can now be configured via the Helm values
+  ``prometheus.portName``, ``operator.prometheus.portName``,
+  ``envoy.prometheus.portName``, ``hubble.metrics.portName``,
+  ``hubble.relay.prometheus.portName``,
+  ``clustermesh.apiserver.metrics.portName``,
+  ``clustermesh.apiserver.metrics.kvstoremesh.portName``, and
+  ``clustermesh.apiserver.metrics.etcd.portName``. These default to their existing
+  names and support custom scrape configurations that require specific named
+  ports.
+* ``CiliumPodIPPool`` gained the ``spec.ipv4.pool`` and ``spec.ipv6.pool``
+  fields, which carry per-CIDR configuration. Each entry references a CIDR from
+  ``cidrs`` and may set ``reservedRanges`` to exclude IP ranges from allocation.
+  These fields are only available in ``cilium.io/v2``. See
+  :ref:`update_existing_ciliumpodippools_with_reservedranges`.
 
 Changed Options
 ###############
@@ -46,6 +84,14 @@ you may need to take action to migrate to an alternative.
   compatible with WireGuard, is deprecated and will be removed in v1.22. Please
   reach out if you are interested to maintain this feature.
 
+* The ``cilium.io/v2alpha1`` API version of ``CiliumPodIPPool`` is deprecated
+  and will be removed in a future release. ``cilium.io/v2`` is now the storage
+  version. Update existing manifests or tooling that references
+  ``cilium.io/v2alpha1`` to use ``cilium.io/v2`` instead.
+
+* The agent option ``--fixed-identity-mapping`` is deprecated and will be removed
+  in a future release.
+
 Removed Options
 ###############
 
@@ -63,6 +109,9 @@ from Cilium.
   you passed ``--aws-use-primary-address`` directly on the operator, set
   ``eni.nodeSpec.usePrimaryAddress=true`` (equivalently, the
   ``--eni-use-primary-address`` agent flag) instead to retain the same behavior.
+* The previously deprecated ``clustermesh.apiserver.kvstoremesh.enabled`` helm
+  value has been removed, and KVStoreMesh is now unconditionally enabled when the
+  clustermesh-apiserver is enabled.
 
 Changes to Metrics
 ~~~~~~~~~~~~~~~~~~

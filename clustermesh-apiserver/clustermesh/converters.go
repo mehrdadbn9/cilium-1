@@ -181,9 +181,7 @@ func (nc *CiliumNodeConverter) Convert(event resource.Event[*cilium_api_v2.Ciliu
 		return noneIter[store.Key], singleIter[store.NamedKey](&node)
 	}
 
-	node := k8s.ParseCiliumNode(event.Object)
-	node.Cluster = nc.cinfo.Name
-	node.ClusterID = nc.cinfo.ID
+	node := k8s.ParseCiliumNode(event.Object, nc.cinfo)
 	return singleIter[store.Key](&node), noneIter[store.NamedKey]
 }
 
@@ -267,6 +265,7 @@ func ciliumEndpointMapper(endpoint *types.CiliumEndpoint) iter.Seq[store.Key] {
 						HostIP:            net.ParseIP(n.NodeIP),
 						K8sNamespace:      endpoint.Namespace,
 						K8sPodName:        endpoint.Name,
+						K8sPodUID:         endpoint.GetPodUID(),
 						K8sServiceAccount: endpoint.ServiceAccount,
 						NamedPorts:        namedPortsToIPIdentity(endpoint.NamedPorts),
 					}
@@ -317,6 +316,7 @@ func ciliumEndpointSliceMapper(endpointslice *cilium_api_v2a1.CiliumEndpointSlic
 							HostIP:            net.ParseIP(n.NodeIP),
 							K8sNamespace:      endpointslice.Namespace,
 							K8sPodName:        endpoint.Name,
+							K8sPodUID:         endpoint.PodUID,
 							ID:                identity.NumericIdentity(endpoint.IdentityID),
 							Key:               uint8(endpoint.Encryption.Key),
 							K8sServiceAccount: endpoint.ServiceAccount,

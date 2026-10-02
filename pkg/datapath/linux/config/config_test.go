@@ -11,7 +11,6 @@ import (
 	"io"
 	"net/netip"
 	"testing"
-	"time"
 
 	"github.com/cilium/ebpf/rlimit"
 	"github.com/cilium/hive/cell"
@@ -20,8 +19,6 @@ import (
 	"github.com/stretchr/testify/require"
 	"github.com/vishvananda/netlink"
 
-	"github.com/cilium/cilium/pkg/byteorder"
-	"github.com/cilium/cilium/pkg/cidr"
 	"github.com/cilium/cilium/pkg/datapath/config"
 	dpdef "github.com/cilium/cilium/pkg/datapath/linux/config/defines"
 	fakeipsec "github.com/cilium/cilium/pkg/datapath/linux/ipsec/fake"
@@ -47,7 +44,6 @@ var (
 		NodeIPv6:            ipv6DummyAddr,
 		CiliumInternalIPv4:  ipv4DummyAddr,
 		CiliumInternalIPv6:  ipv6DummyAddr,
-		AllocCIDRIPv4:       cidr.MustParseCIDR("10.147.0.0/16"),
 		ServiceLoopbackIPv4: ipv4DummyAddr,
 		ServiceLoopbackIPv6: ipv6DummyAddr,
 		Devices:             []*tables.Device{},
@@ -184,108 +180,6 @@ func TestPrivilegedWriteNetdevConfig(t *testing.T) {
 	})
 }
 
-func createMainLink(name string, t *testing.T) *netlink.Dummy {
-	link := &netlink.Dummy{
-		LinkAttrs: netlink.LinkAttrs{
-			Name: name,
-		},
-	}
-	err := netlink.LinkAdd(link)
-	require.NoError(t, err)
-
-	return link
-}
-
-func createVlanLink(vlanId int, mainLink *netlink.Dummy, t *testing.T) *netlink.Vlan {
-	link := &netlink.Vlan{
-		LinkAttrs: netlink.LinkAttrs{
-			Name:        fmt.Sprintf("%s.%d", mainLink.Name, vlanId),
-			ParentIndex: mainLink.Index,
-		},
-		VlanProtocol: netlink.VLAN_PROTOCOL_8021Q,
-		VlanId:       vlanId,
-	}
-	err := netlink.LinkAdd(link)
-	require.NoError(t, err)
-
-	return link
-}
-
-func TestPrivilegedVLANBypassConfig(t *testing.T) {
-	setupConfigSuite(t)
-
-	var devs []*tables.Device
-
-	main1 := createMainLink("dummy0", t)
-	devs = append(devs, &tables.Device{Name: main1.Name, Index: main1.Index})
-	defer func() {
-		netlink.LinkDel(main1)
-	}()
-
-	// Define set of vlans which we want to allow.
-	allow := map[int]bool{
-		4000: true,
-		4001: true,
-		4003: true,
-	}
-
-	for i := 4000; i < 4003; i++ {
-		vlan := createVlanLink(i, main1, t)
-		if allow[i] {
-			devs = append(devs, &tables.Device{Index: vlan.Index, Name: vlan.Name})
-		}
-		defer func() {
-			netlink.LinkDel(vlan)
-		}()
-	}
-
-	main2 := createMainLink("dummy1", t)
-	devs = append(devs, &tables.Device{Name: main2.Name, Index: main2.Index})
-	defer func() {
-		netlink.LinkDel(main2)
-	}()
-
-	for i := 4003; i < 4006; i++ {
-		vlan := createVlanLink(i, main2, t)
-		if allow[i] {
-			devs = append(devs, &tables.Device{Index: vlan.Index, Name: vlan.Name})
-		}
-		defer func() {
-			netlink.LinkDel(vlan)
-		}()
-	}
-
-	option.Config.VLANBPFBypass = []int{4004}
-	m, err := vlanFilterMacros(devs)
-	require.NoError(t, err)
-	require.Equal(t, fmt.Sprintf(`switch (ifindex) { \
-case %d: \
-switch (vlan_id) { \
-case 4000: \
-case 4001: \
-return true; \
-} \
-break; \
-case %d: \
-switch (vlan_id) { \
-case 4003: \
-case 4004: \
-return true; \
-} \
-break; \
-} \
-return false;`, main1.Index, main2.Index), m)
-
-	option.Config.VLANBPFBypass = []int{4002, 4004, 4005}
-	_, err = vlanFilterMacros(devs)
-	require.Error(t, err)
-
-	option.Config.VLANBPFBypass = []int{0}
-	m, err = vlanFilterMacros(devs)
-	require.NoError(t, err)
-	require.Equal(t, "return true", m)
-}
-
 func TestPrivilegedWriteNodeConfigExtraDefines(t *testing.T) {
 	testutils.PrivilegedTest(t)
 	ns := netns.NewNetNS(t)
@@ -369,86 +263,6 @@ func TestPrivilegedWriteNodeConfigExtraDefines(t *testing.T) {
 	require.NoError(t, err)
 }
 
-func TestPreferredIPv4Address(t *testing.T) {
-	// Verify that the v4 address is picked over the v6 one. Ordering is
-	// already covered by tables.TestSortedAddresses.
-	devices := []tables.DeviceAddress{
-		{Addr: netip.MustParseAddr("2600:1900:4001:2a1:0:2::")},
-		{Addr: netip.MustParseAddr("10.0.0.1")},
-	}
-	require.Equal(t, byteorder.NetIPAddrToHost32(netip.MustParseAddr("10.0.0.1")), preferredIPv4Address(devices))
-}
-
-func TestPreferredIPv6Address(t *testing.T) {
-	testCases := []struct {
-		name    string
-		devices []tables.DeviceAddress
-		want    netip.Addr
-	}{
-		{
-			name: "link_local_only",
-			devices: []tables.DeviceAddress{
-				{
-					Addr: netip.MustParseAddr("fe80::4001:aff:fe35:a805"),
-				},
-			},
-			want: netip.MustParseAddr("fe80::4001:aff:fe35:a805"),
-		},
-		{
-			name: "global_only",
-			devices: []tables.DeviceAddress{
-				{
-					Addr: netip.MustParseAddr("2600:1900:4001:2a1:0:2::"),
-				},
-			},
-			want: netip.MustParseAddr("2600:1900:4001:2a1:0:2::"),
-		},
-		{
-			name: "local_first",
-			devices: []tables.DeviceAddress{
-				{
-					Addr: netip.MustParseAddr("fe80::4001:aff:fe35:a805"),
-				},
-				{
-					Addr: netip.MustParseAddr("2600:1900:4001:2a1:0:2::"),
-				},
-			},
-			want: netip.MustParseAddr("2600:1900:4001:2a1:0:2::"),
-		},
-		{
-			name: "global_first",
-			devices: []tables.DeviceAddress{
-				{
-					Addr: netip.MustParseAddr("2600:1900:4001:2a1:0:2::"),
-				},
-				{
-					Addr: netip.MustParseAddr("fe80::4001:aff:fe35:a805"),
-				},
-			},
-			want: netip.MustParseAddr("2600:1900:4001:2a1:0:2::"),
-		},
-		{
-			name: "select_first_global",
-			devices: []tables.DeviceAddress{
-				{
-					Addr: netip.MustParseAddr("2600:1900:4001:2a1:0:2::"),
-				},
-				{
-					Addr: netip.MustParseAddr("2600:1900:4001:2a1:0:3::"),
-				},
-			},
-			want: netip.MustParseAddr("2600:1900:4001:2a1:0:2::"),
-		},
-	}
-	for _, tc := range testCases {
-		t.Run(tc.name, func(t *testing.T) {
-			if got := preferredIPv6Address(tc.devices); got != tc.want {
-				t.Errorf("preferredIPv6Address() mismatch, got %s want %s", got, tc.want)
-			}
-		})
-	}
-}
-
 func TestPrivilegedNewHeaderfileWriter(t *testing.T) {
 	testutils.PrivilegedTest(t)
 	ns := netns.NewNetNS(t)
@@ -505,69 +319,6 @@ func writeNodeConfigToBuffer(t *testing.T, nodeCfg *config.Config) string {
 	var buffer bytes.Buffer
 	require.NoError(t, cfg.WriteNodeConfig(&buffer, nodeCfg))
 	return buffer.String()
-}
-
-// TestPrivilegedWriteNodeConfigMonitorAggregation verifies that the monitor
-// aggregation configuration options (MonitorAggregationInterval and
-// MonitorAggregationFlags) are correctly propagated to BPF defines
-// (CT_REPORT_INTERVAL and CT_REPORT_FLAGS).
-// This covers the MonitorAggregation scenarios previously tested by
-// K8sDatapathConfig.
-func TestPrivilegedWriteNodeConfigMonitorAggregation(t *testing.T) {
-	testutils.PrivilegedTest(t)
-	ns := netns.NewNetNS(t)
-	setupCiliumDummyDevices(t, ns)
-	err := ns.Do(func() error {
-		setupConfigSuite(t)
-
-		origInterval := option.Config.MonitorAggregationInterval
-		origFlags := option.Config.MonitorAggregationFlags
-		t.Cleanup(func() {
-			option.Config.MonitorAggregationInterval = origInterval
-			option.Config.MonitorAggregationFlags = origFlags
-		})
-
-		t.Run("medium aggregation with SYN flag", func(t *testing.T) {
-			// bpf.monitorAggregation=medium, bpf.monitorInterval=60s,
-			// bpf.monitorFlags=syn (TCP SYN = 0x02)
-			option.Config.MonitorAggregationInterval = 60 * time.Second
-			option.Config.MonitorAggregationFlags = 0x02 // SYN flag
-
-			output := writeNodeConfigToBuffer(t, &dummyNodeCfg)
-			require.Contains(t, output, "define CT_REPORT_INTERVAL 60\n",
-				"Expected 60s monitor aggregation interval")
-			require.Contains(t, output, "define CT_REPORT_FLAGS 0x0002\n",
-				"Expected SYN flag (0x0002) in monitor aggregation flags")
-		})
-
-		t.Run("medium aggregation with PSH flag", func(t *testing.T) {
-			// bpf.monitorAggregation=medium, bpf.monitorInterval=60s,
-			// bpf.monitorFlags=psh (TCP PSH = 0x08)
-			option.Config.MonitorAggregationInterval = 60 * time.Second
-			option.Config.MonitorAggregationFlags = 0x08 // PSH flag
-
-			output := writeNodeConfigToBuffer(t, &dummyNodeCfg)
-			require.Contains(t, output, "define CT_REPORT_INTERVAL 60\n",
-				"Expected 60s monitor aggregation interval")
-			require.Contains(t, output, "define CT_REPORT_FLAGS 0x0008\n",
-				"Expected PSH flag (0x0008) in monitor aggregation flags")
-		})
-
-		t.Run("no aggregation", func(t *testing.T) {
-			// monitorAggregation=none => interval=0, flags=0
-			option.Config.MonitorAggregationInterval = 0
-			option.Config.MonitorAggregationFlags = 0
-
-			output := writeNodeConfigToBuffer(t, &dummyNodeCfg)
-			require.Contains(t, output, "define CT_REPORT_INTERVAL 0\n",
-				"Expected 0 interval with no aggregation")
-			require.Contains(t, output, "define CT_REPORT_FLAGS 0x0000\n",
-				"Expected 0x0000 flags with no aggregation")
-		})
-
-		return nil
-	})
-	require.NoError(t, err)
 }
 
 // TestPrivilegedWriteNodeConfigHostFirewall verifies that with host firewall
@@ -649,8 +400,8 @@ func TestPrivilegedWriteNodeConfigIPv4Only(t *testing.T) {
 }
 
 // TestPrivilegedWriteNodeConfigBPFMasquerade verifies that when BPF masquerade
-// is enabled, the correct ENABLE_MASQUERADE_IPV4, ENABLE_IP_MASQ_AGENT_IPV4,
-// and SNAT exclusion CIDR defines are generated.
+// is enabled, the correct ENABLE_MASQUERADE_IPV4 and
+// ENABLE_IP_MASQ_AGENT_IPV4 defines are generated.
 // This covers the BPF masquerading with ip-masq-agent scenarios previously
 // tested by K8sDatapathConfig.
 func TestPrivilegedWriteNodeConfigBPFMasquerade(t *testing.T) {
@@ -678,7 +429,7 @@ func TestPrivilegedWriteNodeConfigBPFMasquerade(t *testing.T) {
 			option.Config.EnableIPv4Masquerade = true
 			option.Config.EnableIPv6Masquerade = false
 			option.Config.EnableIPMasqAgent = true
-			option.Config.IPv4NativeRoutingCIDR = cidr.MustParseCIDR("10.0.0.0/8")
+			option.Config.IPv4NativeRoutingCIDR = netip.MustParsePrefix("10.0.0.0/8")
 
 			output := writeNodeConfigToBuffer(t, &dummyNodeCfg)
 			require.Contains(t, output, "define ENABLE_MASQUERADE_IPV4 1\n",
@@ -696,7 +447,7 @@ func TestPrivilegedWriteNodeConfigBPFMasquerade(t *testing.T) {
 			option.Config.EnableIPMasqAgent = false
 
 			nodeCfg := dummyNodeCfg
-			nodeCfg.NativeRoutingCIDRIPv4 = cidr.MustParseCIDR("10.0.0.0/8")
+			nodeCfg.NativeRoutingCIDRIPv4 = netip.MustParsePrefix("10.0.0.0/8")
 
 			output := writeNodeConfigToBuffer(t, &nodeCfg)
 			require.Contains(t, output, "define ENABLE_MASQUERADE_IPV4 1\n",

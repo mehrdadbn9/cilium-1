@@ -40,7 +40,7 @@ func (ini *localNodeSynchronizer) retrieveNodeInformation(ctx context.Context) *
 				break
 			}
 			if event.Kind == resource.Upsert {
-				no := k8s.ParseCiliumNode(event.Object)
+				no := k8s.ParseCiliumNode(event.Object, ini.ClusterInfo)
 				n = &no
 				ini.Logger.Info("Retrieved node information from cilium node", logfields.NodeName, n.Name)
 				if err := waitForCIDR(); err != nil {
@@ -59,7 +59,7 @@ func (ini *localNodeSynchronizer) retrieveNodeInformation(ctx context.Context) *
 				break
 			}
 			if event.Kind == resource.Upsert {
-				n = k8s.ParseNode(ini.Logger, event.Object, source.Unspec)
+				n = k8s.ParseNode(ini.Logger, event.Object, source.Unspec, ini.ClusterInfo)
 				ini.Logger.Info("Retrieved node information from kubernetes node", logfields.NodeName, n.Name)
 				if err := waitForCIDR(); err != nil {
 					ini.Logger.Warn("Waiting for k8s node information", logfields.Error, err)
@@ -123,7 +123,7 @@ func (ini *localNodeSynchronizer) WaitForNodeInformation(ctx context.Context, st
 			logfields.K8sNodeIP, k8sNodeIP,
 		)
 
-		if option.Config.EnableIPv6 && nodeIP6 == nil {
+		if option.Config.EnableIPv6 && !nodeIP6.IsValid() {
 			ini.Logger.Warn("IPv6 is enabled, but Cilium cannot find the IPv6 address for this node. " +
 				"This may cause connectivity disruption for Endpoints that attempt to communicate using IPv6")
 		}

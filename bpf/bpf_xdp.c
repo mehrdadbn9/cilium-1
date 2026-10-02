@@ -13,7 +13,8 @@
 #define IS_BPF_XDP 1
 
 /* WORLD_IPV{4,6}_ID varies based on dualstack being enabled. Real values are
- * written into node_config.h at runtime. */
+ * written into node_config.h at runtime.
+ */
 #define SECLABEL WORLD_ID
 #define SECLABEL_IPV4 WORLD_IPV4_ID
 #define SECLABEL_IPV6 WORLD_IPV6_ID
@@ -32,11 +33,6 @@
 /* Controls the inclusion of the CILIUM_CALL_SRV6 section in the object file.
  */
 #define SKIP_SRV6_HANDLING
-
-/* The XDP datapath does not take care of health probes from the local node,
- * thus do not compile it in.
- */
-#undef ENABLE_HEALTH_CHECK
 
 #define	NODEPORT_USE_NAT_46x64		1
 

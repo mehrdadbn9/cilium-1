@@ -242,7 +242,7 @@ func (n *Node) ResyncInterfacesAndIPs(ctx context.Context, scopedLog *slog.Logge
 			}
 
 			for _, ip := range e.PrivateIPSets {
-				available[ip.PrivateIpAddress.String()] = ipamTypes.AllocationIP{Resource: e.NetworkInterfaceID}
+				available[ip.PrivateIpAddress] = ipamTypes.AllocationIP{Resource: e.NetworkInterfaceID}
 			}
 			return nil
 		})
@@ -318,9 +318,9 @@ func (n *Node) AllocateIPs(ctx context.Context, a *nodemanager.AllocationAction)
 	return err
 }
 
-func (n *Node) AllocateStaticIP(ctx context.Context, staticIPTags ipamTypes.Tags) (string, error) {
+func (n *Node) AllocateStaticIP(ctx context.Context, staticIPTags ipamTypes.Tags) (netip.Addr, error) {
 	// TODO, see https://github.com/cilium/cilium/issues/34094
-	return "", fmt.Errorf("not implemented")
+	return netip.Addr{}, fmt.Errorf("not implemented")
 }
 
 // PrepareIPRelease prepares the release of ENI IPs.
@@ -350,7 +350,7 @@ func (n *Node) PrepareIPRelease(excessIPs int, scopedLog *slog.Logger) *nodemana
 			if ip.Primary {
 				continue
 			}
-			_, ipUsed := n.k8sObj.Status.IPAM.Used[ip.PrivateIpAddress.String()]
+			_, ipUsed := n.k8sObj.Status.IPAM.Used[ip.PrivateIpAddress]
 			if !ipUsed {
 				freeIpsOnENI = append(freeIpsOnENI, ip.PrivateIpAddress.String())
 			}

@@ -55,7 +55,7 @@ func TestL4Policy(t *testing.T) {
 	}
 
 	// Transform to PolicyEntries and set priority level to 0.5
-	require.NoError(t, rule1.Sanitize())
+	require.NoError(t, rule1.ValidateAndSanitize())
 	entries := utils.RulesToPolicyEntries(api.Rules{rule1})
 	require.Len(t, entries, 2)
 	for i := range entries {
@@ -533,7 +533,7 @@ func TestRuleWithNoEndpointSelector(t *testing.T) {
 		},
 	}
 
-	err := apiRule1.Sanitize()
+	err := apiRule1.ValidateAndSanitize()
 	require.Error(t, err)
 }
 
@@ -570,7 +570,7 @@ func TestL3Policy(t *testing.T) {
 		},
 	}
 
-	err := apiRule1.Sanitize()
+	err := apiRule1.ValidateAndSanitize()
 	require.NoError(t, err)
 
 	// Must be parsable, make sure Validate fails when not.
@@ -581,7 +581,7 @@ func TestL3Policy(t *testing.T) {
 				FromCIDR: []api.CIDR{"10.0.1..0/24"},
 			},
 		}},
-	}).Sanitize()
+	}).Validate()
 	require.Error(t, err)
 
 	// Test CIDRRule with no provided CIDR or ExceptionCIDR.
@@ -593,7 +593,7 @@ func TestL3Policy(t *testing.T) {
 				FromCIDRSet: []api.CIDRRule{{Cidr: "", ExceptCIDRs: nil}},
 			},
 		}},
-	}).Sanitize()
+	}).Validate()
 	require.Error(t, err)
 
 	// Test CIDRRule with only CIDR provided; should not fail, as ExceptionCIDR
@@ -605,7 +605,7 @@ func TestL3Policy(t *testing.T) {
 				FromCIDRSet: []api.CIDRRule{{Cidr: "10.0.1.0/24", ExceptCIDRs: nil}},
 			},
 		}},
-	}).Sanitize()
+	}).Validate()
 	require.NoError(t, err)
 
 	// Cannot provide just an IP to a CIDRRule; Cidr must be of format
@@ -617,7 +617,7 @@ func TestL3Policy(t *testing.T) {
 				FromCIDRSet: []api.CIDRRule{{Cidr: "10.0.1.32", ExceptCIDRs: nil}},
 			},
 		}},
-	}).Sanitize()
+	}).Validate()
 	require.Error(t, err)
 
 	// Cannot exclude a range that is not part of the CIDR.
@@ -628,7 +628,7 @@ func TestL3Policy(t *testing.T) {
 				FromCIDRSet: []api.CIDRRule{{Cidr: "10.0.0.0/10", ExceptCIDRs: []api.CIDR{"10.64.0.0/11"}}},
 			},
 		}},
-	}).Sanitize()
+	}).Validate()
 	require.Error(t, err)
 
 	// Must have a contiguous mask, make sure Validate fails when not.
@@ -639,7 +639,7 @@ func TestL3Policy(t *testing.T) {
 				FromCIDR: []api.CIDR{"10.0.1.0/128.0.0.128"},
 			},
 		}},
-	}).Sanitize()
+	}).Validate()
 	require.Error(t, err)
 
 	// Prefix length must be in range for the address, make sure
@@ -651,7 +651,7 @@ func TestL3Policy(t *testing.T) {
 				FromCIDR: []api.CIDR{"10.0.1.0/34"},
 			},
 		}},
-	}).Sanitize()
+	}).Validate()
 	require.Error(t, err)
 }
 
@@ -1023,7 +1023,7 @@ func TestEgressRuleRestrictions(t *testing.T) {
 		},
 	}
 
-	err := apiRule1.Sanitize()
+	err := apiRule1.Validate()
 	require.Error(t, err)
 }
 
@@ -1038,15 +1038,15 @@ func TestPolicyEntityValidationEgress(t *testing.T) {
 			},
 		},
 	}
-	require.NoError(t, r.Sanitize())
+	require.NoError(t, r.ValidateAndSanitize())
 	require.Len(t, r.Egress[0].ToEntities, 1)
 
 	r.Egress[0].ToEntities = []api.Entity{api.EntityHost}
-	require.NoError(t, r.Sanitize())
+	require.NoError(t, r.ValidateAndSanitize())
 	require.Len(t, r.Egress[0].ToEntities, 1)
 
 	r.Egress[0].ToEntities = []api.Entity{"trololo"}
-	require.Error(t, r.Sanitize())
+	require.Error(t, r.ValidateAndSanitize())
 }
 
 func TestPolicyEntityValidationIngress(t *testing.T) {
@@ -1060,15 +1060,15 @@ func TestPolicyEntityValidationIngress(t *testing.T) {
 			},
 		},
 	}
-	require.NoError(t, r.Sanitize())
+	require.NoError(t, r.ValidateAndSanitize())
 	require.Len(t, r.Ingress[0].FromEntities, 1)
 
 	r.Ingress[0].FromEntities = []api.Entity{api.EntityHost}
-	require.NoError(t, r.Sanitize())
+	require.NoError(t, r.ValidateAndSanitize())
 	require.Len(t, r.Ingress[0].FromEntities, 1)
 
 	r.Ingress[0].FromEntities = []api.Entity{"trololo"}
-	require.Error(t, r.Sanitize())
+	require.Error(t, r.ValidateAndSanitize())
 }
 
 func TestPolicyEntityValidationEntitySelectorsFill(t *testing.T) {
@@ -1089,7 +1089,7 @@ func TestPolicyEntityValidationEntitySelectorsFill(t *testing.T) {
 			},
 		},
 	}
-	require.NoError(t, r.Sanitize())
+	require.NoError(t, r.ValidateAndSanitize())
 	require.Len(t, r.Ingress[0].FromEntities, 2)
 	require.Len(t, r.Egress[0].ToEntities, 2)
 }
@@ -1213,7 +1213,7 @@ func TestL3RuleLabels(t *testing.T) {
 
 						matches = false
 						for sel := range filter.PerSelectorPolicies {
-							cidrLabels := labels.ParseLabelArray("cidr:"+cidr, "reserved:world")
+							cidrLabels := labels.ParseLabels("cidr:"+cidr, "reserved:world")
 							t.Logf("Testing %+v", cidrLabels)
 							cidr, ok := sel.(*identitySelector).source.(*types.CIDRSelector)
 							if ok {
@@ -1451,6 +1451,83 @@ func TestRuleLog(t *testing.T) {
 
 }
 
+// TestRuleLogSpecificAndAggregateEntries checks that a flow that is allowed by both a rule
+// selecting the remote endpoint and a rule selecting all endpoints, but with different L4 matches,
+// is attributed to the rule of the policy map entry that the bpf datapath selects: the one with the
+// more specific L4 match.
+func TestRuleLogSpecificAndAggregateEntries(t *testing.T) {
+	flowAToB90 := types.Flow{From: idA, To: idB, Proto: u8proto.TCP, Dport: 90}
+
+	egressRule := func(to api.EndpointSelector, port string, log string) *api.Rule {
+		rule := &api.Rule{
+			EndpointSelector: endpointSelectorA,
+			Egress: []api.EgressRule{{
+				EgressCommonRule: api.EgressCommonRule{
+					ToEndpoints: []api.EndpointSelector{to},
+				},
+			}},
+			Log: api.LogConfig{Value: log},
+		}
+		if port != "" {
+			rule.Egress[0].ToPorts = api.PortRules{{
+				Ports: []api.PortProtocol{{Port: port, Protocol: api.ProtoTCP}},
+			}}
+		}
+		return rule
+	}
+
+	type check struct {
+		flow    types.Flow
+		wantLog []string
+	}
+	tests := []struct {
+		name   string
+		rules  api.Rules
+		checks []check
+	}{
+		{
+			// Entries: (b, ANY) and (aggregate, TCP/80)
+			name: "rule selecting all endpoints has the more specific L4",
+			rules: api.Rules{
+				egressRule(endpointSelectorB, "", "b-any-port"),
+				egressRule(api.WildcardEndpointSelector, "80", "all-tcp-80"),
+			},
+			checks: []check{
+				{flowAToB, []string{"all-tcp-80"}},
+				{flowAToB90, []string{"b-any-port"}},
+				{flowAToC, []string{"all-tcp-80"}},
+			},
+		},
+		{
+			// Entries: (b, TCP/80) and (aggregate, ANY)
+			name: "rule selecting the remote endpoint has the more specific L4",
+			rules: api.Rules{
+				egressRule(endpointSelectorB, "80", "b-tcp-80"),
+				egressRule(api.WildcardEndpointSelector, "", "all-any-port"),
+			},
+			checks: []check{
+				{flowAToB, []string{"b-tcp-80"}},
+				{flowAToB90, []string{"all-any-port"}},
+				{flowAToC, []string{"all-any-port"}},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			td := newTestData(t, hivetest.Logger(t)).withIDs(ruleTestIDs)
+			td.repo.MustAddList(tt.rules)
+
+			for _, c := range tt.checks {
+				verdict, egress, _, err := LookupFlow(td.repo.logger, td.repo, td.identityManager, c.flow)
+				require.NoError(t, err)
+				require.True(t, verdict.Allowed(), "flow %d -> %d port %d", c.flow.From.ID, c.flow.To.ID, c.flow.Dport)
+				require.Equal(t, c.wantLog, egress.Log(), "flow %d -> %d port %d", c.flow.From.ID, c.flow.To.ID, c.flow.Dport)
+			}
+		})
+	}
+}
+
 var (
 	labelsA = labels.LabelArray{
 		labels.NewLabel("id", "a", labels.LabelSourceK8s),
@@ -1487,9 +1564,9 @@ var (
 	flowAToWorld90 = types.Flow{From: idA, To: identity.LookupReservedIdentity(identity.ReservedIdentityWorld), Proto: u8proto.TCP, Dport: 90}
 
 	ruleTestIDs = identity.IdentityMap{
-		idA.ID: idA.LabelArray,
-		idB.ID: idB.LabelArray,
-		idC.ID: idC.LabelArray,
+		idA.ID: idA.Labels,
+		idB.ID: idB.Labels,
+		idC.ID: idC.Labels,
 	}
 
 	defaultDenyIngress = &types.PolicyEntry{

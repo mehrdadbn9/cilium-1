@@ -7,7 +7,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"reflect"
 	"strconv"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -25,18 +24,12 @@ type nodeAnnotation = map[string]string
 var nodeAnnotationControllerGroup = controller.NewGroup("update-k8s-node-annotations")
 
 func (n *NodeDiscovery) prepareNodeAnnotations(localNode nodeTypes.Node) nodeAnnotation {
-	annotationMap := map[string]fmt.Stringer{
-		annotation.V4IngressName:  localNode.IPv4IngressIP,
-		annotation.V6IngressName:  localNode.IPv6IngressIP,
-		annotation.CiliumHostIP:   localNode.GetCiliumInternalIP(false),
-		annotation.CiliumHostIPv6: localNode.GetCiliumInternalIP(true),
-	}
-
 	annotations := map[string]string{}
-	for k, v := range annotationMap {
-		if !reflect.ValueOf(v).IsNil() {
-			annotations[k] = v.String()
-		}
+	if ip := localNode.GetCiliumInternalIPv4(); ip.IsValid() {
+		annotations[annotation.CiliumHostIP] = ip.String()
+	}
+	if ip := localNode.GetCiliumInternalIPv6(); ip.IsValid() {
+		annotations[annotation.CiliumHostIPv6] = ip.String()
 	}
 	if localNode.IPv4AllocCIDR.IsValid() {
 		annotations[annotation.V4CIDRName] = localNode.IPv4AllocCIDR.String()
@@ -49,6 +42,12 @@ func (n *NodeDiscovery) prepareNodeAnnotations(localNode nodeTypes.Node) nodeAnn
 	}
 	if localNode.IPv6HealthIP.IsValid() {
 		annotations[annotation.V6HealthName] = localNode.IPv6HealthIP.String()
+	}
+	if localNode.IPv4IngressIP.IsValid() {
+		annotations[annotation.V4IngressName] = localNode.IPv4IngressIP.String()
+	}
+	if localNode.IPv6IngressIP.IsValid() {
+		annotations[annotation.V6IngressName] = localNode.IPv6IngressIP.String()
 	}
 	if localNode.EncryptionKey != 0 {
 		annotations[annotation.CiliumEncryptionKey] = strconv.FormatUint(uint64(localNode.EncryptionKey), 10)
@@ -97,8 +96,8 @@ func (n *NodeDiscovery) annotateK8sNode(ctx context.Context, cs kubernetes.Inter
 		logfields.V6HealthIP, localNode.IPv6HealthIP,
 		logfields.V4IngressIP, localNode.IPv4IngressIP,
 		logfields.V6IngressIP, localNode.IPv6IngressIP,
-		logfields.V4CiliumHostIP, localNode.GetCiliumInternalIP(false),
-		logfields.V6CiliumHostIP, localNode.GetCiliumInternalIP(true),
+		logfields.V4CiliumHostIP, localNode.GetCiliumInternalIPv4(),
+		logfields.V6CiliumHostIP, localNode.GetCiliumInternalIPv6(),
 		logfields.Key, localNode.EncryptionKey,
 	)
 	scopedLog.Info("Annotating k8s Node with node information")

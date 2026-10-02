@@ -16,7 +16,6 @@ import (
 	"github.com/cilium/cilium/pkg/counter"
 	"github.com/cilium/cilium/pkg/identity"
 	"github.com/cilium/cilium/pkg/identity/cache"
-	iputil "github.com/cilium/cilium/pkg/ip"
 	ipcacheTypes "github.com/cilium/cilium/pkg/ipcache/types"
 	"github.com/cilium/cilium/pkg/k8s/synced"
 	"github.com/cilium/cilium/pkg/labels"
@@ -96,6 +95,8 @@ type K8sMetadata struct {
 	Namespace string
 	// PodName is the Kubernetes pod name behind the IP
 	PodName string
+	// PodUID is the Kubernetes pod UID behind the IP
+	PodUID string
 	// NamedPorts is the set of named ports for the pod
 	NamedPorts types.NamedPortMap
 }
@@ -572,7 +573,7 @@ func (ipc *IPCache) UpsertMetadataBatch(updates ...MU) (revision uint64) {
 	prefixes := make([]cmtypes.PrefixCluster, 0, len(updates))
 	ipc.metadata.Lock()
 	for _, upd := range updates {
-		if !upd.IsCIDR || ipc.metadata.prefixRefCounter.Add(upd.Prefix) {
+		if !upd.IsCIDR || ipc.metadata.prefixRefCounter.Add(canonicalPrefix(upd.Prefix)) {
 			resource := upd.Resource
 			if upd.IsCIDR {
 				resource = cidrResourceID
@@ -607,7 +608,7 @@ func (ipc *IPCache) RemoveMetadataBatch(updates ...MU) (revision uint64) {
 	prefixes := make([]cmtypes.PrefixCluster, 0, len(updates))
 	ipc.metadata.Lock()
 	for _, upd := range updates {
-		if !upd.IsCIDR || ipc.metadata.prefixRefCounter.Delete(upd.Prefix) {
+		if !upd.IsCIDR || ipc.metadata.prefixRefCounter.Delete(canonicalPrefix(upd.Prefix)) {
 			resource := upd.Resource
 			if upd.IsCIDR {
 				resource = cidrResourceID
@@ -837,12 +838,14 @@ func (ipc *IPCache) GetNamedPorts() (npm types.NamedPortMultiMap) {
 }
 
 // DeleteOnMetadataMatch removes the provided IP to security identity mapping from the IPCache
-// if the metadata cache holds the same "owner" metadata as the triggering pod event.
-func (ipc *IPCache) DeleteOnMetadataMatch(IP string, source source.Source, namespace, name string) (namedPortsChanged bool) {
+// if its Kubernetes metadata matches the triggering Pod event. The UIDs must match exactly:
+// two empty UIDs retain the legacy behavior, while a missing UID on only one side is treated
+// as a mismatch to avoid deleting an entry that cannot be proven to have the same owner.
+func (ipc *IPCache) DeleteOnMetadataMatch(IP string, source source.Source, namespace, name, uid string) (namedPortsChanged bool) {
 	ipc.mutex.Lock()
 	defer ipc.mutex.Unlock()
 	k8sMeta := ipc.getK8sMetadata(IP)
-	if k8sMeta != nil && k8sMeta.Namespace == namespace && k8sMeta.PodName == name {
+	if k8sMeta != nil && k8sMeta.Namespace == namespace && k8sMeta.PodName == name && k8sMeta.PodUID == uid {
 		return ipc.deleteLocked(IP, source)
 	}
 	return false
@@ -955,15 +958,15 @@ func (ipc *IPCache) LookupByIdentity(id identity.NumericIdentity) (ips []string)
 // LookupByHostRLocked returns the list of IPs returns the set of IPs
 // (endpoint or CIDR prefix) that have hostIPv4 or hostIPv6 associated as the
 // host of the entry. Requires the caller to hold the RLock.
-func (ipc *IPCache) LookupByHostRLocked(hostIPv4, hostIPv6 net.IP) (cidrs []net.IPNet) {
+func (ipc *IPCache) LookupByHostRLocked(hostIPv4, hostIPv6 net.IP) (cidrs []netip.Prefix) {
 	for ip, host := range ipc.ipToHostIPCache {
 		if hostIPv4 != nil && host.IP.Equal(hostIPv4) || hostIPv6 != nil && host.IP.Equal(hostIPv6) {
-			_, cidr, err := net.ParseCIDR(ip)
-			if err != nil {
-				endpointIP := net.ParseIP(ip)
-				cidr = iputil.IPToPrefix(endpointIP)
+			if pc, err := cmtypes.ParsePrefixCluster(ip); err == nil {
+				cidrs = append(cidrs, pc.AsPrefix().Masked())
+			} else if ac, err := cmtypes.ParseAddrCluster(ip); err == nil {
+				addr := ac.Addr()
+				cidrs = append(cidrs, netip.PrefixFrom(addr, addr.BitLen()))
 			}
-			cidrs = append(cidrs, *cidr)
 		}
 	}
 	return cidrs
@@ -985,5 +988,5 @@ func (m *K8sMetadata) Equal(o *K8sMetadata) bool {
 			return false
 		}
 	}
-	return m.Namespace == o.Namespace && m.PodName == o.PodName
+	return m.Namespace == o.Namespace && m.PodName == o.PodName && m.PodUID == o.PodUID
 }

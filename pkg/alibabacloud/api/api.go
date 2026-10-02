@@ -25,6 +25,7 @@ import (
 	iputil "github.com/cilium/cilium/pkg/ip"
 	ipamTypes "github.com/cilium/cilium/pkg/ipam/types"
 	"github.com/cilium/cilium/pkg/logging/logfields"
+	"github.com/cilium/cilium/pkg/mac"
 	cslices "github.com/cilium/cilium/pkg/slices"
 	"github.com/cilium/cilium/pkg/spanstat"
 )
@@ -352,7 +353,6 @@ func (c *Client) CreateNetworkInterface(ctx context.Context, secondaryPrivateIPC
 	}
 	eni := &types.ENI{
 		NetworkInterfaceID: resp.NetworkInterfaceId,
-		MACAddress:         resp.MacAddress,
 		Type:               resp.Type,
 		SecurityGroupIDs:   resp.SecurityGroupIds.SecurityGroupId,
 		VPC: types.VPC{
@@ -374,6 +374,16 @@ func (c *Client) CreateNetworkInterface(ctx context.Context, secondaryPrivateIPC
 		)
 	} else {
 		eni.PrimaryIPAddress = iputil.AddrFrom(addr)
+	}
+	if m, err := mac.ParseMACOrUnset(resp.MacAddress); err != nil {
+		c.logger.Warn(
+			"Ignoring unparseable ENI MAC address",
+			logfields.MACAddr, resp.MacAddress,
+			logfields.Interface, resp.NetworkInterfaceId,
+			logfields.Error, err,
+		)
+	} else {
+		eni.MACAddress = m
 	}
 	return resp.NetworkInterfaceId, eni, nil
 }
@@ -648,8 +658,7 @@ func (c *Client) EcsListTagResources(ctx context.Context, tags map[string]string
 // the AlibabaCloud API server. If no specific status is provided, either "OK" or
 // "Failed" is returned based on the error variable.
 func deriveStatus(err error) string {
-	var respErr httperr.Error
-	if errors.As(err, &respErr) {
+	if respErr, ok := errors.AsType[httperr.Error](err); ok {
 		return respErr.ErrorCode()
 	}
 
@@ -683,7 +692,6 @@ func parseENI(logger *slog.Logger, iface *ecs.NetworkInterfaceSet, vpcs ipamType
 
 	eni = &types.ENI{
 		NetworkInterfaceID: iface.NetworkInterfaceId,
-		MACAddress:         iface.MacAddress,
 		Type:               iface.Type,
 		InstanceID:         iface.InstanceId,
 		SecurityGroupIDs:   iface.SecurityGroupIds.SecurityGroupId,
@@ -706,6 +714,16 @@ func parseENI(logger *slog.Logger, iface *ecs.NetworkInterfaceSet, vpcs ipamType
 		)
 	} else {
 		eni.PrimaryIPAddress = iputil.AddrFrom(addr)
+	}
+	if m, err := mac.ParseMACOrUnset(iface.MacAddress); err != nil {
+		logger.Warn(
+			"Ignoring unparseable ENI MAC address",
+			logfields.MACAddr, iface.MacAddress,
+			logfields.Interface, iface.NetworkInterfaceId,
+			logfields.Error, err,
+		)
+	} else {
+		eni.MACAddress = m
 	}
 	vpc, ok := vpcs[iface.VpcId]
 	if ok {

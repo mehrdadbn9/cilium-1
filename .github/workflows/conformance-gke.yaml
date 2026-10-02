@@ -106,7 +106,7 @@ env:
   clusterName: ${{ github.event.repository.name }}-${{ github.run_id }}-${{ inputs.UID }}-${{ github.run_attempt }}
   USE_GKE_GCLOUD_AUTH_PLUGIN: True
   # renovate: datasource=docker depName=google/cloud-sdk
-  gcloud_version: 578.0.0
+  gcloud_version: 586.0.0
 
 jobs:
   echo-inputs:
@@ -123,7 +123,7 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - name: Set initial commit status
-        uses: cilium/actions/set-commit-status@fe0702f5df0d8e44d48f1baa226c023b73ff6b5e # main
+        uses: cilium/actions/set-commit-status@687b48a0547e534dd7270d5069a5ab7967c0e907 # main
         with:
           sha: ${{ inputs.SHA || github.sha }}
 
@@ -218,7 +218,7 @@ jobs:
 
       - name: Set up gcloud credentials
         id: 'auth'
-        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
+        uses: google-github-actions/auth@12060449e87204eca501a11f2f7f1483024afff0 # v3.0.0 + google-github-actions/auth#532
         with:
           workload_identity_provider: ${{ secrets.GCP_PR_WORKLOAD_IDENTITY_PROVIDER }}
           service_account: ${{ secrets.GCP_PR_SA }}
@@ -291,7 +291,8 @@ jobs:
     needs: [generate-matrix, wait-for-images]
     if: ${{ needs.generate-matrix.outputs.empty == 'false' }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 75
+    # Enough headroom for the cluster creation to fall back to another zone.
+    timeout-minutes: 90
     env:
       job_name: "Installation and Connectivity Test"
     strategy:
@@ -300,7 +301,7 @@ jobs:
 
     steps:
       - name: Set commit status to pending
-        uses: cilium/actions/set-commit-status@fe0702f5df0d8e44d48f1baa226c023b73ff6b5e # main
+        uses: cilium/actions/set-commit-status@687b48a0547e534dd7270d5069a5ab7967c0e907 # main
         with:
           sha: ${{ inputs.SHA || github.sha }}
 
@@ -347,7 +348,10 @@ jobs:
             --wait=false"
 
           if [[ ${{ matrix.config.type }} == "tunnel" ]]; then
-            CILIUM_INSTALL_DEFAULTS+=" --datapath-mode=tunnel"
+            # Keep using GKE's alias-IP PodCIDRs in tunnel mode. Cluster-pool
+            # IPAM allocates unrelated 10.0.x.0/24 ranges which GCE cannot
+            # route from the nodes without Cilium.
+            CILIUM_INSTALL_DEFAULTS+=" --datapath-mode=tunnel --helm-set=ipam.mode=kubernetes"
           fi
 
           if [[ "${{ matrix.config.ipsec }}" == "true" ]]; then
@@ -377,7 +381,7 @@ jobs:
 
       - name: Set up gcloud credentials
         id: 'auth'
-        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
+        uses: google-github-actions/auth@12060449e87204eca501a11f2f7f1483024afff0 # v3.0.0 + google-github-actions/auth#532
         with:
           workload_identity_provider: ${{ secrets.GCP_PR_WORKLOAD_IDENTITY_PROVIDER }}
           service_account: ${{ secrets.GCP_PR_SA }}
@@ -398,12 +402,30 @@ jobs:
         run: |
           gcloud info
 
+      - name: Determine fallback zones
+        id: fallback-zones
+        env:
+          ZONE: ${{ matrix.k8s.zone }}
+        run: |
+          # The other zones of the same region, so that a zone which is out of
+          # capacity does not fail the whole job. Same region only, because
+          # cluster names encode just the config index, so legs of different
+          # k8s versions share a name and must not meet in one zone, and each
+          # version is pinned to its own region.
+          region="${ZONE%-?}"
+          zones=$(gcloud compute zones list --filter="status=UP" --format='value(name)' \
+            | grep "^${region}-" | grep -v "^${ZONE}$" | tr '\n' ' ')
+          echo "Fallback zones for ${ZONE}: ${zones}"
+          echo "zones=${zones}" >> $GITHUB_OUTPUT
+          echo "candidates=${ZONE} ${zones}" >> $GITHUB_OUTPUT
+
       - name: Create GKE cluster
         id: create-cluster
         uses: ./.github/actions/setup-gke-cluster
         with:
           cluster-name: ${{ env.clusterName }}-${{ matrix.config.index }}
           zone: ${{ matrix.k8s.zone }}
+          fallback-zones: ${{ steps.fallback-zones.outputs.zones }}
           cluster-version: ${{ matrix.k8s.version }}
           nodes: ${{ matrix.config.nodes || 2 }}
           machine-type: e2-custom-2-4096
@@ -414,11 +436,11 @@ jobs:
         uses: ./.github/actions/gke-create-esp-rule
         with:
           cluster_name: ${{ env.clusterName }}-${{ matrix.config.index }}
-          cluster_zone: ${{ matrix.k8s.zone }}
+          cluster_zone: ${{ steps.create-cluster.outputs.zone }}
 
       - name: Get cluster credentials
         run: |
-          gcloud container clusters get-credentials ${{ env.clusterName }}-${{ matrix.config.index }} --zone ${{ matrix.k8s.zone }}
+          gcloud container clusters get-credentials ${{ env.clusterName }}-${{ matrix.config.index }} --zone ${{ steps.create-cluster.outputs.zone }}
 
       - name: Generate cilium-cli kubeconfig
         id: gen-kubeconfig
@@ -436,7 +458,7 @@ jobs:
             --docker-password="${{ secrets.DOCKER_READ_PASSWORD }}"
 
       - name: Install Cilium CLI
-        uses: cilium/cilium-cli@7ca7fc53c20275f5c10ef5f3557076691fd1d720 # v0.19.7
+        uses: cilium/cilium-cli@c5e42236c7d90bd50e7975ac587f77782666a0aa # v0.20.0
         with:
           skip-build: ${{ env.CILIUM_CLI_SKIP_BUILD }}
           image-repo: ${{ env.CILIUM_CLI_IMAGE_REPO }}
@@ -490,7 +512,7 @@ jobs:
       - name: Determine the CIDR of fake external targets
         id: external_cidr
         run: |
-          ZONE=${{ matrix.k8s.zone }}
+          ZONE=${{ steps.create-cluster.outputs.zone }}
           REGION=${ZONE%-?}
           SUBNET=$(gcloud container clusters describe ${{ env.clusterName }}-${{ matrix.config.index }} --zone "$ZONE" --format 'value(subnetwork)')
           CIDR=$(gcloud compute networks subnets describe "$SUBNET" --region "$REGION" --format 'value(ipCidrRange)')
@@ -509,6 +531,7 @@ jobs:
           external-target-ca-name: custom-ca
           external-target-fake-dns: true
           hubble: false
+          include-unsafe-tests: true
           test-concurrency: 5
 
       - name: Set up job variables for connectivity tests
@@ -534,7 +557,7 @@ jobs:
         id: run-tests
         run: |
           cilium connectivity test ${{ steps.vars-conn.outputs.connectivity_test_defaults }} \
-          --junit-file "cilium-junits/${{ env.job_name }} (${{ join(matrix.k8s.*, ', ') }}, ${{ join(matrix.config.*, ', ') }}).xml" \
+          --junit-file "cilium-junits/${{ env.job_name }} (${{ join(matrix.k8s.*, ', ') }}, ${{ join(matrix.config.*, ', ') }}, ${{ inputs.UID || 1 }}).xml" \
           --junit-property github_job_step="Run connectivity test (${{ matrix.k8s.version }}, ${{ matrix.config.index }}, ${{ matrix.config.type }})"
 
       - name: Run common post steps
@@ -550,15 +573,29 @@ jobs:
         uses: ./../cilium-base-branch/.github/actions/gke-clean-esp-rule
         with:
           cluster_name: ${{ env.clusterName }}-${{ matrix.config.index }}
-          cluster_zone: ${{ matrix.k8s.zone }}
+          cluster_zone: ${{ steps.create-cluster.outputs.zone || matrix.k8s.zone }}
 
       - name: Clean up GKE
         if: ${{ always() }}
+        env:
+          CLUSTER: ${{ env.clusterName }}-${{ matrix.config.index }}
+          # Every zone the cluster could have been created in, not just the one
+          # it ended up in: a creation attempt that was abandoned because it was
+          # too slow keeps provisioning on the GKE side. The cluster name is
+          # unique to this leg, so deleting it by name in each candidate zone
+          # cannot touch another leg's cluster.
+          ZONES: ${{ steps.fallback-zones.outputs.candidates || matrix.k8s.zone }}
         run: |
-          while [ "$(gcloud container operations list --zone ${{ matrix.k8s.zone }} --filter="status=RUNNING AND targetLink~${{ env.clusterName }}-${{ matrix.config.index }}" --format="value(name)")" ];do
-            echo "cluster has an ongoing operation, waiting for all operations to finish"; sleep 15
+          for zone in ${ZONES}; do
+            while [ "$(gcloud container operations list --zone "${zone}" --filter="status=RUNNING AND targetLink~${CLUSTER}" --format="value(name)")" ];do
+              echo "cluster has an ongoing operation in ${zone}, waiting for all operations to finish"; sleep 15
+            done
+            gcloud container clusters describe "${CLUSTER}" --zone "${zone}" --format 'value(name)' > /dev/null 2>&1 || continue
+            for i in 1 2 3; do
+              gcloud container clusters delete "${CLUSTER}" --zone "${zone}" --quiet --async && break
+              echo "delete of ${CLUSTER} in ${zone} failed (attempt ${i}/3), retrying in 15s"; sleep 15
+            done
           done
-          gcloud container clusters delete ${{ env.clusterName }}-${{ matrix.config.index }} --zone ${{ matrix.k8s.zone }} --quiet --async
         shell: bash {0} # Disable default fail-fast behavior so that all commands run independently
 
   merge-upload-and-status:

@@ -113,7 +113,7 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - name: Set initial commit status
-        uses: cilium/actions/set-commit-status@fe0702f5df0d8e44d48f1baa226c023b73ff6b5e # main
+        uses: cilium/actions/set-commit-status@687b48a0547e534dd7270d5069a5ab7967c0e907 # main
         with:
           sha: ${{ inputs.SHA || github.sha }}
 
@@ -205,9 +205,25 @@ jobs:
           login-password: ${{ secrets.DOCKER_READ_PASSWORD }}
           auth-required: ${{ vars.DOCKER_AUTH_REQUIRED }}
 
+  lvh-cache-key:
+    name: LVH Cache Key
+    # Same runner as the legs, so the key describes the packages they install.
+    runs-on: ${{ vars.UBUNTU_2404_4CPU_16GB || 'ubuntu-24.04' }}
+    timeout-minutes: 20
+    outputs:
+      dependency-list-sha: ${{ steps.key.outputs.dependency_list_sha }}
+    steps:
+      - name: Derive the LVH package cache key
+        id: key
+        timeout-minutes: 10
+        continue-on-error: true
+        uses: cilium/little-vm-helper@f86d344aca812dda5aef167867a9a0a90ca6cca5 # v0.0.31
+        with:
+          derive-dependency-list-sha: 'true'
+
   setup-and-test:
-    needs: [wait-for-images, generate-matrix]
-    runs-on: ${{ vars.GH_RUNNER_EXTRA_POWER_UBUNTU_LATEST || 'ubuntu-24.04' }}
+    needs: [wait-for-images, generate-matrix, lvh-cache-key]
+    runs-on: ${{ vars.UBUNTU_2404_4CPU_16GB || 'ubuntu-24.04' }}
     name: 'Setup & Test (${{ matrix.name }}, ${{ matrix.mode }}, ${{ matrix.kernel }})'
     env:
       job_name: 'Setup & Test (${{ matrix.name }}, ${{ matrix.mode }}, ${{ matrix.kernel }})'
@@ -225,7 +241,7 @@ jobs:
           echo '${{ toJSON(matrix) }}'
 
       - name: Set commit status to pending
-        uses: cilium/actions/set-commit-status@fe0702f5df0d8e44d48f1baa226c023b73ff6b5e # main
+        uses: cilium/actions/set-commit-status@687b48a0547e534dd7270d5069a5ab7967c0e907 # main
         with:
           sha: ${{ inputs.SHA || github.sha }}
 
@@ -352,7 +368,6 @@ jobs:
           encryption-strict-ingress: ${{ matrix.encryption-strict-ingress }}
           egress-gateway: ${{ matrix.egress-gateway }}
           host-fw: ${{ matrix.host-fw }}
-          mutual-auth: false
           ingress-controller: ${{ matrix.ingress-controller }}
           misc: ${{ matrix.misc || 'bpfClockProbe=false,cni.uninstall=false' }}
           ciliumendpointslice: ${{ matrix.ciliumendpointslice }}
@@ -383,7 +398,6 @@ jobs:
           encryption-strict-ingress: ${{ matrix.encryption-strict-ingress }}
           egress-gateway: ${{ matrix.egress-gateway }}
           host-fw: ${{ matrix.host-fw }}
-          mutual-auth: false
           ingress-controller: ${{ matrix.ingress-controller }}
           misc: ${{ matrix.misc || 'bpfClockProbe=false,cni.uninstall=false' }}
           ciliumendpointslice: ${{ matrix.ciliumendpointslice }}
@@ -412,6 +426,7 @@ jobs:
         uses: ./.github/actions/lvh-kind
         with:
           test-name: e2e-conformance
+          dependency-list-sha: ${{ needs.lvh-cache-key.outputs.dependency-list-sha }}
           kernel: ${{ steps.kernel-version.outputs.full }}
           kind-params: "${{ steps.kind-params.outputs.params }}"
           kind-image: ${{ env.KIND_K8S_IMAGE }}
@@ -466,7 +481,7 @@ jobs:
 
       - name: Setup bootid file
         if: ${{ steps.vars.outputs.downgrade_version != '' && steps.cilium-stable-config.outputs.skip != 'true' && steps.cilium-newest-config.outputs.skip != 'true' }}
-        uses: cilium/little-vm-helper@5ae749011735fd77f30f38add52f1a53a5568671 # v0.0.30
+        uses: cilium/little-vm-helper@f86d344aca812dda5aef167867a9a0a90ca6cca5 # v0.0.31
         with:
           provision: 'false'
           cmd: |
@@ -490,7 +505,7 @@ jobs:
 
       - name: Install Cilium CLI
         if: ${{ steps.vars.outputs.downgrade_version != '' && steps.cilium-stable-config.outputs.skip != 'true' && steps.cilium-newest-config.outputs.skip != 'true' }}
-        uses: cilium/cilium-cli@7ca7fc53c20275f5c10ef5f3557076691fd1d720 # v0.19.7
+        uses: cilium/cilium-cli@c5e42236c7d90bd50e7975ac587f77782666a0aa # v0.20.0
         with:
           skip-build: ${{ env.CILIUM_CLI_SKIP_BUILD }}
           image-repo: ${{ env.CILIUM_CLI_IMAGE_REPO }}
@@ -534,10 +549,15 @@ jobs:
             cilium encrypt create-key --auth-algo ${{ matrix.key-one }}
           fi
 
+          EXTRA_INSTALL_ARGS="\
+            ${{ steps.kvstore.outputs.config }} \
+            --set extraConfig.boot-id-file=/var/run/cilium/boot_id \
+            --set envoy.idleTimeoutDurationSeconds=3" # Set proxy idle timeout to a low value so that connections teardown for L7 traffic testing doesn't pollute validation during a later step.
+
           if ${{ steps.vars.outputs.skip_upgrade != 'true' }}; then
-            cilium install ${{ steps.cilium-stable-config.outputs.config }} ${{ steps.kvstore.outputs.config }} --set extraConfig.boot-id-file=/var/run/cilium/boot_id
+            cilium install ${{ steps.cilium-stable-config.outputs.config }} ${EXTRA_INSTALL_ARGS}
           else
-            cilium install ${{ steps.cilium-newest-config.outputs.config }} ${{ steps.kvstore.outputs.config }} --set extraConfig.boot-id-file=/var/run/cilium/boot_id
+            cilium install ${{ steps.cilium-newest-config.outputs.config }} ${EXTRA_INSTALL_ARGS}
           fi
 
           cilium status --wait --interactive=false --wait-duration=10m
@@ -545,6 +565,7 @@ jobs:
           kubectl -n kube-system exec daemonset/cilium -c cilium-agent -- cilium-dbg status
 
           mkdir -p cilium-junits
+          echo "extra_args=${EXTRA_INSTALL_ARGS}" >> $GITHUB_OUTPUT
 
       - name: Install node local DNS
         timeout-minutes: 3
@@ -590,8 +611,7 @@ jobs:
           cilium upgrade \
             --helm-set=disableEnvoyVersionCheck=true \
             ${{ steps.cilium-newest-config.outputs.config }} \
-            ${{ steps.kvstore.outputs.config }} \
-            --set extraConfig.boot-id-file=/var/run/cilium/boot_id
+            ${{ steps.install-cilium.outputs.extra_args }}
 
           cilium status --wait --interactive=false --wait-duration=10m
           kubectl get pods --all-namespaces -o wide
@@ -605,7 +625,7 @@ jobs:
         if: ${{ steps.vars.outputs.downgrade_version != '' && steps.cilium-stable-config.outputs.skip != 'true' && steps.cilium-newest-config.outputs.skip != 'true' }}
         uses: ./.github/actions/conn-disrupt-test-check
         with:
-          job-name: cilium-upgrade-${{ matrix.name }}-precheck
+          job-name: cilium-upgrade-${{ matrix.name }}-${{ matrix.mode }}-precheck
           extra-connectivity-test-flags: ${{ steps.vars-conn.outputs.connectivity_test_defaults }}
 
       - name: Start unencrypted packets check for connectivity tests after upgrade
@@ -622,7 +642,7 @@ jobs:
         timeout-minutes: 50
         uses: ./.github/actions/conn-disrupt-test-check
         with:
-          job-name: cilium-upgrade-${{ matrix.name }}-concurrent
+          job-name: cilium-upgrade-${{ matrix.name }}-${{ matrix.mode }}-concurrent
           tests: ${{ steps.vars.outputs.concurrent_connectivity_tests }}
           conn-disrupt: 'false'
           test-concurrency: ${{ env.test_concurrency }}
@@ -632,7 +652,7 @@ jobs:
         if: ${{ steps.vars.outputs.downgrade_version != '' && steps.cilium-stable-config.outputs.skip != 'true' && steps.cilium-newest-config.outputs.skip != 'true' }}
         uses: ./.github/actions/conn-disrupt-test-check
         with:
-          job-name: cilium-upgrade-${{ matrix.name }}-postcheck
+          job-name: cilium-upgrade-${{ matrix.name }}-${{ matrix.mode }}-postcheck
           tests: 'no-unexpected-packet-drops'
           conn-disrupt: 'false'
           extra-connectivity-test-flags: ${{ steps.vars-conn.outputs.connectivity_test_defaults }}
@@ -668,10 +688,9 @@ jobs:
 
       - name: Test Cilium ${{ steps.vars.outputs.skip_upgrade != 'true' && 'after agent restart' }}
         if: ${{ steps.vars.outputs.downgrade_version != '' && steps.vars.outputs.skip_upgrade != 'true' && steps.cilium-stable-config.outputs.skip != 'true' && steps.cilium-newest-config.outputs.skip != 'true' }}
-        continue-on-error: true
         uses: ./.github/actions/conn-disrupt-test-check
         with:
-          job-name: cilium-restart-${{ matrix.name }}-precheck
+          job-name: cilium-restart-${{ matrix.name }}-${{ matrix.mode }}-precheck
           extra-connectivity-test-flags: ${{ steps.vars-conn.outputs.connectivity_test_defaults }}
           include-conn-disrupt-test-l7-traffic: ${{ steps.vars-conn.outputs.include_conn_disrupt_test_l7_traffic }}
 
@@ -701,8 +720,7 @@ jobs:
           cilium upgrade \
             --helm-set=disableEnvoyVersionCheck=true \
             ${{ steps.cilium-stable-config.outputs.config }} \
-            ${{ steps.kvstore.outputs.config }} \
-            --set extraConfig.boot-id-file=/var/run/cilium/boot_id
+            ${{ steps.install-cilium.outputs.extra_args }}
 
           cilium status --wait --interactive=false --wait-duration=10m
           kubectl get pods --all-namespaces -o wide
@@ -716,7 +734,7 @@ jobs:
         if: ${{ steps.vars.outputs.downgrade_version != '' && steps.vars.outputs.skip_upgrade != 'true' && steps.cilium-stable-config.outputs.skip != 'true' && steps.cilium-newest-config.outputs.skip != 'true' }}
         uses: ./.github/actions/conn-disrupt-test-check
         with:
-          job-name: cilium-downgrade-${{ matrix.name }}-precheck
+          job-name: cilium-downgrade-${{ matrix.name }}-${{ matrix.mode }}-precheck
           extra-connectivity-test-flags: ${{ steps.vars-conn.outputs.connectivity_test_defaults }}
 
       - name: Start unencrypted packets check for connectivity tests after downgrade
@@ -731,7 +749,7 @@ jobs:
         if: ${{ steps.vars.outputs.downgrade_version != '' && steps.vars.outputs.skip_upgrade != 'true' && steps.cilium-stable-config.outputs.skip != 'true' && steps.cilium-newest-config.outputs.skip != 'true' }}
         uses: ./.github/actions/conn-disrupt-test-check
         with:
-          job-name: cilium-downgrade-${{ matrix.name }}-concurrent
+          job-name: cilium-downgrade-${{ matrix.name }}-${{ matrix.mode }}-concurrent
           tests: ${{ steps.vars.outputs.concurrent_connectivity_tests }}
           conn-disrupt: 'false'
           test-concurrency: ${{ env.test_concurrency }}
@@ -741,7 +759,7 @@ jobs:
         if: ${{ steps.vars.outputs.downgrade_version != '' && steps.vars.outputs.skip_upgrade != 'true' && steps.cilium-stable-config.outputs.skip != 'true' && steps.cilium-newest-config.outputs.skip != 'true' }}
         uses: ./.github/actions/conn-disrupt-test-check
         with:
-          job-name: cilium-upgrade-${{ matrix.name }}-postcheck
+          job-name: cilium-downgrade-${{ matrix.name }}-${{ matrix.mode }}-postcheck
           tests: 'no-unexpected-packet-drops'
           conn-disrupt: 'false'
           extra-connectivity-test-flags: ${{ steps.vars-conn.outputs.connectivity_test_defaults }}
@@ -758,14 +776,12 @@ jobs:
           json-filename: "${{ env.job_name }} - after downgrade"
 
       - name: Fetch artifacts
-        if: ${{ steps.vars.outputs.downgrade_version != '' && !success() }}
+        if: ${{ steps.vars.outputs.downgrade_version != '' && !success() && steps.kvstore.outcome == 'success' }}
         shell: bash
         run: |
-          if [ "${{ matrix.kvstore }}" == "true" ]; then
-            echo
-            echo "# Retrieving Cilium etcd logs"
-            kubectl -n kube-system logs kvstore
-          fi
+          echo
+          echo "# Retrieving Cilium etcd logs"
+          kubectl -n kube-system logs kvstore
 
       - name: Run common post steps
         if: ${{ always() && steps.vars.outputs.downgrade_version != '' && steps.install-cilium.outcome != 'skipped' }}

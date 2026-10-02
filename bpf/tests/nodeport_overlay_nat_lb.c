@@ -21,7 +21,6 @@
 #define FRONTEND_PORT		tcp_svc_one
 
 #define LB_IP			v4_node_two
-#define IPV4_DIRECT_ROUTING	LB_IP
 
 #define BACKEND_IP		v4_pod_three
 #define BACKEND_PORT		__bpf_htons(8080)
@@ -101,6 +100,10 @@ int mock_skb_set_tunnel_key(__maybe_unused struct __sk_buff *skb,
 #include "lib/lb.h"
 
 ASSIGN_CONFIG(__u8, tunnel_protocol, TUNNEL_PROTOCOL_VXLAN)
+
+ASSIGN_CONFIG(union v4addr, ipv4_direct_routing, { .be32 = LB_IP })
+
+ASSIGN_CONFIG(union v4addr, router_ipv4, { .be32 = 0xfffff50a })
 
 /* Test that a SVC request to an intermediate LB node gets DNATed and SNATed,
  * and flows back out on the overlay interface to a remote backend
@@ -182,7 +185,7 @@ int nodeport_overlay_nat_1_fwd_check(const struct __ctx_buff *ctx)
 	if ((void *)l4 + sizeof(struct tcphdr) > data_end)
 		test_fatal("l4 out of bounds");
 
-	if (l3->saddr != IPV4_GATEWAY)
+	if (l3->saddr != CONFIG(router_ipv4).be32)
 		test_fatal("src IP hasn't been SNATed to gateway IP");
 
 	if (l3->daddr != BACKEND_IP)
@@ -229,7 +232,7 @@ int nodeport_overlay_nat_2_reply_pktgen(struct __ctx_buff *ctx)
 
 	l4 = pktgen__push_ipv4_udp_packet(&builder,
 					  (__u8 *)zero_mac, (__u8 *)zero_mac,
-					  BACKEND_IP, IPV4_GATEWAY,
+					  BACKEND_IP, CONFIG(router_ipv4).be32,
 					  BACKEND_PORT, nat_source_port);
 	if (!l4)
 		return TEST_ERROR;

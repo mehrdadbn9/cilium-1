@@ -58,16 +58,18 @@ NODES_WITHOUT_CILIUM_RAW=$(kubectl get nodes -l cilium.io/no-schedule=true -o na
 mapfile -t NODES_WITHOUT_CILIUM < <(printf '%s' "$NODES_WITHOUT_CILIUM_RAW")
 
 kubectl create ns external
+NGINX_IMAGE="${KIND_FAKE_EXTERNAL_TARGET_IMAGE:-nginx}" \
 NGINX_CERT_BASE64="$(base64 -w0 external-service.cilium.crt)" \
 NGINX_KEY_BASE64="$(base64 -w0 external-service.cilium.key)" \
 EXTERNAL_NODE="${NODES_WITHOUT_CILIUM[0]}" \
-envsubst '$NGINX_CERT_BASE64 $NGINX_KEY_BASE64 $EXTERNAL_NODE' < "$(dirname "$0")/nginx-external.yaml" | kubectl -n external apply -f -
+envsubst '$NGINX_IMAGE $NGINX_CERT_BASE64 $NGINX_KEY_BASE64 $EXTERNAL_NODE' < "$(dirname "$0")/nginx-external.yaml" | kubectl -n external apply -f -
 
 kubectl create ns external-other
+NGINX_IMAGE="${KIND_FAKE_EXTERNAL_TARGET_IMAGE:-nginx}" \
 NGINX_CERT_BASE64="$(base64 -w0 external-service.cilium.crt)" \
 NGINX_KEY_BASE64="$(base64 -w0 external-service.cilium.key)" \
 EXTERNAL_NODE="${NODES_WITHOUT_CILIUM[1]}" \
-envsubst '$NGINX_CERT_BASE64 $NGINX_KEY_BASE64 $EXTERNAL_NODE' < "$(dirname "$0")/nginx-external.yaml" | kubectl -n external-other apply -f -
+envsubst '$NGINX_IMAGE $NGINX_CERT_BASE64 $NGINX_KEY_BASE64 $EXTERNAL_NODE' < "$(dirname "$0")/nginx-external.yaml" | kubectl -n external-other apply -f -
 
 kubectl -n external rollout status daemonset nginx --timeout 60s
 kubectl -n external-other rollout status daemonset nginx --timeout 60s
@@ -83,5 +85,6 @@ if [ "${#IPTARGET[@]}" -ge 2 ] && [ "${#IPOTHERTARGET[@]}" -ge 2 ]; then
 	echo "ipv6_external_target=${IPTARGET[1]}" >> $GITHUB_OUTPUT
 	echo "ipv6_other_external_target=${IPOTHERTARGET[1]}" >> $GITHUB_OUTPUT
 fi
-echo "external_target_name=$TARGETNAME" >> $GITHUB_OUTPUT
-echo "other_external_target_name=$OTHERTARGETNAME" >> $GITHUB_OUTPUT
+# Publish FQDNs, so that pod resolvers don't walk their ndots:5 search list.
+echo "external_target_name=$TARGETNAME." >> $GITHUB_OUTPUT
+echo "other_external_target_name=$OTHERTARGETNAME." >> $GITHUB_OUTPUT

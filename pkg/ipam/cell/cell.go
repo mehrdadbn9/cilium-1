@@ -21,7 +21,6 @@ import (
 	ipamapi "github.com/cilium/cilium/pkg/ipam/api"
 	ipamMetadata "github.com/cilium/cilium/pkg/ipam/metadata"
 	"github.com/cilium/cilium/pkg/ipam/podippool"
-	"github.com/cilium/cilium/pkg/ipmasq"
 	k8sResources "github.com/cilium/cilium/pkg/k8s"
 	k8sClient "github.com/cilium/cilium/pkg/k8s/client"
 	"github.com/cilium/cilium/pkg/k8s/watchers"
@@ -83,17 +82,34 @@ type ipamParams struct {
 	NodeDiscovery       *nodediscovery.NodeDiscovery
 	Sysctl              sysctl.Sysctl
 	EndpointManager     endpointmanager.EndpointManager
-	IPMasqAgent         *ipmasq.IPMasqAgent
 
 	JobGroup   job.Group
 	DB         *statedb.DB
 	PodIPPools statedb.Table[podippool.LocalPodIPPool]
+
+	// CloudProviders are the cloud-specific customizations of the multi-pool
+	// allocator, contributed by the pkg/{cloud}/agent cells. All of them are
+	// registered unconditionally; at most one matches the configured IPAM mode.
+	CloudProviders []ipam.CloudProvider `group:"ipam-cloud-providers"`
 }
 
 func newIPAddressManager(params ipamParams, c ipamConfig) (*ipam.IPAM, error) {
 	if c.OnlyMasqueradeDefaultPool && !params.AgentConfig.EnableBPFMasquerade {
 		return nil, fmt.Errorf("--only-masquerade-default-pool requires --enable-bpf-masquerade to be enabled")
 	}
+
+	cloudProviders := make(map[string]ipam.CloudProvider, len(params.CloudProviders))
+	for _, provider := range params.CloudProviders {
+		if provider == nil {
+			continue
+		}
+		if existing, ok := cloudProviders[provider.Mode()]; ok {
+			return nil, fmt.Errorf("IPAM mode %s is claimed by two cloud providers, %T and %T",
+				provider.Mode(), existing, provider)
+		}
+		cloudProviders[provider.Mode()] = provider
+	}
+
 	ipam := ipam.NewIPAM(ipam.NewIPAMParams{
 		Logger:                    params.Logger,
 		NodeAddressing:            params.NodeAddressing,
@@ -106,11 +122,11 @@ func newIPAddressManager(params ipamParams, c ipamConfig) (*ipam.IPAM, error) {
 		Clientset:                 params.Clientset,
 		Metadata:                  params.IPAMMetadataManager,
 		Sysctl:                    params.Sysctl,
-		IPMasqAgent:               params.IPMasqAgent,
 		DB:                        params.DB,
 		JobGroup:                  params.JobGroup,
 		PodIPPools:                params.PodIPPools,
 		OnlyMasqueradeDefaultPool: c.OnlyMasqueradeDefaultPool,
+		CloudProviders:            cloudProviders,
 	})
 
 	debug.RegisterStatusObject("ipam", ipam)

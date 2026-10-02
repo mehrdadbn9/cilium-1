@@ -9,6 +9,7 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 
+	bgpConfig "github.com/cilium/cilium/pkg/bgp/config"
 	"github.com/cilium/cilium/pkg/clustermesh"
 	"github.com/cilium/cilium/pkg/clustermesh/types"
 	ipsec "github.com/cilium/cilium/pkg/datapath/linux/ipsec/types"
@@ -40,7 +41,6 @@ type Metrics struct {
 
 	NPHostFirewallEnabled        metric.Gauge
 	NPLocalRedirectPolicyEnabled metric.Gauge
-	NPMutualAuthEnabled          metric.Gauge
 	NPNonDefaultDenyEnabled      metric.Gauge
 	NPCIDRPoliciesMode           metric.Vec[metric.Gauge]
 
@@ -67,7 +67,6 @@ type Metrics struct {
 	NPHTTPHeaderMatchesIngested metric.Vec[metric.Counter]
 	NPDenyPoliciesIngested      metric.Vec[metric.Counter]
 	NPIngressCIDRGroupIngested  metric.Vec[metric.Counter]
-	NPMutualAuthIngested        metric.Vec[metric.Counter]
 	NPTLSInspectionIngested     metric.Vec[metric.Counter]
 	NPSNIAllowListIngested      metric.Vec[metric.Counter]
 	NPNonDefaultDenyIngested    metric.Vec[metric.Counter]
@@ -399,13 +398,6 @@ func NewMetrics(withDefaults bool, withEnvVersion bool) Metrics {
 			Namespace: metrics.Namespace,
 			Subsystem: subsystemNP,
 			Name:      "local_redirect_policy_enabled",
-		}),
-
-		NPMutualAuthEnabled: metric.NewGauge(metric.GaugeOpts{
-			Help:      "Mutual Auth enabled on the agent",
-			Namespace: metrics.Namespace,
-			Subsystem: subsystemNP,
-			Name:      "mutual_auth_enabled",
 		}),
 
 		NPNonDefaultDenyEnabled: metric.NewGauge(metric.GaugeOpts{
@@ -761,24 +753,6 @@ func NewMetrics(withDefaults bool, withEnvVersion bool) Metrics {
 			},
 		}),
 
-		NPMutualAuthIngested: metric.NewCounterVecWithLabels(metric.CounterOpts{
-			Help:      "Mutual Auth Policies have been ingested since the agent started",
-			Namespace: metrics.Namespace,
-			Subsystem: subsystemNP,
-			Name:      "mutual_auth_policies_total",
-		}, metric.Labels{
-			{
-				Name: "action", Values: func() metric.Values {
-					if !withDefaults {
-						return nil
-					}
-					return metric.NewValues(
-						defaultActions...,
-					)
-				}(),
-			},
-		}),
-
 		NPTLSInspectionIngested: metric.NewCounterVecWithLabels(metric.CounterOpts{
 			Help:      "TLS Inspection Policies have been ingested since the agent started",
 			Namespace: metrics.Namespace,
@@ -972,11 +946,11 @@ func NewMetrics(withDefaults bool, withEnvVersion bool) Metrics {
 }
 
 type featureMetrics interface {
-	update(params enabledFeatures, config *option.DaemonConfig, lbConfig loadbalancer.Config, kprCfg kpr.KPRConfig, wgCfg wgTypes.Config, ipsecCfg ipsec.Config)
+	update(params enabledFeatures, config *option.DaemonConfig, lbConfig loadbalancer.Config, kprCfg kpr.KPRConfig, wgCfg wgTypes.Config, ipsecCfg ipsec.Config, bgpCfg bgpConfig.BGPConfig)
 	toGatherer() (prometheus.Gatherer, error)
 }
 
-func (m Metrics) update(params enabledFeatures, config *option.DaemonConfig, lbConfig loadbalancer.Config, kprCfg kpr.KPRConfig, wgCfg wgTypes.Config, ipsecCfg ipsec.Config) {
+func (m Metrics) update(params enabledFeatures, config *option.DaemonConfig, lbConfig loadbalancer.Config, kprCfg kpr.KPRConfig, wgCfg wgTypes.Config, ipsecCfg ipsec.Config, bgpCfg bgpConfig.BGPConfig) {
 	networkMode := networkModeDirectRouting
 	if config.TunnelingEnabled() {
 		switch params.TunnelProtocol() {
@@ -1034,10 +1008,6 @@ func (m Metrics) update(params enabledFeatures, config *option.DaemonConfig, lbC
 		m.NPLocalRedirectPolicyEnabled.Set(1)
 	}
 
-	if params.IsMutualAuthEnabled() {
-		m.NPMutualAuthEnabled.Set(1)
-	}
-
 	if config.EnableNonDefaultDenyPolicies {
 		m.NPNonDefaultDenyEnabled.Set(1)
 	}
@@ -1069,7 +1039,7 @@ func (m Metrics) update(params enabledFeatures, config *option.DaemonConfig, lbC
 
 	m.ACLBNodePortConfig.WithLabelValues(lbConfig.LBMode, lbConfig.LBAlgorithm, config.NodePortAcceleration).Set(1)
 
-	if config.EnableBGPControlPlane {
+	if bgpCfg.Enable {
 		m.ACLBBGPEnabled.Set(1)
 	}
 
@@ -1133,7 +1103,7 @@ func (m Metrics) toGatherer() (prometheus.Gatherer, error) {
 		if !f.CanInterface() {
 			continue
 		}
-		c, ok := f.Interface().(prometheus.Collector)
+		c, ok := reflect.TypeAssert[prometheus.Collector](f)
 		if !ok {
 			continue
 		}

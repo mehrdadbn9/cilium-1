@@ -12,13 +12,14 @@ import (
 
 	"github.com/cilium/hive/hivetest"
 	"github.com/stretchr/testify/require"
+	"go4.org/netipx"
 	k8sErrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 
-	"github.com/cilium/cilium/operator/pkg/ipam/allocator/clusterpool/cidralloc"
 	"github.com/cilium/cilium/pkg/controller"
 	iputil "github.com/cilium/cilium/pkg/ip"
+	"github.com/cilium/cilium/pkg/ipam/cidralloc"
 	ipamTypes "github.com/cilium/cilium/pkg/ipam/types"
 	v2 "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2"
 	"github.com/cilium/cilium/pkg/trigger"
@@ -117,6 +118,10 @@ func (d *mockCIDRAllocator) IsClusterCIDR(cidr netip.Prefix) bool {
 
 func (d *mockCIDRAllocator) Prefix() netip.Prefix {
 	return netip.MustParsePrefix("10.0.0.0/24")
+}
+
+func (d *mockCIDRAllocator) SetReservedRanges(ranges []netipx.IPRange) error {
+	return nil
 }
 
 type k8sNodeMock struct {

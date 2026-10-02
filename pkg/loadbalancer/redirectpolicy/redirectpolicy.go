@@ -141,6 +141,37 @@ func (lrp *LocalRedirectPolicy) RedirectServiceName() lb.ServiceName {
 	return lrpServiceName(lrp.ID)
 }
 
+// Returns true if an LRP requires port names to match across the LRP FrontendMapping,
+// BackendPorts, as well as a Service and Pod spec.
+func (lrp *LocalRedirectPolicy) requiresPortNameMatch() bool {
+	switch lrp.FrontendType {
+	case svcFrontendAll:
+		// svcFrontendAll tells us there's no ports in the serviceMatcher, but there
+		// may be multiple ports in the redirectBackend. Where only one backend port
+		// exists, we can skip name checks.
+		if len(lrp.BackendPorts) <= 1 {
+			return false
+		}
+	case svcFrontendSinglePort, addrFrontendSinglePort:
+		// In the case of single port redirects, we can skip name checks.
+		return false
+	}
+
+	return true
+}
+
+// Returns true if an LRP is a single-port variant, which is a subtle variation on the
+// requirement to match named ports. Unlike requirePortNameMatch(), this will return false
+// with svcFrontendAll with a single back-end port.
+func (lrp *LocalRedirectPolicy) isSinglePort() bool {
+	switch lrp.FrontendType {
+	case svcFrontendSinglePort, addrFrontendSinglePort:
+		return true
+	}
+
+	return false
+}
+
 // feMapping stores frontend address and a list of associated backend addresses.
 type feMapping struct {
 	feAddr lb.L3n4Addr
@@ -278,12 +309,17 @@ func getSanitizedLocalRedirectPolicy(cfg Config, log *slog.Logger, name, namespa
 	}
 
 	// Parse backend config
-	bePorts = make([]bePortInfo, len(redirectTo.ToPorts))
-	if len(redirectTo.ToPorts) > 1 {
+	numBePorts := len(redirectTo.ToPorts)
+	if numBePorts == 0 {
+		return nil, fmt.Errorf("backend must specify at least one port")
+	}
+	if numBePorts > 1 {
 		// We check for backend named ports if either frontend/backend have
 		// multiple ports.
 		checkNamedPort = true
 	}
+
+	bePorts = make([]bePortInfo, len(redirectTo.ToPorts))
 	for i, portInfo := range redirectTo.ToPorts {
 		p, pName, proto, err := portInfo.SanitizePortInfo(checkNamedPort)
 		if err != nil {

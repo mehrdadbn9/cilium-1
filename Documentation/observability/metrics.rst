@@ -55,9 +55,9 @@ The ports can be configured via ``prometheus.port``,
 ``envoy.prometheus.port``, or ``operator.prometheus.port`` respectively.
 
 
-When metrics are enabled and ServiceMonitor is not enabled (``hubble.metrics.serviceMonitor.enabled: false``), all Cilium components will have the following annotations. These annotations can be used to signal Prometheus whether to scrape metrics.
+When metrics are enabled and ServiceMonitor is not enabled (``prometheus.serviceMonitor.enabled: false``), all Cilium components will have the following annotations. These annotations can be used to signal Prometheus whether to scrape metrics.
 
-If ServiceMonitor is enabled (``hubble.metrics.serviceMonitor.enabled: true``), these annotations are omitted and Prometheus discovers metrics via the ServiceMonitor resource.
+If ServiceMonitor is enabled (``prometheus.serviceMonitor.enabled: true``), these annotations are omitted and Prometheus discovers metrics via the ServiceMonitor resource.
 
 .. code-block:: yaml
 
@@ -93,6 +93,54 @@ option is set in the ``scrape_configs`` section:
           regex: ([^:]+)(?::\d+)?;(\d+)
           replacement: ${1}:${2}
           target_label: __address__
+
+.. _prometheus_annotation_override:
+
+Overriding the Prometheus Annotations
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+The chart renders these annotations alongside the annotations you set yourself,
+and your values take precedence. Set ``prometheus.io/scrape`` to ``false`` to
+keep the metrics port exposed while opting out of annotation-based scraping,
+for example when your collector reads the port from its own configuration
+rather than from the annotations:
+
+.. code-block:: yaml
+
+    prometheus:
+      enabled: true
+    podAnnotations:
+      prometheus.io/scrape: "false"
+    operator:
+      podAnnotations:
+        prometheus.io/scrape: "false"
+    envoy:
+      annotations:
+        prometheus.io/scrape: "false"
+
+Kubernetes annotation values are strings, hence the quotes around ``"false"``.
+On the command line, use ``--set-string``. Plain ``--set`` infers the type and
+renders an unquoted boolean, which the API server rejects:
+
+.. code-block:: shell-session
+
+    $ helm upgrade cilium cilium/cilium --namespace kube-system --reuse-values \
+        --set-string 'podAnnotations.prometheus\.io/scrape=false'
+
+The annotations of each component are taken from a different Helm value:
+
+===================================  ==================================================
+Component                            Helm value
+===================================  ==================================================
+``cilium-agent`` pods                ``podAnnotations``
+``cilium-operator`` pods             ``operator.podAnnotations``
+``cilium-envoy`` service             ``envoy.annotations``
+``cilium-agent`` service             ``annotations``
+===================================  ==================================================
+
+The ``cilium-agent`` service only carries the Envoy annotations, and only when
+Envoy runs inside the agent rather than as its own DaemonSet. See
+:ref:`hubble_metrics` for the Hubble equivalents.
 
 Prometheus Operator ServiceMonitor
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
@@ -293,6 +341,19 @@ have it scrape all Hubble metrics from the endpoints automatically:
             regex: (.+)(?::\d+);(\d+)
             replacement: $1:$2
 
+As described in :ref:`prometheus_annotation_override`, your own annotations take
+precedence over these, so setting ``prometheus.io/scrape`` to ``false`` keeps
+the Hubble metrics port exposed without opting into annotation-based scraping.
+The Hubble annotations are taken from the following Helm values:
+
+===================================  ==================================================
+Component                            Helm value
+===================================  ==================================================
+``hubble-metrics`` service           ``hubble.metrics.serviceAnnotations`` or ``hubble.annotations``
+``hubble-relay`` pods                ``hubble.relay.podAnnotations``
+``hubble-relay`` service             ``hubble.relay.annotations``
+===================================  ==================================================
+
 Prometheus Operator ServiceMonitor
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
@@ -448,7 +509,7 @@ The following tables categorize feature metrics into four groups:
 - **Network Policies** (:ref:`cilium-feature-network-policies`)
 
   This group encompasses metrics related to policy enforcement, including
-  Cilium Network Policies, Host Firewall, DNS policies, and Mutual Auth.
+  Cilium Network Policies, Host Firewall, and DNS policies.
 
 For example, to check if the Bandwidth Manager is enabled on a Cilium agent,
 observe the metric ``cilium_feature_adv_connect_and_lb_bandwidth_manager_enabled``.
@@ -492,6 +553,19 @@ Name                                       Labels                               
 ``services_events_total``                   ``action``                                         Enabled    Number of services events labeled by action type
 ``service_implementation_delay``           ``action``                                         Enabled    Duration in seconds to propagate the data plane programming of a service, its network and endpoints from the time the service or the service pod was changed excluding the event queue latency
 ========================================== ================================================== ========== ========================================================
+
+Load-balancer
+~~~~~~~~~~~~~
+
+============================================== =============================== =========== ===================================================================
+Name                                           Labels                          Default     Description
+============================================== =============================== =========== ===================================================================
+``loadbalancer_id_capacity``                   ``type``                        Enabled     Number of loadbalancer IDs in the allocation range
+``loadbalancer_id_allocations``                ``type``                        Enabled     Number of loadbalancer IDs currently allocated
+``loadbalancer_id_allocation_attempts_total``  ``type``                        Enabled     Total number of loadbalancer ID allocation attempts
+``loadbalancer_id_allocation_failures_total``  ``type``                        Enabled     Total number of loadbalancer ID allocation failures
+``loadbalancer_id_mappings_pending_restore``   ``type``                        Enabled     Number of loadbalancer address-to-ID mappings pending restoration
+============================================== =============================== =========== ===================================================================
 
 Cluster health
 ~~~~~~~~~~~~~~
@@ -969,7 +1043,7 @@ Name                                         Labels  Default    Description
 
 "Double Write" Identity Allocation Mode
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-When the ":ref:`Double Write <double_write_migration>`" identity allocation mode is
+When the ":ref:`Double Write <kvstore_to_crd_migration>`" identity allocation mode is
 enabled, the following metrics are available:
 
 ============================================ ======= ========== ============================================================

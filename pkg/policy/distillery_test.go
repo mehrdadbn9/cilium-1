@@ -20,6 +20,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	cmtypes "github.com/cilium/cilium/pkg/clustermesh/types"
 	"github.com/cilium/cilium/pkg/crypto/certificatemanager"
 	envoypolicy "github.com/cilium/cilium/pkg/envoy/policy"
 	"github.com/cilium/cilium/pkg/identity"
@@ -31,12 +32,6 @@ import (
 	testpolicy "github.com/cilium/cilium/pkg/testutils/policy"
 )
 
-const (
-	AuthTypeSpire      = types.AuthTypeSpire
-	AuthTypeAlwaysFail = types.AuthTypeAlwaysFail
-	AuthTypeDisabled   = types.AuthTypeDisabled
-)
-
 func localIdentity(n uint32) identity.NumericIdentity {
 	return identity.NumericIdentity(n) | identity.IdentityScopeLocal
 }
@@ -46,14 +41,14 @@ func localIdentity(n uint32) identity.NumericIdentity {
 var (
 	// Identity, labels, selectors for an endpoint named "foo"
 	identityFoo = identity.NumericIdentity(100)
-	labelsFoo   = labels.ParseSelectLabelArray("foo", "blue")
+	labelsFoo   = labels.ParseSelectLabels("foo", "blue")
 	selectFoo_  = api.NewESFromLabels(labels.ParseSelectLabel("foo"))
 	allowFooL3_ = selectFoo_
 	denyFooL3__ = selectFoo_
 
 	// Identity, labels, selectors for an endpoint named "bar"
 	identityBar = identity.NumericIdentity(200)
-	labelsBar   = labels.ParseSelectLabelArray("bar", "blue")
+	labelsBar   = labels.ParseSelectLabels("bar", "blue")
 	selectBar_  = api.NewESFromLabels(labels.ParseSelectLabel("bar"))
 	allowBarL3_ = selectBar_
 
@@ -255,7 +250,6 @@ var (
 	// Desired map keys for L3, L3-dependent L4, L4
 	mapKeyAllowFoo__ = IngressKey().WithIdentity(identityFoo)
 	mapKeyAllowBar__ = IngressKey().WithIdentity(identityBar)
-	mapKeyAllowBarL4 = IngressKey().WithIdentity(identityBar).WithTCPPort(80)
 	mapKeyAllowFooL4 = IngressKey().WithIdentity(identityFoo).WithTCPPort(80)
 	mapKeyDeny_Foo__ = mapKeyAllowFoo__
 	mapKeyDeny_FooL4 = mapKeyAllowFooL4
@@ -266,12 +260,6 @@ var (
 	// Desired map entries for no L7 redirect / redirect to Proxy
 	mapEntryL7None_ = func(lbls ...labels.LabelArray) mapStateEntry {
 		return allowEntry().withLabels(lbls)
-	}
-	mapEntryL7ExplicitAuth_ = func(at AuthType, lbls ...labels.LabelArray) mapStateEntry {
-		return allowEntry().withLabels(lbls).withExplicitAuth(at)
-	}
-	mapEntryL7DerivedAuth_ = func(at AuthType, lbls ...labels.LabelArray) mapStateEntry {
-		return allowEntry().withLabels(lbls).withDerivedAuth(at)
 	}
 	mapEntryL7Deny = func(lbls ...labels.LabelArray) mapStateEntry {
 		return denyEntry().withLabels(lbls)
@@ -305,7 +293,7 @@ type policyDistillery struct {
 func newPolicyDistillery(t testing.TB, selectorCache *SelectorCache) *policyDistillery {
 	idMgr := identitymanager.NewIDManager(hivetest.Logger(t))
 	ret := &policyDistillery{
-		Repository: NewPolicyRepository(hivetest.Logger(t), nil, nil, envoypolicy.NewEnvoyL7RulesTranslator(hivetest.Logger(t), certificatemanager.NewMockSecretManagerInline()), idMgr, testpolicy.NewPolicyMetricsNoop()),
+		Repository: NewPolicyRepository(hivetest.Logger(t), cmtypes.DefaultClusterInfo, nil, nil, envoypolicy.NewEnvoyL7RulesTranslator(hivetest.Logger(t), certificatemanager.NewMockSecretManagerInline()), idMgr, testpolicy.NewPolicyMetricsNoop()),
 		idMgr:      idMgr,
 	}
 	ret.selectorCache = selectorCache
@@ -415,12 +403,10 @@ func Test_MergeL3(t *testing.T) {
 	}
 	selectorCache := testNewSelectorCache(t, hivetest.Logger(t), identityCache)
 
-	type authResult map[identity.NumericIdentity]AuthTypes
 	tests := []struct {
 		test   int
 		rules  api.Rules
 		result mapState
-		auths  authResult
 	}{
 		{
 			0,
@@ -429,10 +415,6 @@ func Test_MergeL3(t *testing.T) {
 				mapKeyAllowFoo__: mapEntryL7None_(lblsL3__AllowFoo),
 				mapKeyAllowBar__: mapEntryL7None_(lblsL3__AllowBar),
 			}),
-			authResult{
-				identityBar: AuthTypes{},
-				identityFoo: AuthTypes{},
-			},
 		},
 		{
 			1,
@@ -441,84 +423,53 @@ func Test_MergeL3(t *testing.T) {
 				mapKeyAllowFoo__: mapEntryL7None_(lblsL3__AllowFoo),
 				mapKeyAllowFooL4: mapEntryL7None_(lblsL3L4__Allow),
 			}),
-			authResult{
-				identityBar: AuthTypes{},
-				identityFoo: AuthTypes{},
-			},
 		},
 		{
 			2,
 			api.Rules{ruleL3__AllowFoo, ruleL3__AllowBarAuth},
 			testMapState(t, mapStateMap{
 				mapKeyAllowFoo__: mapEntryL7None_(lblsL3__AllowFoo),
-				mapKeyAllowBar__: mapEntryL7ExplicitAuth_(AuthTypeAlwaysFail, lblsL3__AllowBar),
+				mapKeyAllowBar__: mapEntryL7None_(lblsL3__AllowBar),
 			}),
-			authResult{
-				identityBar: AuthTypes{AuthTypeAlwaysFail: struct{}{}},
-				identityFoo: AuthTypes{},
-			},
 		},
 		{
 			3,
 			api.Rules{ruleL3__AllowFoo, ruleL3__AllowBarAuth, rule__L4__AllowAuth},
 			testMapState(t, mapStateMap{
-				mapKeyAllow___L4: mapEntryL7ExplicitAuth_(AuthTypeSpire, lbls__L4__Allow),
+				mapKeyAllow___L4: mapEntryL7None_(lbls__L4__Allow),
 				mapKeyAllowFoo__: mapEntryL7None_(lblsL3__AllowFoo),
-				mapKeyAllowBar__: mapEntryL7ExplicitAuth_(AuthTypeAlwaysFail, lblsL3__AllowBar),
+				mapKeyAllowBar__: mapEntryL7None_(lblsL3__AllowBar),
 			}),
-			authResult{
-				identityBar: AuthTypes{AuthTypeAlwaysFail: struct{}{}, AuthTypeSpire: struct{}{}},
-				identityFoo: AuthTypes{AuthTypeSpire: struct{}{}},
-			},
 		},
 		{
 			4,
 			api.Rules{rule____AllowAll, ruleL3__AllowBarAuth},
 			testMapState(t, mapStateMap{
 				mapKeyAllowAll__: mapEntryL7None_(lbls____AllowAll),
-				mapKeyAllowBar__: mapEntryL7ExplicitAuth_(AuthTypeAlwaysFail, lblsL3__AllowBar),
 			}),
-			authResult{
-				identityBar: AuthTypes{AuthTypeAlwaysFail: struct{}{}},
-				identityFoo: AuthTypes{},
-			},
 		},
 		{
 			5,
 			api.Rules{rule____AllowAllAuth, ruleL3__AllowBar},
 			testMapState(t, mapStateMap{
-				mapKeyAllowAll__: mapEntryL7ExplicitAuth_(AuthTypeSpire, lbls____AllowAll),
-				mapKeyAllowBar__: mapEntryL7None_(lblsL3__AllowBar),
+				mapKeyAllowAll__: mapEntryL7None_(lbls____AllowAll),
 			}),
-			authResult{
-				identityBar: AuthTypes{AuthTypeSpire: struct{}{}},
-				identityFoo: AuthTypes{AuthTypeSpire: struct{}{}},
-			},
 		},
 		{
 			6,
 			api.Rules{rule____AllowAllAuth, rule__L4__Allow},
 			testMapState(t, mapStateMap{
-				mapKeyAllowAll__: mapEntryL7ExplicitAuth_(AuthTypeSpire, lbls____AllowAll),
-				mapKeyAllow___L4: mapEntryL7DerivedAuth_(AuthTypeSpire, lbls__L4__Allow),
+				mapKeyAllowAll__: mapEntryL7None_(lbls____AllowAll),
+				mapKeyAllow___L4: mapEntryL7None_(lbls__L4__Allow),
 			}),
-			authResult{
-				identityBar: AuthTypes{AuthTypeSpire: struct{}{}},
-				identityFoo: AuthTypes{AuthTypeSpire: struct{}{}},
-			},
 		},
 		{
 			7,
 			api.Rules{rule____AllowAllAuth, ruleL3__AllowBar, rule__L4__Allow},
 			testMapState(t, mapStateMap{
-				mapKeyAllowAll__: mapEntryL7ExplicitAuth_(AuthTypeSpire, lbls____AllowAll),
-				mapKeyAllow___L4: mapEntryL7DerivedAuth_(AuthTypeSpire, lbls__L4__Allow),
-				mapKeyAllowBar__: mapEntryL7DerivedAuth_(AuthTypeDisabled, lblsL3__AllowBar),
+				mapKeyAllowAll__: mapEntryL7None_(lbls____AllowAll),
+				mapKeyAllow___L4: mapEntryL7None_(lbls__L4__Allow),
 			}),
-			authResult{
-				identityBar: AuthTypes{AuthTypeSpire: struct{}{}},
-				identityFoo: AuthTypes{AuthTypeSpire: struct{}{}},
-			},
 		},
 		{
 			8,
@@ -527,10 +478,6 @@ func Test_MergeL3(t *testing.T) {
 				mapKeyAllowAll__: mapEntryL7None_(lbls____AllowAll),
 				mapKeyAllow___L4: mapEntryL7None_(lbls__L4__Allow),
 			}),
-			authResult{
-				identityBar: AuthTypes{},
-				identityFoo: AuthTypes{},
-			},
 		},
 		{
 			9,
@@ -538,12 +485,7 @@ func Test_MergeL3(t *testing.T) {
 			testMapState(t, mapStateMap{
 				mapKeyAllowAll__: mapEntryL7None_(lbls____AllowAll),
 				mapKeyAllow___L4: mapEntryL7None_(lbls__L4__Allow),
-				mapKeyAllowBar__: mapEntryL7ExplicitAuth_(AuthTypeAlwaysFail, lblsL3__AllowBar),
 			}),
-			authResult{
-				identityBar: AuthTypes{AuthTypeAlwaysFail: struct{}{}},
-				identityFoo: AuthTypes{},
-			},
 		},
 		{
 			10, // Same as 9, but the L3L4 entry is created by an explicit rule.
@@ -551,17 +493,11 @@ func Test_MergeL3(t *testing.T) {
 			testMapState(t, mapStateMap{
 				mapKeyAllowAll__: mapEntryL7None_(lbls____AllowAll),
 				mapKeyAllow___L4: mapEntryL7None_(lbls__L4__Allow),
-				mapKeyAllowBar__: mapEntryL7ExplicitAuth_(AuthTypeAlwaysFail, lblsL3__AllowBar),
-				mapKeyAllowBarL4: mapEntryL7ExplicitAuth_(AuthTypeAlwaysFail, lblsL3L4AllowBar),
 			}),
-			authResult{
-				identityBar: AuthTypes{AuthTypeAlwaysFail: struct{}{}},
-				identityFoo: AuthTypes{},
-			},
 		},
 	}
 
-	identity := identity.NewIdentityFromLabelArray(identity.NumericIdentity(identityFoo), labelsFoo)
+	identity := identity.NewIdentity(identity.NumericIdentity(identityFoo), labelsFoo)
 	for _, tt := range tests {
 		for i, r := range tt.rules {
 			tt.rules[i] = r.WithEndpointSelector(selectFoo_)
@@ -587,19 +523,6 @@ func Test_MergeL3(t *testing.T) {
 					t.Logf("Rules:\n%s\n\n", api.Rules(rules).String())
 					t.Logf("Policy Trace: \n%s\n", logBuffer.String())
 					t.Errorf("Policy obtained didn't match expected for endpoint %s:\nObtained: %v\nExpected: %v", labelsFoo, mapstate, tt.result)
-				}
-				if len(tt.auths) > 0 {
-					repo.mutex.RLock()
-					sp, err := repo.resolvePolicyLocked(identity)
-					repo.mutex.RUnlock()
-					require.NoError(t, err)
-					for remoteID, expectedAuthTypes := range tt.auths {
-						authTypes := sp.GetAuthTypes(remoteID)
-						if !maps.Equal(authTypes, expectedAuthTypes) {
-							t.Errorf("Incorrect AuthTypes result for remote ID %d: obtained %v, expected %v", remoteID, authTypes, expectedAuthTypes)
-						}
-					}
-					sp.Supersede()
 				}
 			})
 		})
@@ -1054,7 +977,7 @@ func Test_MergeRules(t *testing.T) {
 		identity.NumericIdentity(identityFoo): labelsFoo,
 	}
 	selectorCache := testNewSelectorCache(t, hivetest.Logger(t), identityCache)
-	identity := identity.NewIdentityFromLabelArray(identity.NumericIdentity(identityFoo), labelsFoo)
+	identity := identity.NewIdentity(identity.NumericIdentity(identityFoo), labelsFoo)
 
 	tests := []struct {
 		test     int
@@ -1169,7 +1092,7 @@ func Test_MergeRulesWithNamedPorts(t *testing.T) {
 		identity.NumericIdentity(identityFoo): labelsFoo,
 	}
 	selectorCache := testNewSelectorCache(t, hivetest.Logger(t), identityCache)
-	identity := identity.NewIdentityFromLabelArray(identity.NumericIdentity(identityFoo), labelsFoo)
+	identity := identity.NewIdentity(identity.NumericIdentity(identityFoo), labelsFoo)
 
 	tests := []struct {
 		test     int
@@ -1249,7 +1172,7 @@ func Test_AllowAll(t *testing.T) {
 		identityBar: labelsBar,
 	}
 	selectorCache := testNewSelectorCache(t, hivetest.Logger(t), identityCache)
-	identity := identity.NewIdentityFromLabelArray(identity.NumericIdentity(identityFoo), labelsFoo)
+	identity := identity.NewIdentity(identity.NumericIdentity(identityFoo), labelsFoo)
 
 	tests := []struct {
 		test     int
@@ -1289,7 +1212,7 @@ func Test_AllowAll(t *testing.T) {
 
 // newDenyEntryWithLabels creates an deny entry with the specified labels.
 func newDenyEntryWithLabels(lbls labels.LabelArray) mapStateEntry {
-	return newMapStateEntry(0, types.HighestPriority, types.LowestPriority, makeSingleRuleOrigin(lbls, ""), 0, 0, types.Deny, NoAuthRequirement)
+	return newMapStateEntry(0, types.HighestPriority, types.LowestPriority, makeSingleRuleOrigin(lbls, ""), 0, 0, types.Deny)
 }
 
 var (
@@ -1577,20 +1500,20 @@ func Test_EnsureDeniesPrecedeAllows(t *testing.T) {
 
 	// labels.GetCIDRLabels() depends on option.Config.EnableIPv4/6, so must be done
 	// after setting the config
-	lblWorldIP := labels.GetCIDRLabelArray(netip.MustParsePrefix(string(worldIPCIDR)))
-	lblWorldSubnet := labels.GetCIDRLabelArray(netip.MustParsePrefix(string(worldSubnet)))
+	lblWorldIP := labels.GetCIDRLabels(netip.MustParsePrefix(string(worldIPCIDR)))
+	lblWorldSubnet := labels.GetCIDRLabels(netip.MustParsePrefix(string(worldSubnet)))
 
 	identityCache := identity.IdentityMap{
 		identity.NumericIdentity(identityFoo):   labelsFoo,
-		identity.ReservedIdentityWorld:          labels.LabelWorld.LabelArray(),
-		identity.ReservedIdentityWorldIPv4:      labels.LabelWorldIPv4.LabelArray(),
-		identity.ReservedIdentityWorldIPv6:      labels.LabelWorldIPv6.LabelArray(),
-		identity.ReservedIdentityAggregateWorld: labels.LabelsAggregateWorld.LabelArray(),
+		identity.ReservedIdentityWorld:          labels.LabelWorld,
+		identity.ReservedIdentityWorldIPv4:      labels.LabelWorldIPv4,
+		identity.ReservedIdentityWorldIPv6:      labels.LabelWorldIPv6,
+		identity.ReservedIdentityAggregateWorld: labels.LabelsAggregateWorld,
 		worldIPIdentity:                         lblWorldIP,     // "192.0.2.3/32"
 		worldSubnetIdentity:                     lblWorldSubnet, // "192.0.2.0/24"
 	}
 	selectorCache := testNewSelectorCache(t, hivetest.Logger(t), identityCache)
-	identity := identity.NewIdentityFromLabelArray(identity.NumericIdentity(identityFoo), labelsFoo)
+	identity := identity.NewIdentity(identity.NumericIdentity(identityFoo), labelsFoo)
 
 	tests := []struct {
 		test     string
@@ -1715,7 +1638,7 @@ func Test_EnsureDeniesPrecedeAllows(t *testing.T) {
 
 var (
 	allIPv4        = api.CIDR("0.0.0.0/0")
-	lblAllIPv4     = labels.ParseSelectLabelArray(fmt.Sprintf("%s:%s", labels.LabelSourceCIDR, allIPv4))
+	lblAllIPv4     = labels.ParseSelectLabels(fmt.Sprintf("%s:%s", labels.LabelSourceCIDR, allIPv4))
 	one3Z8CIDR     = api.CIDR("1.0.0.0/8")
 	one3Z8Identity = localIdentity(16331)
 	one3Z8Prefix   = netip.MustParsePrefix(string(one3Z8CIDR))
@@ -1762,12 +1685,12 @@ func Test_Allowception(t *testing.T) {
 	// after setting the config.
 	// GetCIDRLabelArray() returns the CIDR label and the appropriate world label,
 	// as needed for an identity (rather than for a selector that only needs one of them).
-	one3Z8Lbls := labels.GetCIDRLabelArray(one3Z8Prefix)
-	one0Z32Lbls := labels.GetCIDRLabelArray(one0Z32Prefix)
+	one3Z8Lbls := labels.GetCIDRLabels(one3Z8Prefix)
+	one0Z32Lbls := labels.GetCIDRLabels(one0Z32Prefix)
 
 	identityCache := identity.IdentityMap{
 		identity.NumericIdentity(identityFoo): labelsFoo,
-		identity.ReservedIdentityWorld:        append(labels.LabelWorld.LabelArray(), lblAllIPv4...),
+		identity.ReservedIdentityWorld:        labels.NewFrom(labels.LabelWorld, lblAllIPv4),
 		one3Z8Identity:                        one3Z8Lbls,  // 16331 (0x3fcb): ["1.0.0.0/8"]
 		one0Z32Identity:                       one0Z32Lbls, // 16332 (0x3fcc): ["1.1.1.1/32"]
 	}
@@ -1779,7 +1702,7 @@ func Test_Allowception(t *testing.T) {
 		ingressKey(one0Z32Identity, 0, 0, 0):                mapEntryAllow,
 	})
 
-	identity := identity.NewIdentityFromLabelArray(identity.NumericIdentity(identityFoo), labelsFoo)
+	identity := identity.NewIdentity(identity.NumericIdentity(identityFoo), labelsFoo)
 
 	repo := newPolicyDistillery(t, selectorCache)
 	rules := api.Rules{ruleAllowIngressDenyCIDRSet}
@@ -1814,10 +1737,10 @@ func Test_EnsureEntitiesSelectableByCIDR(t *testing.T) {
 	hostLabel.MergeLabels(lblHostIPv6CIDR)
 	identityCache := identity.IdentityMap{
 		identity.NumericIdentity(identityFoo): labelsFoo,
-		identity.ReservedIdentityHost:         hostLabel.LabelArray(),
+		identity.ReservedIdentityHost:         hostLabel,
 	}
 	selectorCache := testNewSelectorCache(t, hivetest.Logger(t), identityCache)
-	identity := identity.NewIdentityFromLabelArray(identity.NumericIdentity(identityFoo), labelsFoo)
+	identity := identity.NewIdentity(identity.NumericIdentity(identityFoo), labelsFoo)
 
 	tests := []struct {
 		test     string
@@ -1855,7 +1778,7 @@ func Test_EnsureEntitiesSelectableByCIDR(t *testing.T) {
 }
 
 func addCIDRIdentity(prefix string, c identity.IdentityMap) identity.NumericIdentity {
-	lbls := labels.GetCIDRLabelArray(netip.MustParsePrefix(prefix))
+	lbls := labels.GetCIDRLabels(netip.MustParsePrefix(prefix))
 
 	// return an existing id?
 	for id, ls := range c {
@@ -1880,11 +1803,9 @@ func addFQDNIdentity(fqdnSel api.FQDNSelector, c identity.IdentityMap) (id ident
 	l := fqdnSel.IdentityLabel()
 	lbls[l.Key] = l
 
-	lblA := lbls.LabelArray()
-
 	// return an existing id?
 	for id, ls := range c {
-		if ls.Equals(lblA) {
+		if ls.Equals(lbls) {
 			return id, nil
 		}
 	}
@@ -1893,7 +1814,7 @@ func addFQDNIdentity(fqdnSel api.FQDNSelector, c identity.IdentityMap) (id ident
 	id = identity.IdentityScopeLocal
 	for {
 		if _, exists := c[id]; !exists {
-			return id, identity.IdentityMap{id: lblA}
+			return id, identity.IdentityMap{id: lbls}
 		}
 		id++
 	}
@@ -1911,10 +1832,10 @@ func Test_IncrementalFQDNDeletion(t *testing.T) {
 
 	// load in standard reserved identities
 	identityCache := identity.IdentityMap{
-		fooIdentity.ID: fooIdentity.LabelArray,
+		fooIdentity.ID: fooIdentity.Labels,
 	}
 	identity.IterateReservedIdentities(func(ni identity.NumericIdentity, id *identity.Identity) {
-		identityCache[ni] = id.Labels.LabelArray()
+		identityCache[ni] = id.Labels
 	})
 	id2 := addCIDRIdentity("192.0.2.0/24", identityCache)
 	id3 := addCIDRIdentity("192.0.3.0/24", identityCache)

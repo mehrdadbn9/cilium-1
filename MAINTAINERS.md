@@ -24,9 +24,11 @@ to learn how to level up through the project.
  * [Fabio Falzoi] (Isovalent)
  * [Glib Smaga] (Isovalent)
  * [Hadrien Patte] (Datadog)
+ * [Harsimran Singh Pabla] (Isovalent)
  * [Hemanth Malla] (Microsoft)
  * [Jarno Rajahalme] (Isovalent)
  * [Joe Stringer] (Isovalent)
+ * [Jordan Rife] (Google)
  * [John Fastabend] (Isovalent)
  * [Julian Wiedmann] (Isovalent)
  * [Jussi Mäki] (Isovalent)
@@ -47,6 +49,7 @@ to learn how to level up through the project.
  * [Nirmoy Das] (AMD)
  * [Paul Chaignon] (Isovalent)
  * [Quentin Monnet] (Hedgehog)
+ * [Rastislav Szabo] (Isovalent)
  * [Robin Hahling] (Isovalent)
  * [Sebastian Wicki] (Isovalent)
  * [Simone Magnani] (Isovalent)
@@ -102,11 +105,13 @@ project.
 [Gilberto Bertin]: https://github.com/jibi
 [Glib Smaga]: https://github.com/glibsm
 [Hadrien Patte]: https://github.com/HadrienPatte
+[Harsimran Singh Pabla]: https://github.com/harsimran-pabla
 [Hemanth Malla]: https://github.com/hemanthmalla
 [Ian Vernon]: https://github.com/ianvernon
 [Ilya Dmitrichenko]: https://github.com/errordeveloper
 [Jarno Rajahalme]: https://github.com/jrajahalme
 [Joe Stringer]: https://github.com/joestringer
+[Jordan Rife]: https://github.com/jrife
 [John Fastabend]: https://github.com/jrfastab
 [Julian Wiedmann]: https://github.com/julianwiedmann
 [Jussi Mäki]: https://github.com/joamaki
@@ -130,6 +135,7 @@ project.
 [Nirmoy Das]: https://github.com/nirmoy
 [Paul Chaignon]: https://github.com/pchaigno
 [Quentin Monnet]: https://github.com/qmonnet
+[Rastislav Szabo]: https://github.com/rastislavs
 [Ray Bejjani]: https://github.com/raybejjani
 [Robin Hahling]: https://github.com/rolinh
 [Sebastian Wicki]: https://github.com/gandro

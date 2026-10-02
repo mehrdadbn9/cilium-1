@@ -4,18 +4,18 @@
 package config
 
 import (
-	"net"
 	"net/netip"
 
-	"github.com/cilium/cilium/pkg/cidr"
 	plugin "github.com/cilium/cilium/pkg/datapath/plugins/types"
 	"github.com/cilium/cilium/pkg/datapath/tables"
 	"github.com/cilium/cilium/pkg/datapath/tunnel"
 	"github.com/cilium/cilium/pkg/datapath/xdp"
+	"github.com/cilium/cilium/pkg/ip"
 	"github.com/cilium/cilium/pkg/kpr"
 	"github.com/cilium/cilium/pkg/loadbalancer"
 	"github.com/cilium/cilium/pkg/mac"
 	"github.com/cilium/cilium/pkg/maglev"
+	"github.com/cilium/cilium/pkg/slices"
 	"github.com/cilium/cilium/pkg/svcrouteconfig"
 )
 
@@ -36,6 +36,9 @@ type ChangeHandler interface {
 type Config struct {
 	// ClusterID is the immutable identifier of the local cluster.
 	ClusterID uint32
+
+	// Number of bits of the identity reserved for the Cluster ID.
+	ClusterIDBits uint32
 
 	// NodeIPv4 is the primary IPv4 address of this node.
 	// Mutable at runtime.
@@ -71,21 +74,13 @@ type Config struct {
 	// MAC address of the cilium_net device.
 	CiliumNetMAC mac.MAC
 
-	// AllocCIDRIPv4 is the IPv4 allocation CIDR from which IP addresses for
-	// endpoints are allocated from.
-	// Immutable at runtime.
-	AllocCIDRIPv4 *cidr.CIDR
-
-	// AllocCIDRIPv6 is the IPv6 allocation CIDR from which IP addresses for
-	// endpoints are allocated from.
-	// Immutable at runtime.
-	AllocCIDRIPv6 *cidr.CIDR
-
 	// NativeRoutingCIDRIPv4 is the v4 CIDR in which pod IPs are routable.
-	NativeRoutingCIDRIPv4 *cidr.CIDR
+	// +deepequal-gen=false
+	NativeRoutingCIDRIPv4 netip.Prefix
 
 	// NativeRoutingCIDRIPv6 is the v4 CIDR in which pod IPs are routable.
-	NativeRoutingCIDRIPv6 *cidr.CIDR
+	// +deepequal-gen=false
+	NativeRoutingCIDRIPv6 netip.Prefix
 
 	// LoopbackIPv4 is the source address used for SNAT when a Pod talks to itself
 	// over a Service.
@@ -107,6 +102,10 @@ type Config struct {
 	// DirectRoutingDevice is the device used in direct routing mode.
 	// Mutable at runtime.
 	DirectRoutingDevice *tables.Device
+
+	// LoadBalancerRSS contains the resolved source prefixes used for DSR IPIP RSS.
+	// +deepequal-gen=false
+	LoadBalancerRSS loadbalancer.RSSConfig
 
 	// NodeAddresses are the IP addresses of the local node that are considered
 	// as this node's addresses. From this set we pick the addresses that are
@@ -143,7 +142,7 @@ type Config struct {
 	//
 	// This field is mutable. The implementation of
 	// NodeConfigurationChanged() must adjust the routes accordingly.
-	AuxiliaryPrefixes []*cidr.CIDR
+	AuxiliaryPrefixes []ip.Prefix
 
 	// EnableIPv4 enables use of IPv4. Routing to the IPv4 allocation CIDR
 	// of other nodes must be enabled.
@@ -165,6 +164,12 @@ type Config struct {
 	// This field is immutable at runtime. The value will not change in
 	// subsequent calls to NodeConfigurationChanged().
 	EnableEncapsulation bool
+
+	// Interface index of the IPv4 IPIP encapsulation device.
+	Encap4IfIndex uint32
+
+	// Interface index of the IPv6 IPIP encapsulation device.
+	Encap6IfIndex uint32
 
 	// RequiresNativeRouting returns true if the node requires native routing to setup.
 	RequiresNativeRouting bool
@@ -242,12 +247,15 @@ type Config struct {
 	// IPv4PodSubnets is a list of IPv4 subnets that pod IPs are assigned from
 	// these are then used when encryption is enabled to configure the node
 	// for encryption over these subnets at node initialization.
-	IPv4PodSubnets []*cidr.CIDR
+	IPv4PodSubnets []ip.Prefix
 
 	// IPv6PodSubnets is a list of IPv6 subnets that pod IPs are assigned from
 	// these are then used when encryption is enabled to configure the node
 	// for encryption over these subnets at node initialization.
-	IPv6PodSubnets []*cidr.CIDR
+	IPv6PodSubnets []ip.Prefix
+
+	// VLANFilter contains the resolved VLAN bypass configuration for native devices.
+	VLANFilter VLANFilter
 
 	// XDPConfig holds configuration options to determine how the node should
 	// handle XDP programs.
@@ -272,7 +280,7 @@ func (cfg *Config) DeepEqual(other *Config) bool {
 	if other == nil {
 		return false
 	}
-	// Manually compare netip.Addr fields
+	// Manually compare netip.Addr and netip.Prefix fields
 	if cfg.NodeIPv4 != other.NodeIPv4 {
 		return false
 	}
@@ -291,6 +299,15 @@ func (cfg *Config) DeepEqual(other *Config) bool {
 	if cfg.ServiceLoopbackIPv6 != other.ServiceLoopbackIPv6 {
 		return false
 	}
+	if cfg.NativeRoutingCIDRIPv4 != other.NativeRoutingCIDRIPv4 {
+		return false
+	}
+	if cfg.NativeRoutingCIDRIPv6 != other.NativeRoutingCIDRIPv6 {
+		return false
+	}
+	if cfg.LoadBalancerRSS != other.LoadBalancerRSS {
+		return false
+	}
 	// Call generated `deepEqual` method which compares all other fields
 	return cfg.deepEqual(other)
 }
@@ -299,10 +316,10 @@ func (cfg *Config) DeviceNames() []string {
 	return tables.DeviceNames(cfg.Devices)
 }
 
-func (cfg *Config) GetIPv4PodSubnets() []*net.IPNet {
-	return cidr.CIDRsToIPNets(cfg.IPv4PodSubnets)
+func (cfg *Config) GetIPv4PodSubnets() []netip.Prefix {
+	return slices.Map(cfg.IPv4PodSubnets, ip.Prefix.Unwrap)
 }
 
-func (cfg *Config) GetIPv6PodSubnets() []*net.IPNet {
-	return cidr.CIDRsToIPNets(cfg.IPv6PodSubnets)
+func (cfg *Config) GetIPv6PodSubnets() []netip.Prefix {
+	return slices.Map(cfg.IPv6PodSubnets, ip.Prefix.Unwrap)
 }

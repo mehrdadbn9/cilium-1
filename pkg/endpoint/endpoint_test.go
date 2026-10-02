@@ -5,6 +5,7 @@ package endpoint
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"iter"
@@ -24,6 +25,7 @@ import (
 
 	"github.com/cilium/cilium/api/v1/models"
 	"github.com/cilium/cilium/pkg/annotation"
+	cmtypes "github.com/cilium/cilium/pkg/clustermesh/types"
 	fakebandwidth "github.com/cilium/cilium/pkg/datapath/linux/bandwidth/fake"
 	fakeipsec "github.com/cilium/cilium/pkg/datapath/linux/ipsec/fake"
 	fakeendpoint "github.com/cilium/cilium/pkg/endpoint/fake"
@@ -49,7 +51,6 @@ import (
 	"github.com/cilium/cilium/pkg/policy"
 	"github.com/cilium/cilium/pkg/policy/api"
 	"github.com/cilium/cilium/pkg/policy/compute"
-	policyTypes "github.com/cilium/cilium/pkg/policy/types"
 	proxyendpoint "github.com/cilium/cilium/pkg/proxy/endpoint"
 	"github.com/cilium/cilium/pkg/testutils"
 	testcompute "github.com/cilium/cilium/pkg/testutils/compute"
@@ -67,12 +68,123 @@ type EndpointSuite struct {
 	mgr          *cache.CachingIdentityAllocator
 }
 
+func TestAPICanModifyConfig(t *testing.T) {
+	tests := []struct {
+		name       string
+		dropNotify bool
+		options    models.ConfigurationMap
+		wantErr    string
+	}{
+		{
+			name:       "disable drop notifications",
+			dropNotify: true,
+			options:    models.ConfigurationMap{option.DropNotify: "0"},
+		},
+		{
+			name:    "enable drop notifications",
+			options: models.ConfigurationMap{option.DropNotify: "1"},
+		},
+		{
+			name:       "unchanged drop notifications",
+			dropNotify: true,
+			options:    models.ConfigurationMap{option.DropNotify: "1"},
+		},
+		{
+			name:    "enable trace notifications",
+			options: models.ConfigurationMap{option.TraceNotify: "1"},
+		},
+		{
+			name:    "unchanged protected option",
+			options: models.ConfigurationMap{option.SourceIPVerification: "1"},
+		},
+		{
+			name:    "change protected option",
+			options: models.ConfigurationMap{option.SourceIPVerification: "0"},
+			wantErr: "SourceIPVerification cannot be modified for endpoints with reserved labels",
+		},
+		{
+			name:       "change drop notifications and protected option",
+			dropNotify: true,
+			options: models.ConfigurationMap{
+				option.DropNotify:           "0",
+				option.SourceIPVerification: "0",
+			},
+			wantErr: "SourceIPVerification cannot be modified for endpoints with reserved labels",
+		},
+	}
+
+	lib := option.GetEndpointMutableOptionLibrary()
+	for _, label := range []string{"host", "health"} {
+		for _, tt := range tests {
+			t.Run(label+"/"+tt.name, func(t *testing.T) {
+				ep := &Endpoint{
+					labels: labels.OpLabels{
+						OrchestrationIdentity: labels.Map2Labels(map[string]string{label: ""}, labels.LabelSourceReserved),
+					},
+					Options: option.NewIntOptions(&lib),
+				}
+				ep.Options.SetBool(option.DropNotify, tt.dropNotify)
+				ep.Options.SetBool(option.SourceIPVerification, true)
+
+				err := ep.APICanModifyConfig(tt.options)
+				if tt.wantErr != "" {
+					require.EqualError(t, err, tt.wantErr)
+				} else {
+					require.NoError(t, err)
+				}
+			})
+		}
+	}
+}
+
+func TestGetPolicyNamesCachesAddresses(t *testing.T) {
+	tests := []struct {
+		name string
+		ep   *Endpoint
+		want []string
+	}{
+		{
+			name: "dual stack",
+			ep: &Endpoint{
+				IPv4: netip.MustParseAddr("192.0.2.1"),
+				IPv6: netip.MustParseAddr("2001:db8::1"),
+			},
+			want: []string{"2001:db8::1", "192.0.2.1"},
+		},
+		{
+			name: "IPv4 only",
+			ep: &Endpoint{
+				IPv4: netip.MustParseAddr("192.0.2.1"),
+			},
+			want: []string{"192.0.2.1"},
+		},
+		{
+			name: "IPv6 only",
+			ep: &Endpoint{
+				IPv4: netip.MustParseAddr("2001:db8::1"),
+			},
+			want: []string{"2001:db8::1"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			first := tt.ep.GetPolicyNames()
+			second := tt.ep.GetPolicyNames()
+
+			require.Equal(t, tt.want, first)
+			require.Equal(t, len(first), cap(first))
+			require.Same(t, &first[0], &second[0])
+		})
+	}
+}
+
 func setupEndpointSuite(tb testing.TB) *EndpointSuite {
 	testutils.IntegrationTest(tb)
 	logger := hivetest.Logger(tb)
 
 	idmgr := identitymanager.NewIDManager(logger)
-	repo := policy.NewPolicyRepository(logger, nil, nil, nil, idmgr, testpolicy.NewPolicyMetricsNoop())
+	repo := policy.NewPolicyRepository(logger, cmtypes.DefaultClusterInfo, nil, nil, nil, idmgr, testpolicy.NewPolicyMetricsNoop())
 	s := &EndpointSuite{
 		orchestrator: &fakeendpoint.FakeOrchestrator{},
 		repo:         repo,
@@ -547,7 +659,7 @@ func TestInitialNamedPortsIdentityLabel(t *testing.T) {
 		model := newTestEndpointModel(100, StateWaitingForIdentity)
 		logger := hivetest.Logger(t)
 		idmgr := identitymanager.NewIDManager(logger)
-		repo := policy.NewPolicyRepository(logger, nil, nil, nil, idmgr, testpolicy.NewPolicyMetricsNoop())
+		repo := policy.NewPolicyRepository(logger, cmtypes.DefaultClusterInfo, nil, nil, nil, idmgr, testpolicy.NewPolicyMetricsNoop())
 		fetcher := testcompute.InstantiateCellForTesting(t, logger, "endpoint", "TestInitialNamedPortsIdentityLabel", repo, idmgr)
 		p := createEndpointParams(
 			t,
@@ -615,15 +727,15 @@ func TestInitialNamedPortsIdentityLabel(t *testing.T) {
 				}
 			}
 			return &corev1.Pod{
-					ObjectMeta: metav1.ObjectMeta{
-						Namespace: ns,
-						Name:      podName,
-						UID:       k8sTypes.UID(uid),
-					},
-				}, &K8sMetadata{
-					IdentityLabels: lbls,
-					NamedPorts:     namedPorts,
-				}, nil
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace: ns,
+					Name:      podName,
+					UID:       k8sTypes.UID(uid),
+				},
+			}, &K8sMetadata{
+				IdentityLabels: lbls,
+				NamedPorts:     namedPorts,
+			}, nil
 		}
 	}
 	resolvePodMetadata := func(t *testing.T, e *Endpoint, restored bool, namedPorts ciliumTypes.NamedPortMap) {
@@ -1084,10 +1196,6 @@ func (sp *testSelectorPolicy) GetEgressNamedPorts(name string, proto u8proto.U8p
 	}
 }
 
-func (sp *testSelectorPolicy) GetAuthTypes(remoteID identity.NumericIdentity) policyTypes.AuthTypes {
-	return nil
-}
-
 func (sp *testSelectorPolicy) AddHold() bool { return true }
 
 func (sp *testSelectorPolicy) ReleaseHold() {}
@@ -1187,7 +1295,7 @@ func TestProxyID(t *testing.T) {
 func endpointCachedSelectorForIdentities(t testing.TB, selectorLabel string, identities ...identity.NumericIdentity) (policy.CachedSelector, policy.SelectorSnapshot) {
 	identityMap := make(identity.IdentityMap, len(identities))
 	for _, nid := range identities {
-		identityMap[nid] = labels.ParseLabelArray(selectorLabel)
+		identityMap[nid] = labels.ParseSelectLabels(selectorLabel)
 	}
 
 	selectorCache := policy.NewSelectorCache(hivetest.Logger(t), identityMap)
@@ -1253,6 +1361,42 @@ func TestK8sPodNameIsSet(t *testing.T) {
 	e.K8sPodName = "foo"
 	e.K8sNamespace = "default"
 	require.True(t, e.K8sNamespaceAndPodNameIsSet())
+}
+
+func TestGetK8sPodUID(t *testing.T) {
+	tests := []struct {
+		name   string
+		cniUID string
+		podUID string
+		want   string
+	}{
+		{
+			name:   "CNI UID takes precedence",
+			cniUID: "cni-pod-uid",
+			podUID: "cached-pod-uid",
+			want:   "cni-pod-uid",
+		},
+		{
+			name:   "cached Pod UID fallback",
+			podUID: "cached-pod-uid",
+			want:   "cached-pod-uid",
+		},
+		{
+			name: "unknown Pod UID",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			e := &Endpoint{K8sUID: tt.cniUID}
+			if tt.podUID != "" {
+				e.SetPod(&corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+					UID: k8sTypes.UID(tt.podUID),
+				}})
+			}
+			require.Equal(t, tt.want, e.GetK8sPodUID())
+		})
+	}
 }
 
 type EndpointDeadlockEvent struct {
@@ -1607,4 +1751,41 @@ func TestComputeCIDRLabels(t *testing.T) {
 			assert.Equal(t, tt.expectLabels, ep.computeCIDRLabelsRLocked())
 		})
 	}
+}
+
+// TestComputeCIDRLabelsAfterRestore ensures that endpoints restored from disk
+// are wired up with the ipcache, so that they keep resolving their CIDR labels
+// across an agent restart.
+func TestComputeCIDRLabelsAfterRestore(t *testing.T) {
+	originalMode := option.Config.PolicyCIDRMatchMode
+	defer func() {
+		option.Config.PolicyCIDRMatchMode = originalMode
+	}()
+	option.Config.PolicyCIDRMatchMode = []string{"pods"}
+
+	logger := hivetest.Logger(t)
+	do := &DummyOwner{repo: policy.NewPolicyRepository(logger, cmtypes.DefaultClusterInfo, nil, nil, nil, nil, testpolicy.NewPolicyMetricsNoop())}
+	p := createEndpointParams(t, nil, do.repo, do.fetcher)
+
+	podIP := netip.MustParseAddr("10.244.1.7")
+	lblCIDR := labels.NewLabel("10.244.1.0/24", "", labels.LabelSourceCIDR)
+	expected := labels.Labels{lblCIDR.GetExtendedKey(): lblCIDR}
+	p.IPCache = &mockIPCache{labels: map[string]labels.Labels{
+		podIP.String(): expected,
+	}}
+
+	ep, err := NewEndpointFromChangeModel(p, nil, nil, newTestEndpointModel(12345, StateReady), nil)
+	require.NoError(t, err)
+	ep.IPv4 = podIP
+	require.Equal(t, expected, ep.computeCIDRLabelsRLocked())
+
+	ep.unconditionalRLock()
+	epJSON, err := json.Marshal(ep)
+	ep.runlock()
+	require.NoError(t, err)
+
+	restoredEP, err := ParseEndpoint(p, nil, nil, epJSON, nil)
+	require.NoError(t, err)
+	require.Equal(t, podIP, restoredEP.IPv4)
+	require.Equal(t, expected, restoredEP.computeCIDRLabelsRLocked())
 }

@@ -5,6 +5,7 @@ package loader
 
 import (
 	"github.com/cilium/cilium/pkg/datapath/config"
+	"github.com/cilium/cilium/pkg/datapath/types"
 	"github.com/cilium/cilium/pkg/option"
 )
 
@@ -19,11 +20,22 @@ var (
 
 func setBasePermutations(t *config.Node) {
 	t.EnableBPFHostRouting = true
+	t.IPv4SNATExclusion.DstAddr.Addr = [4]byte{0xff, 0xff, 0x00, 0x00}
+	t.IPv4SNATExclusion.Bits = 16
+	t.IPv4SNATExclusion.Enabled = true
+	t.IPv6SNATExclusion.DstAddr.Addr = [16]byte{0xfa, 0xce, 0xff, 0xff, 0xff}
+	t.IPv6SNATExclusion.DstMask.Addr = [16]byte{0xff, 0xff, 0xff, 0xff, 0xff}
+	t.IPv6SNATExclusion.Enabled = true
 	t.LBSelectionPerService = true
 	t.MonitorAggregation = uint8(option.MonitorAggregationLevelMedium)
+	t.MonitorReportInterval = 5
+	t.MonitorReportFlags = 0xff
 	t.TracingIPOptionType = 1
 	t.DebugLB = true
 	t.EventsMapRateLimit = 1000
+	t.EnableIdentityMark = true
+	t.EnableSCTP = true
+	t.EnableDropNotify = true
 }
 
 func baseLXCPermutations() *loadPermutationBuilder {
@@ -39,6 +51,9 @@ func baseLXCPermutations() *loadPermutationBuilder {
 			t.EnableIPv6Fragments = true
 			t.EnableARPResponder = true
 			t.EnableNetkit = false
+			t.EnableVTEP = true
+			t.EnableServiceNoBackendResponse = true
+			t.EnableSIPVerification = true
 		}),
 
 		Increment(func(t *config.BPFLXC, v bool) { t.Node.PolicyDenyResponseEnabled = v }),
@@ -61,6 +76,8 @@ func baseHostPermutations() *loadPermutationBuilder {
 			t.EnableIPv4Fragments = true
 			t.EnableIPv6Fragments = true
 			t.EnableL2Announcements = true
+			t.EnableVTEP = true
+			t.EnableServiceNoBackendResponse = true
 		}),
 
 		Increment(func(t *config.BPFHost, v bool) { t.Node.PolicyDenyResponseEnabled = v }),
@@ -74,6 +91,15 @@ func baseHostPermutations() *loadPermutationBuilder {
 		}),
 		Increment(func(t *config.BPFHost, v bool) { t.HybridRoutingEnabled = v }),
 		Increment(func(t *config.BPFHost, v bool) { t.Node.EnableEndpointRoutes = v }),
+		Increment(func(t *config.BPFHost, v bool) {
+			if v {
+				t.StrictEgressEncryption.Enabled = true
+				t.StrictEgressEncryption.IPv4Net = types.V4Addr{Addr: [4]byte{192, 168, 0, 0}}
+				t.StrictEgressEncryption.IPv4EncryptIface = types.V4Addr{Addr: [4]byte{10, 0, 0, 1}}
+				t.StrictEgressEncryption.IPv4NetSize = 24
+				t.StrictEgressEncryption.AllowRemoteNodes = true
+			}
+		}),
 	)
 	return b
 }
@@ -85,6 +111,8 @@ func baseOverlayPermutations() *loadPermutationBuilder {
 		Always(func(t *config.BPFOverlay, _ bool) {
 			setBasePermutations(&t.Node)
 			t.EnableConntrackAccounting = true
+			t.EnableVTEP = true
+			t.EnableServiceNoBackendResponse = true
 		}),
 		Increment(func(t *config.BPFOverlay, v bool) { t.Node.EnableEndpointRoutes = v }),
 	)
@@ -97,8 +125,17 @@ func baseSockPermutations() *loadPermutationBuilder {
 	b.addOptions(
 		Always(func(t *config.BPFSock, _ bool) {
 			setBasePermutations(&t.Node)
+			t.DisableExternalIPMitigation = false
 			t.EnableIPv4Fragments = true
 			t.EnableIPv6Fragments = true
+			t.EnableSocketLBTracing = true
+			t.EnableVTEP = true
+			t.EnableServiceNoBackendResponse = true
+		}),
+		Increment(func(t *config.BPFSock, v bool) {
+			if v {
+				t.MKEHost = option.HostExtensionMKE
+			}
 		}),
 		IncrementOrPermute(func(t *config.BPFSock, v bool) { t.EnableLRP = v }),
 	)
@@ -114,6 +151,8 @@ func baseWireguardPermutations() *loadPermutationBuilder {
 			t.EnableConntrackAccounting = true
 			t.EnableIPv4Fragments = true
 			t.EnableIPv6Fragments = true
+			t.EnableVTEP = true
+			t.EnableServiceNoBackendResponse = true
 		}),
 		Increment(func(t *config.BPFWireguard, v bool) { t.Node.EnableEndpointRoutes = v }),
 	)
@@ -129,6 +168,8 @@ func baseXDPPermutations() *loadPermutationBuilder {
 			t.EnableConntrackAccounting = true
 			t.EnableIPv4Fragments = true
 			t.EnableIPv6Fragments = true
+			t.EnableVTEP = true
+			t.EnableServiceNoBackendResponse = true
 		}),
 		Increment(func(t *config.BPFXDP, v bool) { t.EnableXDPPrefilter = v }),
 	)

@@ -83,6 +83,9 @@ var (
 	//go:embed manifests/client-egress-l7-http.yaml
 	clientEgressL7HTTPPolicyYAML string
 
+	//go:embed manifests/client-egress-l7-http-connect.yaml
+	clientEgressL7HTTPConnectPolicyYAML string
+
 	//go:embed manifests/client-egress-l7-http-port-range.yaml
 	clientEgressL7HTTPPolicyPortRangeYAML string
 
@@ -298,6 +301,9 @@ func concurrentTests(connTests []*check.ConnectivityTest) error {
 		clientEgressToCidrgroupDenyByLabel{},
 		clientEgressToCidrDenyDefault{},
 		clusterMeshEndpointSliceSync{},
+		clusterMeshNSNotGlobal{},
+		clusterMeshNSNotGlobalPodToPod{},
+		clusterMeshNSNotGlobalPodToPodDenied{},
 		health{},
 		northSouthLoadbalancing{},
 		podToPodEncryption{},
@@ -309,15 +315,15 @@ func concurrentTests(connTests []*check.ConnectivityTest) error {
 		egressGatewayWithL7Policy{},
 		podToNodeCidrpolicy{},
 		northSouthLoadbalancingWithL7Policy{},
+		eastWestLoadbalancingWithL7Policy{},
 		echoIngressL7{},
 		echoIngressL7NamedPort{},
 		clientEgressL7Method{},
 		clientEgressL7{},
 		clientEgressL7NamedPort{},
+		clientEgressL7Connect{},
 		clientEgressTlsSni{},
 		clientEgressL7SetHeader{},
-		echoIngressAuthAlwaysFail{},
-		echoIngressMutualAuthSpiffe{},
 		podToIngressService{},
 		outsideToIngressService{},
 		serviceLoopback{},
@@ -375,6 +381,7 @@ func renderTemplates(clusterNameLocal, clusterNameRemote string, param check.Par
 		"clientEgressToCIDRGroupExternalDenyLabelPolicyYAML":         clientEgressToCIDRGroupExternalDenyLabelPolicyYAML,
 		"clientEgressToCIDRGroupExternalDenyLabelPolicyV2Alpha1YAML": clientEgressToCIDRGroupExternalDenyLabelPolicyV2Alpha1YAML,
 		"clientEgressL7HTTPPolicyYAML":                               clientEgressL7HTTPPolicyYAML,
+		"clientEgressL7HTTPConnectPolicyYAML":                        clientEgressL7HTTPConnectPolicyYAML,
 		"clientEgressL7HTTPPolicyPortRangeYAML":                      clientEgressL7HTTPPolicyPortRangeYAML,
 		"clientEgressL7HTTPNamedPortPolicyYAML":                      clientEgressL7HTTPNamedPortPolicyYAML,
 		"clientEgressToFQDNsPolicyYAML":                              clientEgressToFQDNsPolicyYAML,

@@ -27,6 +27,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	k8sTypes "k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/apimachinery/pkg/watch"
 	k8sTesting "k8s.io/client-go/testing"
 
@@ -38,7 +39,6 @@ import (
 	"github.com/cilium/cilium/pkg/ipam/service/ipallocator"
 	"github.com/cilium/cilium/pkg/ipam/types"
 	ciliumv2 "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2"
-	k8sv2alpha1 "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2alpha1"
 	k8sClient "github.com/cilium/cilium/pkg/k8s/client/testutils"
 	"github.com/cilium/cilium/pkg/k8s/resource"
 	"github.com/cilium/cilium/pkg/lock"
@@ -502,13 +502,9 @@ func Test_MultiPoolManager(t *testing.T) {
 		}, timeout, tick)
 
 		ipv4Dump, ipv4Summary := mgr.dump(IPv4)
-		assert.Equal(t, map[Pool]map[string]string{
-			PoolDefault(): {
-				defaultAllocation.IP.String(): "",
-			},
-			Pool("mars"): {
-				marsAllocation.IP.String(): "",
-			},
+		assert.Equal(t, map[Pool]sets.Set[netip.Addr]{
+			PoolDefault(): sets.New(defaultAllocation.IP),
+			Pool("mars"):  sets.New(marsAllocation.IP),
 		}, ipv4Dump)
 		assert.Equal(t, "2 IPAM pool(s) available", ipv4Summary)
 	})
@@ -1163,7 +1159,7 @@ func Test_MultiPoolManager_UpdateNodeRetries(t *testing.T) {
 			Status: ciliumv2.NodeStatus{
 				IPAM: types.IPAMStatus{
 					Used: types.AllocationMap{
-						"10.0.0.1": types.AllocationIP{Resource: "pod-a"},
+						iputil.AddrFrom(netip.MustParseAddr("10.0.0.1")): types.AllocationIP{Resource: "pod-a"},
 					},
 				},
 			},
@@ -1507,13 +1503,13 @@ func TestMultiPoolManagerWaitForAllPools(t *testing.T) {
 }
 
 func Test_multiPoolManager_staticIPStatus(t *testing.T) {
-	newNode := func(tags map[string]string, assigned string) *ciliumv2.CiliumNode {
+	newNode := func(tags map[string]string, assigned netip.Addr) *ciliumv2.CiliumNode {
 		return &ciliumv2.CiliumNode{
 			Spec: ciliumv2.NodeSpec{
 				IPAM: types.IPAMSpec{StaticIPTags: tags},
 			},
 			Status: ciliumv2.NodeStatus{
-				IPAM: types.IPAMStatus{AssignedStaticIP: assigned},
+				IPAM: types.IPAMStatus{AssignedStaticIP: iputil.AddrFrom(assigned)},
 			},
 		}
 	}
@@ -1522,31 +1518,31 @@ func Test_multiPoolManager_staticIPStatus(t *testing.T) {
 		name                  string
 		node                  *ciliumv2.CiliumNode
 		wantRequestedStaticIP bool
-		wantAssignedStaticIP  string
+		wantAssignedStaticIP  netip.Addr
 	}{
 		{
 			name:                  "nil node",
 			node:                  nil,
 			wantRequestedStaticIP: false,
-			wantAssignedStaticIP:  "",
+			wantAssignedStaticIP:  netip.Addr{},
 		},
 		{
 			name:                  "no static IP requested",
-			node:                  newNode(nil, ""),
+			node:                  newNode(nil, netip.Addr{}),
 			wantRequestedStaticIP: false,
-			wantAssignedStaticIP:  "",
+			wantAssignedStaticIP:  netip.Addr{},
 		},
 		{
 			name:                  "static IP requested but not yet assigned",
-			node:                  newNode(map[string]string{"env": "prod"}, ""),
+			node:                  newNode(map[string]string{"env": "prod"}, netip.Addr{}),
 			wantRequestedStaticIP: true,
-			wantAssignedStaticIP:  "",
+			wantAssignedStaticIP:  netip.Addr{},
 		},
 		{
 			name:                  "static IP requested and assigned",
-			node:                  newNode(map[string]string{"env": "prod"}, "1.2.3.4"),
+			node:                  newNode(map[string]string{"env": "prod"}, netip.MustParseAddr("1.2.3.4")),
 			wantRequestedStaticIP: true,
-			wantAssignedStaticIP:  "1.2.3.4",
+			wantAssignedStaticIP:  netip.MustParseAddr("1.2.3.4"),
 		},
 	}
 
@@ -1575,12 +1571,12 @@ func insertPool(t *testing.T, db *statedb.DB, tbl statedb.RWTable[podippool.Loca
 	}
 
 	poolObj := podippool.LocalPodIPPool{
-		CiliumPodIPPool: &k8sv2alpha1.CiliumPodIPPool{
+		CiliumPodIPPool: &ciliumv2.CiliumPodIPPool{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:        name,
 				Annotations: ann,
 			},
-			Spec: k8sv2alpha1.IPPoolSpec{
+			Spec: ciliumv2.IPPoolSpec{
 				AllowFirstIP: allowFirstIP,
 				AllowLastIP:  allowLastIP,
 			},
@@ -1648,7 +1644,7 @@ func createSkipMasqTestManager(t *testing.T, db *statedb.DB, pools statedb.Table
 	_, err := clientset.CiliumV2().CiliumNodes().Create(t.Context(), initialNode, metav1.CreateOptions{})
 	assert.NoError(t, err)
 
-	v4Alloc, _ := newMultiPoolAllocators(MultiPoolAllocatorParams{
+	v4Alloc, _, err := newMultiPoolAllocators(t.Context(), MultiPoolAllocatorParams{
 		Logger:                    hivetest.Logger(t),
 		IPv4Enabled:               fakeConfig.EnableIPv4,
 		IPv6Enabled:               fakeConfig.EnableIPv6,
@@ -1662,6 +1658,7 @@ func createSkipMasqTestManager(t *testing.T, db *statedb.DB, pools statedb.Table
 		PodIPPools:                pools,
 		OnlyMasqueradeDefaultPool: onlyMasqDefault,
 	})
+	require.NoError(t, err)
 
 	return v4Alloc
 }

@@ -37,8 +37,9 @@ spec:
         {{- toYaml . | nindent 8 }}
         {{- end }}
         {{- if and .Values.hubble.relay.prometheus.enabled (not .Values.hubble.relay.prometheus.serviceMonitor.enabled) }}
-        prometheus.io/port: {{ .Values.hubble.relay.prometheus.port | quote }}
-        prometheus.io/scrape: "true"
+        {{- with include "cilium.prometheusAnnotations" (list .Values.hubble.relay.prometheus.port .Values.hubble.relay.podAnnotations) }}
+        {{- . | nindent 8 }}
+        {{- end }}
         {{- end }}
       labels:
         k8s-app: hubble-relay
@@ -88,7 +89,7 @@ spec:
             - name: grpc
               containerPort: {{ include "hubble-relay.config.listenPort" . }}
             {{- if .Values.hubble.relay.prometheus.enabled }}
-            - name: prometheus
+            - name: {{ .Values.hubble.relay.prometheus.portName | quote }}
               containerPort: {{ .Values.hubble.relay.prometheus.port }}
               protocol: TCP
             {{- end }}

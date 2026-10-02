@@ -10,7 +10,6 @@ import (
 	"fmt"
 	"os"
 	"path"
-	"slices"
 
 	corev1 "k8s.io/api/core/v1"
 	resourceapi "k8s.io/api/resource/v1"
@@ -121,6 +120,13 @@ func (d *Driver) HandleError(ctx context.Context, err error, msg string) {
 	)
 }
 
+// WatchHealthStatus reports device health to the kubelet. The driver does not
+// track device health, so it declines the service: the kubelet is told the
+// stream is unimplemented and stops watching.
+func (d *Driver) WatchHealthStatus(ctx context.Context, reports chan<- kubeletplugin.DeviceHealthReport) error {
+	return kubeletplugin.ErrHealthNotSupported
+}
+
 // PrepareResourceClaims gets called when we have a request to allocate a resource claim. we also need to have a way to remember
 // the allocations elsewhere so allocation state persist across restarts in the plugin.
 func (driver *Driver) PrepareResourceClaims(ctx context.Context, claims []*resourceapi.ResourceClaim) (result map[kube_types.UID]kubeletplugin.PrepareResult, err error) {
@@ -184,42 +190,38 @@ func (driver *Driver) UnprepareResourceClaims(ctx context.Context, claims []kube
 
 // unprepareResourceClaim removes an allocation and frees up the device.
 func (d *Driver) unprepareResourceClaim(ctx context.Context, claim kubeletplugin.NamespacedObject) error {
-	var errs []error
-	var found bool
-
-	for pod, alloc := range d.allocations {
-		devices, ok := alloc[claim.UID]
-
-		if ok {
-			found = true
-			for _, dev := range devices {
-				if err := dev.Device.Free(dev.Config); err != nil {
-					errs = append(errs, err)
-				}
-			}
-		}
-
-		if found {
-			delete(alloc, claim.UID)
-			// see if pod ended up without any allocations.
-			// clean it up if we just removed the last one.
-			if len(alloc) == 0 {
-				delete(d.allocations, pod)
-			}
-
-			break
+	// Look up all devices for this claim via the secondary index.
+	txn := d.db.ReadTxn()
+	var devices []allocation
+	for row := range AllocationsByClaimUID(d.allocationTable, txn, claim.UID) {
+		if row.PreparedDevice != nil {
+			devices = append(devices, allocationFromRow(row))
 		}
 	}
 
-	if !found {
+	if len(devices) == 0 {
 		d.logger.DebugContext(
 			ctx, "no allocation found for claim",
 			logfields.UID, claim.UID,
 			logfields.K8sNamespace, claim.Namespace,
 			logfields.Name, claim.Name,
 		)
+		return nil
 	}
 
+	var (
+		freed []allocation
+		errs  []error
+	)
+	for _, dev := range devices {
+		if err := dev.Device.Free(dev.Config); err != nil {
+			errs = append(errs, err)
+			continue
+		}
+		freed = append(freed, dev)
+	}
+	// Keep failed allocations so a later unprepare can retry their cleanup.
+	d.deleteAllocations(freed)
 	return errors.Join(errs...)
 }
 
@@ -267,7 +269,7 @@ func (driver *Driver) prepareResourceClaim(ctx context.Context, claim *resourcea
 			return
 		}
 		for _, a := range alloc {
-			if _, reused := state.existingByDevice[a.Device.IfName()]; reused {
+			if _, reused := state.existingByDevice[a.DeviceName]; reused {
 				continue
 			}
 			driver.rollbackDevice(a)
@@ -306,7 +308,7 @@ func (driver *Driver) prepareResourceClaim(ctx context.Context, claim *resourcea
 		}
 	}
 
-	driver.commitAllocation(pod.UID, claim.UID, alloc)
+	driver.storeAllocations(alloc, pod.UID, claim.UID)
 
 	// we dont need to return anything here.
 	return kubeletplugin.PrepareResult{}
@@ -376,19 +378,23 @@ func (driver *Driver) podForClaim(ctx context.Context, claim *resourceapi.Resour
 // claimPrepState holds the precomputed lookups used to make prepareResourceClaim
 // idempotent across retries.
 type claimPrepState struct {
-	// devices already set up for this exact (pod, claim), keyed by ifname.
+	// devices already set up for this exact (pod, claim), keyed by device name.
 	existingByDevice map[string]allocation
 	// devices that already have a status entry in the claim for this driver.
 	existingStatusDevice map[string]struct{}
 }
 
 // newClaimPrepState builds the idempotency lookups for a (pod, claim) pair:
-// which devices were already set up in memory, and which already have a
+// which devices were already set up locally, and which already have a
 // Kubernetes status entry. Both let a retry skip work that already completed.
 func (driver *Driver) newClaimPrepState(pod resourceapi.ResourceClaimConsumerReference, claim *resourceapi.ResourceClaim) claimPrepState {
 	existingByDevice := make(map[string]allocation)
-	for _, a := range driver.allocations[pod.UID][claim.UID] {
-		existingByDevice[a.Device.IfName()] = a
+	txn := driver.db.ReadTxn()
+	for row := range AllocationsByClaimUID(driver.allocationTable, txn, claim.UID) {
+		if row.PodUID != pod.UID || row.PreparedDevice == nil {
+			continue
+		}
+		existingByDevice[row.DeviceName] = allocationFromRow(row)
 	}
 
 	existingStatusDevice := make(map[string]struct{})
@@ -494,22 +500,20 @@ func (driver *Driver) prepareClaimDevice(
 }
 
 func (driver *Driver) prepareDeviceAllocation(ctx context.Context, claim string, result resourceapi.DeviceRequestAllocationResult, cfg types.DeviceConfig) (allocation, error) {
-	alloc := allocation{Config: cfg}
-
-	var found bool
-	for mgr, devices := range driver.devices {
-		if i := slices.IndexFunc(devices, func(dev types.Device) bool {
-			return dev.IfName() == result.Device
-		}); i >= 0 {
-			alloc.Manager = mgr
-			alloc.Device = devices[i]
-			found = true
-			break
-		}
+	alloc := allocation{
+		DeviceName: result.Device,
+		Pool:       result.Pool,
+		Config:     cfg,
 	}
-	if !found {
+
+	txn := driver.db.ReadTxn()
+	row, _, found := driver.deviceTable.Get(txn, deviceByName.Query(result.Device))
+	if !found || row.Dev == nil {
 		return alloc, fmt.Errorf("%w with ifname %s for %s", errDeviceNotFound, result.Device, claim)
 	}
+
+	alloc.Manager = row.Manager
+	alloc.Device = row.Dev
 
 	if err := alloc.Device.Setup(alloc.Config); err != nil {
 		driver.logger.ErrorContext(ctx, "failed to set up device",
@@ -591,33 +595,25 @@ func (driver *Driver) buildDeviceStatus(
 	}, nil
 }
 
-// conflictingDeviceForPod returns the ifname of the first device that is
+// conflictingDeviceForPod returns the name of the first device that is
 // already allocated to podUID by a claim other than skipClaimUID, or "" if
-// there is no conflict. The check is intentionally skipped for skipClaimUID so
-// that re-preparing an existing claim (idempotent retry) is not rejected.
+// there is no conflict. The check skips skipClaimUID so re-preparing an
+// existing claim remains idempotent.
 func (driver *Driver) conflictingDeviceForPod(podUID kube_types.UID, skipClaimUID kube_types.UID, results []resourceapi.DeviceRequestAllocationResult) string {
-	for claimUID, allocs := range driver.allocations[podUID] {
-		if claimUID == skipClaimUID {
+	txn := driver.db.ReadTxn()
+	requested := make(map[string]struct{}, len(results))
+	for _, result := range results {
+		requested[result.Device] = struct{}{}
+	}
+	for row := range AllocationsByPodUID(driver.allocationTable, txn, podUID) {
+		if row.ClaimUID == skipClaimUID {
 			continue
 		}
-		for _, result := range results {
-			for _, a := range allocs {
-				if a.Device.IfName() == result.Device {
-					return result.Device
-				}
-			}
+		if _, conflict := requested[row.DeviceName]; conflict {
+			return row.DeviceName
 		}
 	}
 	return ""
-}
-
-// commitAllocation stores allocs under driver.allocations[podUID][claimUID],
-// creating the inner map if this is the first claim for the pod.
-func (driver *Driver) commitAllocation(podUID, claimUID kube_types.UID, allocs []allocation) {
-	if _, exists := driver.allocations[podUID]; !exists {
-		driver.allocations[podUID] = make(map[kube_types.UID][]allocation)
-	}
-	driver.allocations[podUID][claimUID] = allocs
 }
 
 func conditionReady(claim *resourceapi.ResourceClaim) metav1.Condition {

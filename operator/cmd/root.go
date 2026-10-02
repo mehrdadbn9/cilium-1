@@ -29,7 +29,6 @@ import (
 	"github.com/cilium/cilium/cilium-dbg/cmd/troubleshoot"
 	cmapisrv "github.com/cilium/cilium/clustermesh-apiserver/clustermesh"
 	"github.com/cilium/cilium/operator/api"
-	"github.com/cilium/cilium/operator/auth"
 	"github.com/cilium/cilium/operator/doublewrite"
 	"github.com/cilium/cilium/operator/endpointgc"
 	"github.com/cilium/cilium/operator/endpointslicegc"
@@ -50,6 +49,7 @@ import (
 	"github.com/cilium/cilium/operator/pkg/kvstore/locksweeper"
 	"github.com/cilium/cilium/operator/pkg/kvstore/nodesgc"
 	"github.com/cilium/cilium/operator/pkg/lbipam"
+	networkdriverconfig "github.com/cilium/cilium/operator/pkg/networkdriver/config"
 	"github.com/cilium/cilium/operator/pkg/networkpolicy"
 	"github.com/cilium/cilium/operator/pkg/nodeipam"
 	"github.com/cilium/cilium/operator/pkg/secretsync"
@@ -136,10 +136,8 @@ var (
 	}
 
 	ControlPlaneCells = []cell.Cell{
-		cell.Config(cmtypes.DefaultClusterInfo),
-		cell.Config(cmtypes.DefaultPolicyConfig),
-		cell.Invoke(cmtypes.ClusterInfo.InitClusterIDMax),
-		cell.Invoke(cmtypes.ClusterInfo.Validate),
+		cmtypes.ClusterInfoCell,
+		cmtypes.PolicyConfigCell,
 
 		cell.Provide(func() *option.DaemonConfig {
 			return option.Config
@@ -223,7 +221,6 @@ var (
 		bgp.Cell,
 		lbipam.Cell,
 		nodeipam.Cell,
-		auth.Cell,
 		store.Cell,
 		cmoperator.Cell,
 		endpointslicesync.Cell,
@@ -339,6 +336,8 @@ var (
 		// Provides the ztunnel daemonset controller if ztunnel encryption
 		// is specified.
 		ztunnel.Cell,
+
+		networkdriverconfig.Cell,
 	}
 
 	binaryName = filepath.Base(os.Args[0])
@@ -413,9 +412,7 @@ func NewOperatorCmd(h *hive.Hive) *cobra.Command {
 		Short: "Run " + binaryName,
 		Run: func(cobraCmd *cobra.Command, args []string) {
 			// slogloggercheck: the logger has been initialized in the cobra.OnInitialize
-			logger := logging.DefaultSlogLogger.With(logfields.LogSubsys, binaryName)
-
-			initEnv(logger, h.Viper())
+			initEnv(logging.DefaultSlogLogger, h.Viper())
 
 			// Pass the DefaultSlogLogger to the hive after being initialized
 			// with the initEnv which sets up the logging.DefaultSlogLogger with
@@ -496,6 +493,13 @@ func initEnv(logger *slog.Logger, vp *viper.Viper) {
 
 	// add hooks after setting up metrics in the option.Config
 	logging.AddHandlers(metrics.NewLoggingHook())
+
+	// Derive the subsystem logger only now that the logging setup is complete.
+	// slog.Logger.With() snapshots the handlers of the logger it is derived
+	// from, hence a logger derived any earlier would keep emitting through the
+	// default text handler, ignoring the user-provided --log-opt format.
+	// slogloggercheck: the logger has been initialized by SetupLogging above
+	logger = logging.DefaultSlogLogger.With(logfields.LogSubsys, binaryName)
 
 	// Register the user options in the logs
 	option.LogRegisteredSlogOptions(vp, logger)

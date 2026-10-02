@@ -12,7 +12,8 @@
 #define IS_BPF_OVERLAY 1
 
 /* WORLD_IPV{4,6}_ID varies based on dualstack being enabled. Real values are
- * written into node_config.h at runtime. */
+ * written into node_config.h at runtime.
+ */
 #define SECLABEL WORLD_ID
 #define SECLABEL_IPV4 WORLD_IPV4_ID
 #define SECLABEL_IPV6 WORLD_IPV6_ID
@@ -137,7 +138,7 @@ static __always_inline int handle_ipv6(struct __ctx_buff *ctx,
 	}
 #endif /* ENABLE_EGRESS_GATEWAY_COMMON */
 
-#if defined(ENABLE_DSR) && (DSR_ENCAP_MODE == DSR_ENCAP_GENEVE)
+#if defined(DSR_ENCAP_MODE) && (DSR_ENCAP_MODE == DSR_ENCAP_GENEVE)
 	/* Pass incoming packets which will be returned using Geneve DSR
 	 * to host-stack for conntrack entry insertion.
 	 * Geneve DSR reply packets are processed by the host-stack,
@@ -182,8 +183,7 @@ int tail_handle_ipv6(struct __ctx_buff *ctx)
 #ifdef ENABLE_IPV4
 #if defined(ENABLE_CLUSTER_AWARE_ADDRESSING) && defined(ENABLE_INTER_CLUSTER_SNAT)
 static __always_inline int handle_inter_cluster_revsnat(struct __ctx_buff *ctx,
-							__u32 src_sec_identity,
-							__s8 *ext_err)
+							__u32 src_sec_identity)
 {
 	int ret;
 	struct iphdr *ip4;
@@ -199,7 +199,7 @@ static __always_inline int handle_inter_cluster_revsnat(struct __ctx_buff *ctx,
 	};
 	struct trace_ctx trace;
 
-	ret = snat_v4_rev_nat(ctx, &target, &trace, ext_err);
+	ret = snat_v4_rev_nat(ctx, &target, &trace);
 	if (ret != NAT_PUNT_TO_STACK && ret != DROP_NAT_NO_MAPPING) {
 		if (IS_ERR(ret))
 			return ret;
@@ -241,11 +241,10 @@ int tail_handle_inter_cluster_revsnat(struct __ctx_buff *ctx)
 {
 	int ret;
 	__u32 src_sec_identity = ctx_load_and_clear_meta(ctx, CB_SRC_LABEL);
-	__s8 ext_err = 0;
 
-	ret = handle_inter_cluster_revsnat(ctx, src_sec_identity, &ext_err);
+	ret = handle_inter_cluster_revsnat(ctx, src_sec_identity);
 	if (IS_ERR(ret))
-		return send_drop_notify_error_ext(ctx, src_sec_identity, ret, ext_err,
+		return send_drop_notify_error(ctx, src_sec_identity, ret,
 						  METRIC_INGRESS);
 	return ret;
 }
@@ -305,8 +304,7 @@ static __always_inline int handle_ipv4(struct __ctx_buff *ctx,
 	if (!revalidate_data(ctx, &data, &data_end, &ip4))
 		return DROP_INVALID;
 
-#ifdef ENABLE_VTEP
-	{
+	if (CONFIG(enable_vtep)) {
 		struct vtep_key vkey = {
 			.vtep_ip = ip4->saddr & CONFIG(vtep_mask),
 		};
@@ -318,7 +316,6 @@ static __always_inline int handle_ipv4(struct __ctx_buff *ctx,
 				return DROP_INVALID_VNI;
 		}
 	}
-#endif
 
 #if defined(ENABLE_CLUSTER_AWARE_ADDRESSING) && defined(ENABLE_INTER_CLUSTER_SNAT)
 	{
@@ -358,8 +355,8 @@ static __always_inline int handle_ipv4(struct __ctx_buff *ctx,
 		__be32 snat_addr, daddr;
 
 		daddr = ip4->daddr;
-		if (egress_gw_snat_needed_hook(ip4->saddr, daddr, &snat_addr,
-					       &egress_ifindex)) {
+		if (egress_gw_snat_needed_hook(ctx, ip4->saddr, daddr, &snat_addr,
+					       &egress_ifindex, false)) {
 			__u32 tbid = EGRESS_GATEWAY_RT_TBID;
 
 			if (snat_addr == EGRESS_GATEWAY_NO_EGRESS_IP)
@@ -379,7 +376,7 @@ static __always_inline int handle_ipv4(struct __ctx_buff *ctx,
 	}
 #endif /* ENABLE_EGRESS_GATEWAY_COMMON */
 
-#if defined(ENABLE_DSR) && (DSR_ENCAP_MODE == DSR_ENCAP_GENEVE)
+#if defined(DSR_ENCAP_MODE) && (DSR_ENCAP_MODE == DSR_ENCAP_GENEVE)
 	/* Pass incoming packets which will be returned using Geneve DSR
 	 * to host-stack for conntrack entry insertion.
 	 * Geneve DSR reply packets are processed by the host-stack,
@@ -419,7 +416,6 @@ int tail_handle_ipv4(struct __ctx_buff *ctx)
 	return ret;
 }
 
-#ifdef ENABLE_VTEP
 /*
  * ARP responder for ARP requests from VTEP
  * Respond to remote VTEP endpoint with cilium_vxlan MAC
@@ -479,7 +475,6 @@ pass_to_stack:
 			  trace.reason, trace.monitor, bpf_htons(ETH_P_ARP));
 	return CTX_ACT_OK;
 }
-#endif /* ENABLE_VTEP */
 
 #endif /* ENABLE_IPV4 */
 
@@ -580,12 +575,14 @@ int cil_from_overlay(struct __ctx_buff *ctx)
 #endif
 		break;
 
-#ifdef ENABLE_VTEP
 	case bpf_htons(ETH_P_ARP):
-		ret = tail_call_internal(ctx, CILIUM_CALL_ARP, &ext_err);
-		break;
-#endif
-
+		if (CONFIG(enable_vtep)) {
+			ret = tail_call_internal(ctx,
+						 CILIUM_CALL_ARP,
+						 &ext_err);
+			break;
+		}
+		fallthrough;
 	default:
 		/* Pass unknown traffic to the stack */
 		ret = CTX_ACT_OK;

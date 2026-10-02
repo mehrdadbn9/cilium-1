@@ -15,9 +15,9 @@ import (
 	k8sErrors "k8s.io/apimachinery/pkg/api/errors"
 
 	"github.com/cilium/cilium/operator/pkg/ipam/allocator"
-	"github.com/cilium/cilium/operator/pkg/ipam/allocator/clusterpool/cidralloc"
 	"github.com/cilium/cilium/pkg/controller"
 	iputil "github.com/cilium/cilium/pkg/ip"
+	"github.com/cilium/cilium/pkg/ipam/cidralloc"
 	v2 "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2"
 	"github.com/cilium/cilium/pkg/lock"
 	"github.com/cilium/cilium/pkg/logging/logfields"
@@ -688,8 +688,7 @@ func (n *NodesPodCIDRManager) reuseIPNets(
 			// If already allocated, skip this family rather than
 			// reverting the other. The caller strips the conflicting
 			// CIDR from the node's spec.
-			var errAllocated *ErrCIDRAllocated
-			if !errors.As(v4Err, &errAllocated) {
+			if _, ok := errors.AsType[*ErrCIDRAllocated](v4Err); !ok {
 				return nil, false, v4Err
 			}
 			n.logger.Warn("Duplicate v4 CIDR, will be released from this node",
@@ -722,8 +721,7 @@ func (n *NodesPodCIDRManager) reuseIPNets(
 			v6CIDR = append(v6CIDR, newv6CIDR)
 		}
 		if v6Err != nil {
-			var errAllocated *ErrCIDRAllocated
-			if !errors.As(v6Err, &errAllocated) {
+			if _, ok := errors.AsType[*ErrCIDRAllocated](v6Err); !ok {
 				if v4RevertFunc != nil {
 					v4RevertFunc()
 				}

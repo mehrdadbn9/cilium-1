@@ -25,7 +25,7 @@ func FuzzResolvePolicy(f *testing.F) {
 			return
 		}
 		r.EndpointSelector = endpointSelectorA // force the endpoint selector to one that will select, so we definitely evaluate policy
-		err = r.Sanitize()
+		err = r.ValidateAndSanitize()
 		if err != nil {
 			return
 		}
@@ -87,7 +87,7 @@ func FuzzAccumulateMapChange(f *testing.F) {
 		if deny {
 			verdict = types.Deny
 		}
-		value := newMapStateEntry(0, types.HighestPriority, types.LowestPriority, NilRuleOrigin, proxyPort, 0, verdict, NoAuthRequirement)
+		value := newMapStateEntry(0, types.HighestPriority, types.LowestPriority, NilRuleOrigin, proxyPort, 0, verdict)
 		policyMaps := MapChanges{logger: slog.New(slog.DiscardHandler)}
 		policyMaps.AccumulateMapChanges(0, 0, adds, deletes, key, value)
 		policyMaps.SyncMapChanges(types.MockSelectorSnapshot())

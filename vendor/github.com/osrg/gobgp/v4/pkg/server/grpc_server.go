@@ -16,7 +16,6 @@
 package server
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -31,7 +30,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/dgryski/go-farm"
 	"github.com/google/uuid"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -588,17 +586,6 @@ func api2Path(resource api.TableType, path *api.Path, isWithdraw bool) (*table.P
 
 	doWithdraw := isWithdraw || path.IsWithdraw
 	newPath := table.NewPath(rf, pi, bgp.PathNLRI{NLRI: nlri, ID: path.Identifier}, doWithdraw, pattrs, time.Now(), path.NoImplicitWithdraw)
-	if !doWithdraw {
-		total := bytes.NewBuffer(make([]byte, 0))
-		for _, a := range newPath.GetPathAttrs() {
-			if a.GetType() == bgp.BGP_ATTR_TYPE_MP_REACH_NLRI {
-				continue
-			}
-			b, _ := a.Serialize()
-			total.Write(b)
-		}
-		newPath.SetHash(farm.Hash64(total.Bytes()))
-	}
 	newPath.SetIsFromExternal(path.IsFromExternal)
 	return newPath, nil
 }
@@ -1328,13 +1315,32 @@ func (s *server) DeleteDynamicNeighbor(ctx context.Context, r *api.DeleteDynamic
 }
 
 func newPrefixFromApiStruct(a *api.Prefix) (*table.Prefix, error) {
-	prefix, err := netip.ParsePrefix(a.IpPrefix)
-	if err != nil {
-		return nil, err
+	if a.IpPrefix != "" && a.RtcPrefix != "" {
+		return nil, fmt.Errorf("ip-prefix and rtc-prefix are mutually exclusive")
 	}
-	rf := bgp.RF_IPv4_UC
-	if prefix.Addr().Is6() {
-		rf = bgp.RF_IPv6_UC
+	var (
+		prefix netip.Prefix
+		rf     bgp.Family
+		err    error
+	)
+	switch {
+	case a.IpPrefix != "":
+		prefix, err = netip.ParsePrefix(a.IpPrefix)
+		if err != nil {
+			return nil, err
+		}
+		rf = bgp.RF_IPv4_UC
+		if prefix.Addr().Is6() {
+			rf = bgp.RF_IPv6_UC
+		}
+	case a.RtcPrefix != "":
+		prefix, err = bgp.ParseRTCPrefix(a.RtcPrefix)
+		if err != nil {
+			return nil, err
+		}
+		rf = bgp.RF_RTC_UC
+	default:
+		return nil, fmt.Errorf("prefix requires ip-prefix or rtc-prefix")
 	}
 	return &table.Prefix{
 		Prefix:             prefix,
@@ -1345,12 +1351,32 @@ func newPrefixFromApiStruct(a *api.Prefix) (*table.Prefix, error) {
 }
 
 func newConfigPrefixFromAPIStruct(a *api.Prefix) (*oc.Prefix, error) {
-	_, prefix, err := net.ParseCIDR(a.IpPrefix)
-	if err != nil {
-		return nil, err
+	if a.IpPrefix != "" && a.RtcPrefix != "" {
+		return nil, fmt.Errorf("ip-prefix and rtc-prefix are mutually exclusive")
+	}
+	var (
+		ipPrefix  netip.Prefix
+		rtcPrefix string
+	)
+	switch {
+	case a.IpPrefix != "":
+		prefix, err := netip.ParsePrefix(a.IpPrefix)
+		if err != nil {
+			return nil, err
+		}
+		ipPrefix = prefix
+	case a.RtcPrefix != "":
+		nlri, err := bgp.ParseRouteTargetMembershipNLRI(a.RtcPrefix)
+		if err != nil {
+			return nil, err
+		}
+		rtcPrefix = nlri.String()
+	default:
+		return nil, fmt.Errorf("prefix requires ip-prefix or rtc-prefix")
 	}
 	return &oc.Prefix{
-		IpPrefix:        netip.MustParsePrefix(prefix.String()),
+		IpPrefix:        ipPrefix,
+		RtcPrefix:       rtcPrefix,
 		MasklengthRange: fmt.Sprintf("%d..%d", a.MaskLengthMin, a.MaskLengthMax),
 	}, nil
 }
@@ -2503,4 +2529,35 @@ func (s *server) GetTable(ctx context.Context, r *api.GetTableRequest) (*api.Get
 
 func (s *server) SetLogLevel(ctx context.Context, r *api.SetLogLevelRequest) (*api.SetLogLevelResponse, error) {
 	return &api.SetLogLevelResponse{}, s.bgpServer.SetLogLevel(ctx, r)
+}
+
+func (s *server) AddTcpAoKeychain(ctx context.Context, r *api.AddTcpAoKeychainRequest) (*api.AddTcpAoKeychainResponse, error) {
+	return &api.AddTcpAoKeychainResponse{}, s.bgpServer.AddTcpAoKeychain(ctx, r)
+}
+
+func (s *server) UpdateTcpAoKeychain(ctx context.Context, r *api.UpdateTcpAoKeychainRequest) (*api.UpdateTcpAoKeychainResponse, error) {
+	return s.bgpServer.UpdateTcpAoKeychain(ctx, r)
+}
+
+func (s *server) DeleteTcpAoKeychain(ctx context.Context, r *api.DeleteTcpAoKeychainRequest) (*api.DeleteTcpAoKeychainResponse, error) {
+	if err := s.bgpServer.DeleteTcpAoKeychain(ctx, r); err != nil {
+		return nil, err
+	}
+	return &api.DeleteTcpAoKeychainResponse{}, nil
+}
+
+func (s *server) ListTcpAoKeychain(r *api.ListTcpAoKeychainRequest, stream api.GoBgpService_ListTcpAoKeychainServer) error {
+	ctx, cancel := context.WithCancel(stream.Context())
+	defer cancel()
+	var sendErr error
+	fn := func(chain *api.TcpAoKeychain) {
+		if sendErr = stream.Send(&api.ListTcpAoKeychainResponse{Keychain: chain}); sendErr != nil {
+			cancel()
+		}
+	}
+	err := s.bgpServer.ListTcpAoKeychain(ctx, r, fn)
+	if sendErr != nil {
+		return sendErr
+	}
+	return err
 }

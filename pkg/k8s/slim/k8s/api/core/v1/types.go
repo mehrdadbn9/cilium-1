@@ -7,7 +7,6 @@ package v1
 
 import (
 	slim_metav1 "github.com/cilium/cilium/pkg/k8s/slim/k8s/apis/meta/v1"
-	"github.com/cilium/cilium/pkg/k8s/slim/k8s/apis/util/intstr"
 )
 
 const (
@@ -58,25 +57,12 @@ type ContainerPort struct {
 	HostIP string `json:"hostIP,omitempty" protobuf:"bytes,5,opt,name=hostIP"`
 }
 
-// VolumeMount describes a mounting of a Volume within a container.
-type VolumeMount struct {
-	// Path within the container at which the volume should be mounted.  Must
-	// not contain ':'.
-	MountPath string `json:"mountPath" protobuf:"bytes,3,opt,name=mountPath"`
-}
-
 // A single application container that you want to run within a pod.
 type Container struct {
 	// Name of the container specified as a DNS_LABEL.
 	// Each container in a pod must have a unique name (DNS_LABEL).
 	// Cannot be updated.
 	Name string `json:"name" protobuf:"bytes,1,opt,name=name"`
-	// Container image name.
-	// More info: https://kubernetes.io/docs/concepts/containers/images
-	// This field is optional to allow higher level config management to default or override
-	// container images in workload controllers like Deployments and StatefulSets.
-	// +optional
-	Image string `json:"image,omitempty" protobuf:"bytes,2,opt,name=image"`
 	// List of ports to expose from the container. Not specifying a port here
 	// DOES NOT prevent that port from being exposed. Any port which is
 	// listening on the default "0.0.0.0" address inside a container will be
@@ -91,14 +77,6 @@ type Container struct {
 	// +listMapKey=containerPort
 	// +listMapKey=protocol
 	Ports []ContainerPort `json:"ports,omitempty" patchStrategy:"merge" patchMergeKey:"containerPort" protobuf:"bytes,6,rep,name=ports"`
-	// Pod volumes to mount into the container's filesystem.
-	// Cannot be updated.
-	// +optional
-	// +patchMergeKey=mountPath
-	// +patchStrategy=merge
-	// +listType=map
-	// +listMapKey=mountPath
-	VolumeMounts []VolumeMount `json:"volumeMounts,omitempty" patchStrategy:"merge" patchMergeKey:"mountPath" protobuf:"bytes,9,rep,name=volumeMounts"`
 }
 
 type ConditionStatus string
@@ -115,9 +93,6 @@ const (
 
 // ContainerStateRunning is a running state of a container.
 type ContainerStateRunning struct {
-	// Time at which the container was last (re-)started
-	// +optional
-	StartedAt slim_metav1.Time `json:"startedAt,omitempty" protobuf:"bytes,1,opt,name=startedAt"`
 }
 
 // ContainerState holds a possible state of container.
@@ -245,18 +220,6 @@ type PodCondition struct {
 	// Can be True, False, Unknown.
 	// More info: https://kubernetes.io/docs/concepts/workloads/pods/pod-lifecycle#pod-conditions
 	Status ConditionStatus `json:"status" protobuf:"bytes,2,opt,name=status,casttype=ConditionStatus"`
-	// Last time we probed the condition.
-	// +optional
-	LastProbeTime slim_metav1.Time `json:"lastProbeTime,omitempty" protobuf:"bytes,3,opt,name=lastProbeTime"`
-	// Last time the condition transitioned from one status to another.
-	// +optional
-	LastTransitionTime slim_metav1.Time `json:"lastTransitionTime,omitempty" protobuf:"bytes,4,opt,name=lastTransitionTime"`
-	// Unique, one-word, CamelCase reason for the condition's last transition.
-	// +optional
-	Reason string `json:"reason,omitempty" protobuf:"bytes,5,opt,name=reason"`
-	// Human-readable message indicating details about last transition.
-	// +optional
-	Message string `json:"message,omitempty" protobuf:"bytes,6,opt,name=message"`
 }
 
 const (
@@ -305,12 +268,6 @@ const (
 	// Currently enforced by NodeController.
 	TaintEffectNoExecute TaintEffect = "NoExecute"
 )
-
-// PodReadinessGate contains the reference to a pod condition
-type PodReadinessGate struct {
-	// ConditionType refers to a condition in the pod's condition list with matching type.
-	ConditionType PodConditionType `json:"conditionType" protobuf:"bytes,1,opt,name=conditionType,casttype=PodConditionType"`
-}
 
 // PodSpec is a description of a pod.
 type PodSpec struct {
@@ -471,7 +428,7 @@ type PodStatus struct {
 // Pod is a collection of containers that can run on a host. This resource is created
 // by clients and scheduled onto hosts.
 type Pod struct {
-	slim_metav1.TypeMeta `json:",inline"`
+	slim_metav1.TypeMeta `json:""`
 	// Standard object's metadata.
 	// More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#metadata
 	// +optional
@@ -496,7 +453,7 @@ type Pod struct {
 
 // PodList is a list of Pods.
 type PodList struct {
-	slim_metav1.TypeMeta `json:",inline"`
+	slim_metav1.TypeMeta `json:""`
 	// Standard list metadata.
 	// More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
 	// +optional
@@ -972,17 +929,6 @@ type ServicePort struct {
 	// The port that will be exposed by this service.
 	Port int32 `json:"port" protobuf:"varint,3,opt,name=port"`
 
-	// Number or name of the port to access on the pods targeted by the service.
-	// Number must be in the range 1 to 65535. Name must be an IANA_SVC_NAME.
-	// If this is a string, it will be looked up as a named port in the
-	// target Pod's container ports. If this is not specified, the value
-	// of the 'port' field is used (an identity map).
-	// This field is ignored for services with clusterIP=None, and should be
-	// omitted or set equal to the 'port' field.
-	// More info: https://kubernetes.io/docs/concepts/services-networking/service/#defining-a-service
-	// +optional
-	TargetPort intstr.IntOrString `json:"targetPort,omitempty" protobuf:"bytes,4,opt,name=targetPort"`
-
 	// The port on each node on which this service is exposed when type is
 	// NodePort or LoadBalancer.  Usually assigned by the system. If a value is
 	// specified, in-range, and not in use it will be used, otherwise the
@@ -1005,7 +951,7 @@ type ServicePort struct {
 // (for example 3306) that the proxy listens on, and the selector that determines which pods
 // will answer requests sent through the proxy.
 type Service struct {
-	slim_metav1.TypeMeta `json:",inline"`
+	slim_metav1.TypeMeta `json:""`
 	// Standard object's metadata.
 	// More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#metadata
 	// +optional
@@ -1035,7 +981,7 @@ const (
 
 // ServiceList holds a list of services.
 type ServiceList struct {
-	slim_metav1.TypeMeta `json:",inline"`
+	slim_metav1.TypeMeta `json:""`
 	// Standard list metadata.
 	// More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
 	// +optional
@@ -1197,7 +1143,7 @@ type NodeAddress struct {
 // Node is a worker node in Kubernetes.
 // Each node will have a unique identifier in the cache (i.e. in etcd).
 type Node struct {
-	slim_metav1.TypeMeta `json:",inline"`
+	slim_metav1.TypeMeta `json:""`
 	// Standard object's metadata.
 	// More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#metadata
 	// +optional
@@ -1221,7 +1167,7 @@ type Node struct {
 
 // NodeList is the whole list of all Nodes which have been registered with master.
 type NodeList struct {
-	slim_metav1.TypeMeta `json:",inline"`
+	slim_metav1.TypeMeta `json:""`
 	// Standard list metadata.
 	// More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
 	// +optional
@@ -1240,7 +1186,7 @@ type NodeList struct {
 // Namespace provides a scope for Names.
 // Use of multiple namespaces is optional.
 type Namespace struct {
-	slim_metav1.TypeMeta `json:",inline"`
+	slim_metav1.TypeMeta `json:""`
 	// Standard object's metadata.
 	// More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#metadata
 	// +optional
@@ -1252,7 +1198,7 @@ type Namespace struct {
 
 // NamespaceList is a list of Namespaces.
 type NamespaceList struct {
-	slim_metav1.TypeMeta `json:",inline"`
+	slim_metav1.TypeMeta `json:""`
 	// Standard list metadata.
 	// More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
 	// +optional
@@ -1261,35 +1207,6 @@ type NamespaceList struct {
 	// Items is the list of Namespace objects in the list.
 	// More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/namespaces/
 	Items []Namespace `json:"items" protobuf:"bytes,2,rep,name=items"`
-}
-
-// TypedLocalObjectReference contains enough information to let you locate the
-// typed referenced object inside the same namespace.
-// ---
-// New uses of this type are discouraged because of difficulty describing its usage when embedded in APIs.
-//  1. Invalid usage help.  It is impossible to add specific help for individual usage.  In most embedded usages, there are particular
-//     restrictions like, "must refer only to types A and B" or "UID not honored" or "name must be restricted".
-//     Those cannot be well described when embedded.
-//  2. Inconsistent validation.  Because the usages are different, the validation rules are different by usage, which makes it hard for users to predict what will happen.
-//  3. The fields are both imprecise and overly precise.  Kind is not a precise mapping to a URL. This can produce ambiguity
-//     during interpretation and require a REST mapping.  In most cases, the dependency is on the group,resource tuple
-//     and the version of the actual struct is irrelevant.
-//  4. We cannot easily change it.  Because this type is embedded in many locations, updates to this type
-//     will affect numerous schemas.  Don't make new APIs embed an underspecified API type they do not control.
-//
-// Instead of using this type, create a locally provided and used type that is well-focused on your reference.
-// For example, ServiceReferences for admission registration: https://github.com/kubernetes/api/blob/release-1.17/admissionregistration/v1/types.go#L533 .
-// +structType=atomic
-type TypedLocalObjectReference struct {
-	// APIGroup is the group for the resource being referenced.
-	// If APIGroup is not specified, the specified Kind must be in the core API group.
-	// For any other third-party types, APIGroup is required.
-	// +optional
-	APIGroup *string `json:"apiGroup" protobuf:"bytes,1,opt,name=apiGroup"`
-	// Kind is the type of resource being referenced
-	Kind string `json:"kind" protobuf:"bytes,2,opt,name=kind"`
-	// Name is the name of resource being referenced
-	Name string `json:"name" protobuf:"bytes,3,opt,name=name"`
 }
 
 // Bytes type is used to avoid issue with deepequal
@@ -1303,18 +1220,11 @@ type Bytes []byte
 // Secret holds secret data of a certain type. The total bytes of the values in
 // the Data field must be less than MaxSecretSize bytes.
 type Secret struct {
-	slim_metav1.TypeMeta `json:",inline"`
+	slim_metav1.TypeMeta `json:""`
 	// Standard object's metadata.
 	// More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#metadata
 	// +optional
 	slim_metav1.ObjectMeta `json:"metadata,omitempty" protobuf:"bytes,1,opt,name=metadata"`
-
-	// Immutable, if set to true, ensures that data stored in the Secret cannot
-	// be updated (only object metadata can be modified).
-	// If not set to true, the field can be modified at any time.
-	// Defaulted to nil.
-	// +optional
-	Immutable *bool `json:"immutable,omitempty" protobuf:"varint,5,opt,name=immutable"`
 
 	// Data contains the secret data. Each key must consist of alphanumeric
 	// characters, '-', '_' or '.'. The serialized form of the secret data is a
@@ -1322,14 +1232,6 @@ type Secret struct {
 	// data value here. Described in https://tools.ietf.org/html/rfc4648#section-4
 	// +optional
 	Data map[string]Bytes `json:"data,omitempty" protobuf:"bytes,2,rep,name=data"`
-
-	// stringData allows specifying non-binary secret data in string form.
-	// It is provided as a write-only input field for convenience.
-	// All keys and values are merged into the data field on write, overwriting any existing values.
-	// The stringData field is never output when reading from the API.
-	// +k8s:conversion-gen=false
-	// +optional
-	StringData map[string]string `json:"stringData,omitempty" protobuf:"bytes,4,rep,name=stringData"`
 
 	// Used to facilitate programmatic handling of secret data.
 	// More info: https://kubernetes.io/docs/concepts/configuration/secret/#secret-types
@@ -1429,7 +1331,7 @@ const (
 
 // SecretList is a list of Secret.
 type SecretList struct {
-	slim_metav1.TypeMeta `json:",inline"`
+	slim_metav1.TypeMeta `json:""`
 	// Standard list metadata.
 	// More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
 	// +optional

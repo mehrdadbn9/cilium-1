@@ -19,7 +19,6 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/cilium/cilium/pkg/cidr"
 	"github.com/cilium/cilium/pkg/defaults"
 	ipamOption "github.com/cilium/cilium/pkg/ipam/option"
 	"github.com/cilium/cilium/pkg/util"
@@ -299,7 +298,6 @@ func TestLocalAddressExclusion(t *testing.T) {
 
 func TestCheckMapSizeLimits(t *testing.T) {
 	type sizes struct {
-		AuthMapEntries        int
 		CTMapEntriesGlobalTCP int
 		CTMapEntriesGlobalAny int
 		NATMapEntriesGlobal   int
@@ -315,7 +313,6 @@ func TestCheckMapSizeLimits(t *testing.T) {
 		{
 			name: "default map sizes",
 			d: &DaemonConfig{
-				AuthMapEntries:        AuthMapEntriesDefault,
 				CTMapEntriesGlobalTCP: CTMapEntriesGlobalTCPDefault,
 				CTMapEntriesGlobalAny: CTMapEntriesGlobalAnyDefault,
 				NATMapEntriesGlobal:   NATMapEntriesGlobalDefault,
@@ -323,7 +320,6 @@ func TestCheckMapSizeLimits(t *testing.T) {
 				NeighMapEntriesGlobal: NATMapEntriesGlobalDefault,
 			},
 			want: sizes{
-				AuthMapEntries:        AuthMapEntriesDefault,
 				CTMapEntriesGlobalTCP: CTMapEntriesGlobalTCPDefault,
 				CTMapEntriesGlobalAny: CTMapEntriesGlobalAnyDefault,
 				NATMapEntriesGlobal:   NATMapEntriesGlobalDefault,
@@ -335,39 +331,17 @@ func TestCheckMapSizeLimits(t *testing.T) {
 		{
 			name: "arbitrary map sizes within range",
 			d: &DaemonConfig{
-				AuthMapEntries:        20000,
 				CTMapEntriesGlobalTCP: 20000,
 				CTMapEntriesGlobalAny: 18000,
 				NATMapEntriesGlobal:   2048,
 				FragmentsMapEntries:   2 << 14,
 			},
 			want: sizes{
-				AuthMapEntries:        20000,
 				CTMapEntriesGlobalTCP: 20000,
 				CTMapEntriesGlobalAny: 18000,
 				NATMapEntriesGlobal:   2048,
 				FragmentsMapEntries:   2 << 14,
 				WantErr:               false,
-			},
-		},
-		{
-			name: "Auth map size below range",
-			d: &DaemonConfig{
-				AuthMapEntries: AuthMapEntriesMin - 1,
-			},
-			want: sizes{
-				AuthMapEntries: AuthMapEntriesMin - 1,
-				WantErr:        true,
-			},
-		},
-		{
-			name: "Auth map size above range",
-			d: &DaemonConfig{
-				AuthMapEntries: AuthMapEntriesMax + 1,
-			},
-			want: sizes{
-				AuthMapEntries: AuthMapEntriesMax + 1,
-				WantErr:        true,
 			},
 		},
 		{
@@ -433,14 +407,12 @@ func TestCheckMapSizeLimits(t *testing.T) {
 		{
 			name: "NAT map auto sizing with default size",
 			d: &DaemonConfig{
-				AuthMapEntries:        AuthMapEntriesDefault,
 				CTMapEntriesGlobalTCP: 2048,
 				CTMapEntriesGlobalAny: 4096,
 				NATMapEntriesGlobal:   NATMapEntriesGlobalDefault,
 				FragmentsMapEntries:   defaults.FragmentsMapEntries,
 			},
 			want: sizes{
-				AuthMapEntries:        AuthMapEntriesDefault,
 				CTMapEntriesGlobalTCP: 2048,
 				CTMapEntriesGlobalAny: 4096,
 				NATMapEntriesGlobal:   (2048 + 4096) * 2 / 3,
@@ -488,7 +460,6 @@ func TestCheckMapSizeLimits(t *testing.T) {
 			err := tt.d.checkMapSizeLimits()
 
 			got := sizes{
-				AuthMapEntries:        tt.d.AuthMapEntries,
 				CTMapEntriesGlobalTCP: tt.d.CTMapEntriesGlobalTCP,
 				CTMapEntriesGlobalAny: tt.d.CTMapEntriesGlobalAny,
 				NATMapEntriesGlobal:   tt.d.NATMapEntriesGlobal,
@@ -521,7 +492,7 @@ func TestCheckIPv4NativeRoutingCIDR(t *testing.T) {
 				EnableIPv6Masquerade:  true,
 				RoutingMode:           RoutingModeNative,
 				IPAM:                  ipamOption.IPAMAzure,
-				IPv4NativeRoutingCIDR: cidr.MustParseCIDR("10.127.64.0/18"),
+				IPv4NativeRoutingCIDR: netip.MustParsePrefix("10.127.64.0/18"),
 				EnableIPv4:            true,
 			},
 			wantErr: false,
@@ -589,7 +560,7 @@ func TestCheckIPv4NativeRoutingCIDR(t *testing.T) {
 				EnableIPv6Masquerade:  true,
 				RoutingMode:           RoutingModeHybrid,
 				IPAM:                  ipamOption.IPAMAzure,
-				IPv4NativeRoutingCIDR: cidr.MustParseCIDR("10.127.64.0/18"),
+				IPv4NativeRoutingCIDR: netip.MustParsePrefix("10.127.64.0/18"),
 				EnableIPv4:            true,
 			},
 			wantErr: false,
@@ -632,7 +603,7 @@ func TestCheckIPv6NativeRoutingCIDR(t *testing.T) {
 				EnableIPv4Masquerade:  true,
 				EnableIPv6Masquerade:  true,
 				RoutingMode:           RoutingModeNative,
-				IPv6NativeRoutingCIDR: cidr.MustParseCIDR("fd00::/120"),
+				IPv6NativeRoutingCIDR: netip.MustParsePrefix("fd00::/120"),
 				EnableIPv6:            true,
 			},
 			wantErr: false,
@@ -684,7 +655,7 @@ func TestCheckIPv6NativeRoutingCIDR(t *testing.T) {
 				EnableIPv4Masquerade:  true,
 				EnableIPv6Masquerade:  true,
 				RoutingMode:           RoutingModeHybrid,
-				IPv6NativeRoutingCIDR: cidr.MustParseCIDR("fd00::/120"),
+				IPv6NativeRoutingCIDR: netip.MustParsePrefix("fd00::/120"),
 				EnableIPv6:            true,
 			},
 			wantErr: false,

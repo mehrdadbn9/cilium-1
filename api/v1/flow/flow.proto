@@ -25,9 +25,8 @@ message Flow {
     // deprecated in favor of drop_reason_desc.
     uint32 drop_reason = 3 [deprecated=true];
 
-    // auth_type is the authentication type specified for the flow in Cilium Network Policy.
-    // Only set on policy verdict events.
-    AuthType auth_type = 35;
+    // auth_type is deprecated and no longer set.
+    AuthType auth_type = 35 [deprecated=true];
 
     // l2
     Ethernet ethernet = 4;
@@ -95,6 +94,19 @@ message Flow {
 
     // only applicable to Verdict = DROPPED.
     DropReason drop_reason_desc = 25;
+
+    // ext_error is the extended error code reported by the datapath alongside
+    // the primary drop reason (see DropNotify.ExtError in pkg/monitor). It
+    // provides additional context for the drop (for example, the BPF FIB
+    // lookup result for DROP_NO_FIB). Only applicable to Verdict = DROPPED.
+    int32 ext_error = 42;
+
+    // ext_drop_reason_desc is the human-readable extended drop reason
+    // combining drop_reason_desc with ext_error (equivalent to the string
+    // produced by cilium monitor's DropReasonExt). Only set for drops
+    // reported via DropNotify; not populated for policy verdict denials,
+    // which carry their reason in drop_reason_desc.
+    string ext_drop_reason_desc = 43;
 
     // is_reply indicates that this was a packet (L4) or message (L7) in the
     // reply direction. May be absent (in which case it is unknown whether it
@@ -306,6 +318,8 @@ message Endpoint {
     repeated string labels = 4;
     string pod_name = 5;
     repeated Workload workloads = 6;
+    // pod_uid is the Kubernetes UID of the Pod represented by this endpoint.
+    string pod_uid = 8;
 }
 
 message Workload {
@@ -500,7 +514,7 @@ enum DropReason {
     MISSING_SRV6_STATE = 186 [deprecated = true];
     NAT46 = 187;
     NAT64 = 188;
-    AUTH_REQUIRED = 189;
+    AUTH_REQUIRED = 189 [deprecated = true];
     CT_NO_MAP_FOUND = 190;
     SNAT_NO_MAP_FOUND = 191;
     INVALID_CLUSTER_ID = 192;

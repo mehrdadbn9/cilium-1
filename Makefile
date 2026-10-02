@@ -38,13 +38,26 @@ SUBDIRS := $(SUBDIRS_CILIUM_CONTAINER) $(SUBDIR_OPERATOR_CONTAINER) plugins tool
 # which is then used to filter out items such as "tools/mount" and "tools/sysctlfx"
 SUBDIRS := $(filter-out $(foreach dir,$(SUBDIRS),$(dir)/%),$(SUBDIRS))
 
+# The bpf subdir regenerates Go sources under pkg/datapath that every other subdir compiles, so it cannot run alongside them.
+SUBDIRS_DATAPATH_GEN := bpf
+SUBDIRS_GO := $(filter-out $(SUBDIRS_DATAPATH_GEN),$(SUBDIRS))
+
 # Space-separated list of Go packages to test, equivalent to 'go test' package patterns.
 # Because is treated as a Go package pattern, the special '...' sequence is supported,
 # meaning 'all subpackages of the given package'.
 TESTPKGS ?= ./...
 
+# The only packages a -run "TestPrivileged.*" filter can select from, './'-normalised for go test.
+PRIVILEGED_TESTPKGS = $(shell grep -rlE '^func TestPrivileged' --include='*_test.go' \
+	--exclude-dir=vendor --exclude-dir=.git . \
+	| sed -e 's|/[^/]*$$||' -e 's|^\./||' -e 's|^|./|' | sort -u)
+
 GOTEST_BASE := -timeout 720s
 GOTEST_COVER_OPTS += -coverprofile=coverage.out
+# generate-cov is the sole consumer of the profile, so stop producing one as well.
+ifneq ($(SKIP_COVERAGE),)
+GOTEST_COVER_OPTS =
+endif
 BENCH_EVAL := "."
 BENCH ?= $(BENCH_EVAL)
 BENCHFLAGS_EVAL := -bench=$(BENCH) -run=^$$ -benchtime=10s
@@ -59,7 +72,10 @@ TEST_LDFLAGS=-ldflags "-X github.com/cilium/cilium/pkg/kvstore.etcdDummyAddress=
 
 TEST_UNITTEST_LDFLAGS=
 
-build: $(SUBDIRS) ## Builds all the components for Cilium by executing make in the respective sub directories.
+.PHONY: build
+build: ## Builds all the components for Cilium by executing make in the respective sub directories.
+	$(QUIET)$(MAKE) $(SUBMAKEOPTS) $(SUBDIRS_DATAPATH_GEN)
+	$(QUIET)$(MAKE) $(SUBMAKEOPTS) $(SUBDIRS_GO)
 
 build-container: ## Builds components required for cilium-agent container.
 	for i in $(SUBDIRS_CILIUM_CONTAINER); do $(MAKE) $(SUBMAKEOPTS) -C $$i all; done
@@ -91,8 +107,10 @@ build-container-standalone-dns-proxy: ## Builds components required for standalo
 $(SUBDIRS): force ## Execute default make target(make all) for the provided subdirectory.
 	@ $(MAKE) $(SUBMAKEOPTS) -C $@ all
 
+tests-privileged-only: TESTPKGS = $(PRIVILEGED_TESTPKGS)
 tests-privileged-only: ## Run Go only the unit tests that require elevated privileges.
 	@$(ECHO_CHECK) running only privileged tests...
+	@test -n "$(strip $(TESTPKGS))" || { echo "no package declares a TestPrivileged test"; exit 1; }
 	PRIVILEGED_TESTS=true PATH=$(PATH):$(ROOT_DIR)/bpf $(GO_TEST) $(TEST_LDFLAGS) \
 		$(TESTPKGS) $(GOTEST_BASE) -run "TestPrivileged.*" $(GOTEST_COVER_OPTS) | $(GOTEST_FORMATTER)
 	$(MAKE) generate-cov
@@ -263,9 +281,10 @@ generate-api: api/v1/openapi.yaml ## Generate cilium-agent client, model and ser
 		-C api/v1/cilium-client.yml \
 		-r hack/spdx-copyright-header.txt
 	@# go-swagger always emits omitempty, which is a no-op on the struct types
-	@# iputil.Addr and iputil.Prefix: a zero value would be marshalled as ""
-	@# instead of being omitted. omitzero is the appropriate annotation for those.
-	$(QUIET)$(SED) -i -E '/[[:space:]]\*?iputil\.(Addr|Prefix)[[:space:]]+`json:/s/,omitempty"`$$/,omitzero"`/' ./api/v1/models/*.go
+	@# iputil.Addr and iputil.Prefix and on the array type mac.MAC: a zero value
+	@# would be marshalled as "" or "00:00:00:00:00:00" instead of being omitted.
+	@# omitzero is the appropriate annotation for those.
+	$(QUIET)$(SED) -i -E '/[[:space:]]\*?(iputil\.(Addr|Prefix)|mac\.MAC)[[:space:]]+`json:/s/,omitempty"`$$/,omitzero"`/' ./api/v1/models/*.go
 	@# sort goimports automatically
 	$(QUIET)$(GO) tool golang.org/x/tools/cmd/goimports -w ./api/v1/client ./api/v1/models ./api/v1/server
 
@@ -284,8 +303,8 @@ generate-health-api: api/v1/health/openapi.yaml ## Generate cilium-health client
 		-f api/v1/health/openapi.yaml \
 		-C api/v1/cilium-client.yml \
 		-r hack/spdx-copyright-header.txt
-	@# rewrite omitempty to omitzero on iputil fields, see generate-api
-	$(QUIET)$(SED) -i -E '/[[:space:]]\*?iputil\.(Addr|Prefix)[[:space:]]+`json:/s/,omitempty"`$$/,omitzero"`/' ./api/v1/health/models/*.go
+	@# rewrite omitempty to omitzero on iputil and mac fields, see generate-api
+	$(QUIET)$(SED) -i -E '/[[:space:]]\*?(iputil\.(Addr|Prefix)|mac\.MAC)[[:space:]]+`json:/s/,omitempty"`$$/,omitzero"`/' ./api/v1/health/models/*.go
 	@# sort goimports automatically
 	$(QUIET)$(GO) tool golang.org/x/tools/cmd/goimports -w ./api/v1/health
 
@@ -304,8 +323,8 @@ generate-operator-api: api/v1/operator/openapi.yaml ## Generate cilium-operator 
 		-f api/v1/operator/openapi.yaml \
 		-C api/v1/cilium-client.yml \
 		-r hack/spdx-copyright-header.txt
-	@# rewrite omitempty to omitzero on iputil fields, see generate-api
-	$(QUIET)$(SED) -i -E '/[[:space:]]\*?iputil\.(Addr|Prefix)[[:space:]]+`json:/s/,omitempty"`$$/,omitzero"`/' ./api/v1/operator/models/*.go
+	@# rewrite omitempty to omitzero on iputil and mac fields, see generate-api
+	$(QUIET)$(SED) -i -E '/[[:space:]]\*?(iputil\.(Addr|Prefix)|mac\.MAC)[[:space:]]+`json:/s/,omitempty"`$$/,omitzero"`/' ./api/v1/operator/models/*.go
 	@# sort goimports automatically
 	$(QUIET)$(GO) tool golang.org/x/tools/cmd/goimports -w ./api/v1/operator
 
@@ -324,8 +343,8 @@ generate-kvstoremesh-api: api/v1/kvstoremesh/openapi.yaml ## Generate kvstoremes
 		-f api/v1/kvstoremesh/openapi.yaml \
 		-C api/v1/cilium-client.yml \
 		-r hack/spdx-copyright-header.txt
-	@# rewrite omitempty to omitzero on iputil fields, see generate-api
-	$(QUIET)$(SED) -i -E '/[[:space:]]\*?iputil\.(Addr|Prefix)[[:space:]]+`json:/s/,omitempty"`$$/,omitzero"`/' ./api/v1/kvstoremesh/models/*.go
+	@# rewrite omitempty to omitzero on iputil and mac fields, see generate-api
+	$(QUIET)$(SED) -i -E '/[[:space:]]\*?(iputil\.(Addr|Prefix)|mac\.MAC)[[:space:]]+`json:/s/,omitempty"`$$/,omitzero"`/' ./api/v1/kvstoremesh/models/*.go
 	@# sort goimports automatically
 	$(QUIET)$(GO) tool golang.org/x/tools/cmd/goimports -w ./api/v1/kvstoremesh
 
@@ -520,24 +539,18 @@ endif
 	$(QUIET) contrib/scripts/check-fmt.sh
 	@$(ECHO_CHECK) contrib/scripts/check-log-newlines.sh
 	$(QUIET) contrib/scripts/check-log-newlines.sh
-	@$(ECHO_CHECK) contrib/scripts/lock-check.sh
-	$(QUIET) contrib/scripts/lock-check.sh
 	@$(ECHO_CHECK) contrib/scripts/check-viper.sh
 	$(QUIET) contrib/scripts/check-viper.sh
 ifeq ($(SKIP_CUSTOMVET_CHECK),false)
 	@$(ECHO_CHECK) contrib/scripts/custom-vet-check.sh
 	$(QUIET) contrib/scripts/custom-vet-check.sh
 endif
-	@$(ECHO_CHECK) contrib/scripts/check-time.sh
-	$(QUIET) contrib/scripts/check-time.sh
 	@$(ECHO_CHECK) contrib/scripts/check-go-testdata.sh
 	$(QUIET) contrib/scripts/check-go-testdata.sh
 	@$(ECHO_CHECK) contrib/scripts/check-go-test-tags.sh
 	$(QUIET) contrib/scripts/check-go-test-tags.sh
 	@$(ECHO_CHECK) contrib/scripts/check-source-info.sh
 	$(QUIET) contrib/scripts/check-source-info.sh
-	@$(ECHO_CHECK) contrib/scripts/check-xfrmstate.sh
-	$(QUIET) contrib/scripts/check-xfrmstate.sh
 	@$(ECHO_CHECK) contrib/scripts/check-legacy-header-guard.sh
 	$(QUIET) contrib/scripts/check-legacy-header-guard.sh
 	@$(ECHO_CHECK) contrib/scripts/check-datapathconfig.sh
@@ -619,10 +632,28 @@ KIND_NET_CIDR ?= $(shell docker network inspect kind-cilium -f '{{json .IPAM.Con
 GATEWAY_API_CONFORMANCE_USABLE_NETWORK_ADDRESSES?=$(shell echo ${KIND_NET_CIDR} | sed "s@0.0/16@255.206@")
 GATEWAY_API_CONFORMANCE_UNUSABLE_NETWORK_ADDRESSES?=$(shell echo ${KIND_NET_CIDR} | sed "s@0.0/16@255.216@")
 GATEWAY_API_CONFORMANCE_TEST_NAME ?= TestConformance
+GATEWAY_API_DIR ?=
 gateway-api-conformance: ## Run Gateway API conformance tests.
 	@$(ECHO_CHECK) running Gateway API conformance tests...
+	$(QUIET)set -e; \
+	modfile_flags=; \
+	if [ -n "$(GATEWAY_API_DIR)" ]; then \
+		if [ ! -f "$(GATEWAY_API_DIR)/go.mod" ] || [ ! -f "$(GATEWAY_API_DIR)/conformance/go.mod" ]; then \
+			echo "GATEWAY_API_DIR must contain go.mod and conformance/go.mod" >&2; \
+			exit 1; \
+		fi; \
+		gateway_api_dir="$$(cd "$(GATEWAY_API_DIR)" && pwd)"; \
+		tmpdir="$$(mktemp -d)"; \
+		trap 'rm -rf "$$tmpdir"' EXIT; \
+		cp "$(CURDIR)/go.mod" "$$tmpdir/cilium.mod"; \
+		cp "$(CURDIR)/go.sum" "$$tmpdir/cilium.sum"; \
+		$(GO) mod edit -modfile="$$tmpdir/cilium.mod" \
+			-replace=sigs.k8s.io/gateway-api="$$gateway_api_dir" \
+			-replace=sigs.k8s.io/gateway-api/conformance="$$gateway_api_dir/conformance"; \
+		modfile_flags="-mod=mod -modfile=$$tmpdir/cilium.mod"; \
+	fi; \
 	GATEWAY_API_CONFORMANCE_TESTS=1 \
-	$(GO_TEST) $(GO_TEST_FLAGS) -p 4 -v ./operator/pkg/gateway-api \
+	$(GO_TEST) $(GO_TEST_FLAGS) $$modfile_flags -p 4 -v ./operator/pkg/gateway-api \
 		$(GATEWAY_TEST_FLAGS) \
 		-test.run $(GATEWAY_API_CONFORMANCE_TEST_NAME) \
 		-test.timeout=29m \

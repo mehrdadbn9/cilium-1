@@ -7,13 +7,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"net"
 	"net/netip"
 	"slices"
 	"strings"
 
 	"github.com/cilium/cilium/api/v1/models"
-	cmtypes "github.com/cilium/cilium/pkg/clustermesh/types"
 	"github.com/cilium/cilium/pkg/defaults"
 	iputil "github.com/cilium/cilium/pkg/ip"
 	"github.com/cilium/cilium/pkg/node/addressing"
@@ -69,13 +67,13 @@ type Node struct {
 	// cilium-health endpoint located on the node.
 	IPv6HealthIP iputil.Addr
 
-	// IPv4IngressIP if not nil, this is the IPv4 address of the
+	// IPv4IngressIP if set, this is the IPv4 address of the
 	// Ingress listener on the node.
-	IPv4IngressIP net.IP
+	IPv4IngressIP iputil.Addr
 
-	// IPv6IngressIP if not nil, this is the IPv6 address of the
+	// IPv6IngressIP if set, this is the IPv6 address of the
 	// Ingress listener located on the node.
-	IPv6IngressIP net.IP
+	IPv6IngressIP iputil.Addr
 
 	// ClusterID is the unique identifier of the cluster
 	ClusterID uint32
@@ -111,22 +109,36 @@ func (n *Node) Fullname() string {
 
 // Address is a node address which contains an IP and the address type.
 //
+// IP is always stored unmapped, i.e. an IPv4 address is held as a 4-byte
+// [netip.Addr] and never as its IPv4-mapped IPv6 form. Build addresses with
+// [NewAddress], which enforces this, rather than with a struct literal: the
+// readers of IPAddresses compare addresses with == and derive prefixes from
+// their bit length, so a mapped value would silently compare unequal to every
+// other copy of the same address and yield a /128 prefix for an IPv4 address.
+//
 // +k8s:deepcopy-gen=true
 type Address struct {
 	Type addressing.AddressType
-	IP   net.IP
+	IP   iputil.Addr
+}
+
+// NewAddress returns a node address of the given type, normalizing addr so
+// that the invariant documented on [Address] holds.
+func NewAddress(typ addressing.AddressType, addr netip.Addr) Address {
+	return Address{Type: typ, IP: iputil.AddrFrom(addr.Unmap())}
 }
 
 func (a *Address) DeepEqual(other *Address) bool {
-	return a.Type == other.Type && slices.Equal(a.IP, other.IP)
-}
-
-func (a Address) ToString() string {
-	return a.IP.String()
+	return a.Type == other.Type && a.IP == other.IP
 }
 
 func (a Address) AddrType() addressing.AddressType {
 	return a.Type
+}
+
+// Addr returns the address, implementing [addressing.Address].
+func (a Address) Addr() netip.Addr {
+	return a.IP.Addr
 }
 
 // IsNodeIP determines if addr is one of the node's IP addresses,
@@ -134,13 +146,7 @@ func (a Address) AddrType() addressing.AddressType {
 // is not one of the node's IP addresses.
 func (n *Node) IsNodeIP(addr netip.Addr) addressing.AddressType {
 	for _, a := range n.IPAddresses {
-		// for IPv4 this should not allocate memory
-		// this conversion will go away once net.IP is replaced with netip.Addr
-		ip := a.IP.To4()
-		if ip == nil {
-			ip = a.IP
-		}
-		if na, ok := netip.AddrFromSlice(ip); ok && na == addr {
+		if a.IP.Addr == addr {
 			return a.Type
 		}
 	}
@@ -153,84 +159,60 @@ func (n *Node) IsNodeIP(addr netip.Addr) addressing.AddressType {
 // - NodeInternalIP
 // - NodeExternalIP
 // - other IP address type
-// Nil is returned if GetNodeIP fails to extract an IP from the Node based
-// on the provided address family.
-func (n *Node) GetNodeIP(ipv6 bool) net.IP {
+// The zero value is returned if GetNodeIP fails to extract an IP from the Node
+// based on the provided address family.
+func (n *Node) GetNodeIP(ipv6 bool) netip.Addr {
 	return addressing.ExtractNodeIP[Address](n.IPAddresses, ipv6)
 }
 
-// GetExternalIP returns ExternalIP of k8s Node. If not present, then it
-// returns nil;
-func (n *Node) GetExternalIP(ipv6 bool) net.IP {
-	for _, addr := range n.IPAddresses {
-		if (ipv6 && addr.IP.To4() != nil) || (!ipv6 && addr.IP.To4() == nil) {
-			continue
-		}
-		if addr.Type == addressing.NodeExternalIP {
-			return addr.IP
-		}
-	}
-
-	return nil
-}
-
-// GetK8sNodeIPs returns k8s Node IP (either InternalIP or ExternalIP or nil;
-// the former is preferred).
-func (n *Node) GetK8sNodeIP() net.IP {
-	var externalIP net.IP
+// GetK8sNodeIP returns k8s Node IP (either InternalIP or ExternalIP or the
+// zero value, the former is preferred).
+func (n *Node) GetK8sNodeIP() netip.Addr {
+	var externalIP netip.Addr
 
 	for _, addr := range n.IPAddresses {
 		if addr.Type == addressing.NodeInternalIP {
-			return addr.IP
+			return addr.IP.Addr
 		} else if addr.Type == addressing.NodeExternalIP {
-			externalIP = addr.IP
+			externalIP = addr.IP.Addr
 		}
 	}
 
 	return externalIP
 }
 
-// GetNodeInternalIP returns the Internal IPv4 of node or nil.
-func (n *Node) GetNodeInternalIPv4() net.IP {
-	for _, addr := range n.IPAddresses {
-		if addr.IP.To4() == nil {
-			continue
-		}
-		if addr.Type == addressing.NodeInternalIP {
-			return addr.IP
-		}
-	}
-
-	return nil
+// GetNodeExternalIPv4 returns the IPv4 ExternalIP of the k8s Node, or the zero
+// value if the node holds no such address.
+func (n *Node) GetNodeExternalIPv4() netip.Addr {
+	return n.getAddress(addressing.NodeExternalIP, false)
 }
 
-// GetNodeInternalIP returns the Internal IPv6 of node or nil.
-func (n *Node) GetNodeInternalIPv6() net.IP {
-	for _, addr := range n.IPAddresses {
-		if addr.IP.To4() != nil {
-			continue
-		}
-		if addr.Type == addressing.NodeInternalIP {
-			return addr.IP
-		}
-	}
-
-	return nil
+// GetNodeExternalIPv6 returns the IPv6 ExternalIP of the k8s Node, or the zero
+// value if the node holds no such address.
+func (n *Node) GetNodeExternalIPv6() netip.Addr {
+	return n.getAddress(addressing.NodeExternalIP, true)
 }
 
-// GetCiliumInternalIP returns the CiliumInternalIP e.g. the IP associated
-// with cilium_host on the node.
-func (n *Node) GetCiliumInternalIP(ipv6 bool) net.IP {
-	for _, addr := range n.IPAddresses {
-		if (ipv6 && addr.IP.To4() != nil) ||
-			(!ipv6 && addr.IP.To4() == nil) {
-			continue
-		}
-		if addr.Type == addressing.NodeCiliumInternalIP {
-			return addr.IP
-		}
-	}
-	return nil
+// GetNodeInternalIPv4 returns the InternalIPv4 of the k8s Node or the zero value.
+func (n *Node) GetNodeInternalIPv4() netip.Addr {
+	return n.getAddress(addressing.NodeInternalIP, false)
+}
+
+// GetNodeInternalIPv6 returns the InternalIPv6 of the k8s Node or the zero value.
+func (n *Node) GetNodeInternalIPv6() netip.Addr {
+	return n.getAddress(addressing.NodeInternalIP, true)
+}
+
+// GetCiliumInternalIPv4 returns the IPv4 CiliumInternalIP e.g. the IP
+// associated with cilium_host on the node.
+func (n *Node) GetCiliumInternalIPv4() netip.Addr {
+	return n.getAddress(addressing.NodeCiliumInternalIP, false)
+}
+
+// GetCiliumInternalIPv6 returns the IPv6 CiliumInternalIP e.g. the IP
+// associated with cilium_host on the node.
+func (n *Node) GetCiliumInternalIPv6() netip.Addr {
+	return n.getAddress(addressing.NodeCiliumInternalIP, true)
 }
 
 // SetCiliumInternalIP sets the CiliumInternalIP e.g. the IP associated
@@ -238,35 +220,49 @@ func (n *Node) GetCiliumInternalIP(ipv6 bool) net.IP {
 // This must not be conflated with k8s internal IP as this IP address is only relevant within the
 // Cilium-managed network (this means within the node for direct routing mode and on the overlay
 // for tunnel mode).
-func (n *Node) SetCiliumInternalIP(newAddr net.IP) {
+func (n *Node) SetCiliumInternalIP(newAddr netip.Addr) {
 	n.setAddress(addressing.NodeCiliumInternalIP, newAddr)
 }
 
 // SetNodeExternalIP sets the NodeExternalIP.
-func (n *Node) SetNodeExternalIP(newAddr net.IP) {
+func (n *Node) SetNodeExternalIP(newAddr netip.Addr) {
 	n.setAddress(addressing.NodeExternalIP, newAddr)
 }
 
 // SetNodeInternalIP sets the NodeInternalIP.
-func (n *Node) SetNodeInternalIP(newAddr net.IP) {
+func (n *Node) SetNodeInternalIP(newAddr netip.Addr) {
 	n.setAddress(addressing.NodeInternalIP, newAddr)
 }
 
-func (n *Node) RemoveAddresses(typ addressing.AddressType) {
-	newAddresses := []Address{}
+// getAddress returns the node address of the given type for the given address
+// family, or the zero value if the node holds no such address.
+//
+// Unlike GetNodeIP and GetK8sNodeIP, which fall back to other address types
+// when the preferred one is missing, this is a plain lookup: it only ever
+// returns an address of type typ.
+func (n *Node) getAddress(typ addressing.AddressType, ipv6 bool) netip.Addr {
 	for _, addr := range n.IPAddresses {
 		if addr.Type != typ {
-			newAddresses = append(newAddresses, addr)
+			continue
+		}
+		if ipv6 != addr.IP.Is4() {
+			return addr.IP.Addr
 		}
 	}
-	n.IPAddresses = newAddresses
+	return netip.Addr{}
 }
 
-func (n *Node) setAddress(typ addressing.AddressType, newIP net.IP) {
-	newAddr := Address{Type: typ, IP: newIP}
+// setAddress sets the node address of the given type, replacing the address of
+// the same type and address family if the node already holds one. An invalid
+// newIP removes every address of that type instead, for both address families.
+//
+// The address family is derived from newIP, which is why the exported setters,
+// unlike the getters, take no address family argument.
+func (n *Node) setAddress(typ addressing.AddressType, newIP netip.Addr) {
+	newAddr := NewAddress(typ, newIP)
 
-	if newIP == nil {
-		n.RemoveAddresses(typ)
+	if !newAddr.IP.IsValid() {
+		n.removeAddresses(typ)
 		return
 	}
 
@@ -274,13 +270,13 @@ func (n *Node) setAddress(typ addressing.AddressType, newIP net.IP) {
 	// current one, which may be captured by any of the observers.
 	n.IPAddresses = slices.Clone(n.IPAddresses)
 
-	ipv6 := newIP.To4() == nil
+	ipv6 := !newAddr.IP.Is4()
 	// Try first to replace an existing address with same type
 	for i, addr := range n.IPAddresses {
 		if addr.Type != typ {
 			continue
 		}
-		if ipv6 != (addr.IP.To4() == nil) {
+		if ipv6 == addr.IP.Is4() {
 			// Don't replace if address family is different.
 			continue
 		}
@@ -290,16 +286,16 @@ func (n *Node) setAddress(typ addressing.AddressType, newIP net.IP) {
 	n.IPAddresses = append(n.IPAddresses, newAddr)
 }
 
-func (n *Node) GetIPByType(addrType addressing.AddressType, ipv6 bool) net.IP {
+// removeAddresses removes all the node addresses of the given type, for both
+// address families.
+func (n *Node) removeAddresses(typ addressing.AddressType) {
+	newAddresses := []Address{}
 	for _, addr := range n.IPAddresses {
-		if addr.Type != addrType {
-			continue
-		}
-		if is4 := addr.IP.To4() != nil; (!ipv6 && is4) || (ipv6 && !is4) {
-			return addr.IP
+		if addr.Type != typ {
+			newAddresses = append(newAddresses, addr)
 		}
 	}
-	return nil
+	n.IPAddresses = newAddresses
 }
 
 func (n *Node) getPrimaryAddress() *models.NodeAddressing {
@@ -315,10 +311,10 @@ func (n *Node) getPrimaryAddress() *models.NodeAddressing {
 	}
 
 	var v4Str, v6Str string
-	if v4 != nil {
+	if v4.IsValid() {
 		v4Str = v4.String()
 	}
-	if v6 != nil {
+	if v6.IsValid() {
 		v6Str = v6.String()
 	}
 
@@ -337,17 +333,14 @@ func (n *Node) getPrimaryAddress() *models.NodeAddressing {
 }
 
 func (n *Node) isPrimaryAddress(addr Address, ipv4 bool) bool {
-	return addr.IP.String() == n.GetNodeIP(!ipv4).String()
+	return addr.IP.Addr == n.GetNodeIP(!ipv4)
 }
 
 func (n *Node) getSecondaryAddresses() []*models.NodeAddressingElement {
 	result := []*models.NodeAddressingElement{}
 
 	for _, addr := range n.IPAddresses {
-		ipv4 := false
-		if addr.IP.To4() != nil {
-			ipv4 = true
-		}
+		ipv4 := addr.IP.Is4()
 		if !n.isPrimaryAddress(addr, ipv4) {
 			result = append(result, &models.NodeAddressingElement{
 				IP: addr.IP.String(),
@@ -384,15 +377,15 @@ func (n *Node) getHealthAddresses() *models.NodeAddressing {
 }
 
 func (n *Node) getIngressAddresses() *models.NodeAddressing {
-	if n.IPv4IngressIP == nil && n.IPv6IngressIP == nil {
+	if !n.IPv4IngressIP.IsValid() && !n.IPv6IngressIP.IsValid() {
 		return nil
 	}
 
 	var v4Str, v6Str string
-	if n.IPv4IngressIP != nil {
+	if n.IPv4IngressIP.IsValid() {
 		v4Str = n.IPv4IngressIP.String()
 	}
-	if n.IPv6IngressIP != nil {
+	if n.IPv6IngressIP.IsValid() {
 		v6Str = n.IPv6IngressIP.String()
 	}
 
@@ -493,6 +486,13 @@ func (n *Node) Unmarshal(key string, data []byte) error {
 		return err
 	}
 
+	// Normalize the decoded addresses: encoding/json hands netip.Addr the
+	// textual form verbatim, so a peer that wrote an IPv4-mapped IPv6 form
+	// would otherwise break the invariant documented on Address.
+	for i, addr := range newNode.IPAddresses {
+		newNode.IPAddresses[i] = NewAddress(addr.Type, addr.IP.Addr)
+	}
+
 	*n = newNode
 
 	return nil
@@ -513,14 +513,6 @@ func (n *Node) validate() error {
 		return errors.New("cluster is unset")
 	case n.Name == "":
 		return errors.New("name is unset")
-	}
-
-	// Skip the ClusterID check if it matches the local one, as we assume that
-	// it has already been validated, and to allow it to be zero.
-	if n.ClusterID != option.Config.ClusterID {
-		if err := cmtypes.ValidateClusterID(n.ClusterID); err != nil {
-			return err
-		}
 	}
 
 	return nil

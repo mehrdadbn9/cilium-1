@@ -50,6 +50,7 @@ var (
 			CiliumEndpointResource,
 			CiliumEndpointSliceResource,
 			CiliumNodeResource,
+			NodeResource,
 			PodResource,
 			k8s.NamespaceResource,
 			k8s.CiliumNetworkPolicyResource,
@@ -68,10 +69,11 @@ type Resources struct {
 	EndpointSlices       resource.Resource[*slim_discovery_v1.EndpointSlice]
 	LBIPPools            resource.Resource[*cilium_api_v2.CiliumLoadBalancerIPPool]
 	Identities           resource.Resource[*cilium_api_v2.CiliumIdentity]
-	CiliumPodIPPools     resource.Resource[*cilium_api_v2alpha1.CiliumPodIPPool]
+	CiliumPodIPPools     resource.Resource[*cilium_api_v2.CiliumPodIPPool]
 	CiliumEndpoints      resource.Resource[*cilium_api_v2.CiliumEndpoint]
 	CiliumEndpointSlices resource.Resource[*cilium_api_v2alpha1.CiliumEndpointSlice]
 	CiliumNodes          resource.Resource[*cilium_api_v2.CiliumNode]
+	Nodes                resource.Resource[*slim_corev1.Node]
 	Pods                 resource.Resource[*slim_corev1.Pod]
 	Namespaces           resource.Resource[*slim_corev1.Namespace]
 }

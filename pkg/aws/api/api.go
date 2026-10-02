@@ -30,6 +30,7 @@ import (
 	ipamOption "github.com/cilium/cilium/pkg/ipam/option"
 	ipamTypes "github.com/cilium/cilium/pkg/ipam/types"
 	"github.com/cilium/cilium/pkg/logging/logfields"
+	"github.com/cilium/cilium/pkg/mac"
 	"github.com/cilium/cilium/pkg/spanstat"
 )
 
@@ -473,9 +474,9 @@ retry:
 // parseENI parses a ec2.NetworkInterface as returned by the EC2 service API,
 // converts it into a types.ENI object.
 //
-// Returns an error on any malformed IP/CIDR string. AWS uses string pointers
-// for these fields, so unset values are nil and any non-nil string is expected
-// to be a valid IP or CIDR.
+// Returns an error on any malformed IP/CIDR/MAC string. AWS uses string
+// pointers for these fields, so unset values are nil and any non-nil string is
+// expected to be a valid IP, CIDR or MAC.
 func parseENI(iface *ec2_types.NetworkInterface, vpcs ipamTypes.VirtualNetworkMap, subnets ipamTypes.SubnetMap) (instanceID string, eni *types.ENI, err error) {
 	if iface.PrivateIpAddress == nil {
 		return "", nil, fmt.Errorf("ENI has no IP address")
@@ -492,7 +493,10 @@ func parseENI(iface *ec2_types.NetworkInterface, vpcs ipamTypes.VirtualNetworkMa
 	}
 
 	if iface.MacAddress != nil {
-		eni.MAC = aws.ToString(iface.MacAddress)
+		eni.MAC, err = mac.ParseMACOrUnset(aws.ToString(iface.MacAddress))
+		if err != nil {
+			return "", nil, fmt.Errorf("unable to parse ENI MAC %q: %w", aws.ToString(iface.MacAddress), err)
+		}
 	}
 
 	if iface.NetworkInterfaceId != nil {
@@ -1028,9 +1032,9 @@ func (c *Client) UnassignENIPrefixes(ctx context.Context, eniID string, prefixes
 }
 
 // AssociateEIP tries to find an Elastic IP Address with the given tags and associates it with the given instance
-func (c *Client) AssociateEIP(ctx context.Context, eniID string, eipTags ipamTypes.Tags) (string, error) {
+func (c *Client) AssociateEIP(ctx context.Context, eniID string, eipTags ipamTypes.Tags) (netip.Addr, error) {
 	if len(eipTags) == 0 {
-		return "", fmt.Errorf("no EIP tags were provided")
+		return netip.Addr{}, fmt.Errorf("no EIP tags were provided")
 	}
 
 	filters := make([]ec2_types.Filter, 0, len(eipTags))
@@ -1049,7 +1053,7 @@ func (c *Client) AssociateEIP(ctx context.Context, eniID string, eipTags ipamTyp
 	addresses, err := c.ec2Client.DescribeAddresses(ctx, describeAddressesInput)
 	c.metricsAPI.ObserveAPICall(DescribeAddresses, deriveStatus(err), sinceStart.Seconds())
 	if err != nil {
-		return "", err
+		return netip.Addr{}, err
 	}
 	c.logger.Info(
 		"Found EIPs corresponding to tags",
@@ -1072,7 +1076,7 @@ func (c *Client) AssociateEIP(ctx context.Context, eniID string, eipTags ipamTyp
 		association, err := c.ec2Client.AssociateAddress(ctx, associateAddressInput)
 		c.metricsAPI.ObserveAPICall(AssociateAddress, deriveStatus(err), sinceStart.Seconds())
 		if err != nil {
-			return "", err
+			return netip.Addr{}, err
 		}
 		c.logger.Info(
 			"Associated EIP successfully",
@@ -1080,10 +1084,15 @@ func (c *Client) AssociateEIP(ctx context.Context, eniID string, eipTags ipamTyp
 			logfields.Interface, eniID,
 			logfields.AssociationID, aws.ToString(association.AssociationId),
 		)
-		return aws.ToString(address.PublicIp), nil
+		publicIP := aws.ToString(address.PublicIp)
+		addr, err := netip.ParseAddr(publicIP)
+		if err != nil {
+			return netip.Addr{}, fmt.Errorf("failed to parse associated EIP %q: %w", publicIP, err)
+		}
+		return addr, nil
 	}
 
-	return "", fmt.Errorf("no unassociated EIPs found for tags %v", eipTags)
+	return netip.Addr{}, fmt.Errorf("no unassociated EIPs found for tags %v", eipTags)
 }
 
 func createAWSTagSlice(tags map[string]string) []ec2_types.Tag {

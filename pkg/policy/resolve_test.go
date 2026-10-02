@@ -17,6 +17,7 @@ import (
 	"github.com/stretchr/testify/require"
 	k8stypes "k8s.io/apimachinery/pkg/types"
 
+	cmtypes "github.com/cilium/cilium/pkg/clustermesh/types"
 	"github.com/cilium/cilium/pkg/endpoint/regeneration"
 	"github.com/cilium/cilium/pkg/identity"
 	"github.com/cilium/cilium/pkg/k8s/apis/cilium.io/utils"
@@ -65,7 +66,7 @@ func generateNumIdentities(numIdentities int) identity.IdentityMap {
 		bumpedIdentity := i + 1000
 		numericIdentity := identity.NumericIdentity(bumpedIdentity)
 
-		c[numericIdentity] = identityLabels.LabelArray()
+		c[numericIdentity] = identityLabels
 	}
 	return c
 }
@@ -194,8 +195,8 @@ func (d DummyOwner) IsHost() bool {
 	return false
 }
 
-func (d DummyOwner) PreviousMapState() *MapState {
-	return d.previousMap
+func (d DummyOwner) PreviousMapStateSizes() MapStateSizes {
+	return d.previousMap.Sizes()
 }
 
 func (_ DummyOwner) RegenerateIfAlive(_ *regeneration.ExternalRegenerationMetadata) <-chan bool {
@@ -213,10 +214,10 @@ func (td *testData) bootstrapRepo(ruleGenFunc func(int) (api.Rules, identity.Ide
 	wg := &sync.WaitGroup{}
 	// load in standard reserved identities
 	c := identity.IdentityMap{
-		fooIdentity.ID: fooIdentity.LabelArray,
+		fooIdentity.ID: fooIdentity.Labels,
 	}
 	identity.IterateReservedIdentities(func(ni identity.NumericIdentity, id *identity.Identity) {
-		c[ni] = id.Labels.LabelArray()
+		c[ni] = id.Labels
 	})
 	td.sc.UpdateIdentities(c, nil, wg)
 	td.subjectSc.UpdateIdentities(c, nil, wg)
@@ -400,7 +401,7 @@ func TestGetEgressNamedPorts(t *testing.T) {
 		"http": pkgTypes.PortProto{Port: 9090, Proto: u8proto.TCP},
 	}))
 
-	sp := newSelectorPolicy(testNewSelectorCache(t, hivetest.Logger(t), nil))
+	sp := newSelectorPolicy(testNewSelectorCache(t, hivetest.Logger(t), nil), cmtypes.ClusterInfo{MaxConnectedClusters: 255})
 	sp.namedPortsGetter = testNamedPortsGetter{npm: namedPorts}
 
 	portsByNID := map[identity.NumericIdentity]uint16{}
@@ -771,7 +772,7 @@ func TestMapStateWithIngressWildcard(t *testing.T) {
 
 	// Add new identity to test accumulation of MapChanges
 	added1 := identity.IdentityMap{
-		identity.NumericIdentity(192): labels.ParseSelectLabelArray("id=resolve_test_1"),
+		identity.NumericIdentity(192): labels.ParseSelectLabels("id=resolve_test_1"),
 	}
 	wg := &sync.WaitGroup{}
 	td.sc.UpdateIdentities(added1, nil, wg)
@@ -850,9 +851,9 @@ func TestMapStateWithIngress(t *testing.T) {
 
 	// Add new identity to test accumulation of MapChanges
 	added1 := identity.IdentityMap{
-		identity.NumericIdentity(192): labels.ParseSelectLabelArray("id=resolve_test_1", "num=1"),
-		identity.NumericIdentity(193): labels.ParseSelectLabelArray("id=resolve_test_1", "num=2"),
-		identity.NumericIdentity(194): labels.ParseSelectLabelArray("id=resolve_test_1", "num=3"),
+		identity.NumericIdentity(192): labels.ParseSelectLabels("id=resolve_test_1", "num=1"),
+		identity.NumericIdentity(193): labels.ParseSelectLabels("id=resolve_test_1", "num=2"),
+		identity.NumericIdentity(194): labels.ParseSelectLabels("id=resolve_test_1", "num=3"),
 	}
 	wg := &sync.WaitGroup{}
 	td.sc.UpdateIdentities(added1, nil, wg)
@@ -860,7 +861,7 @@ func TestMapStateWithIngress(t *testing.T) {
 	require.Len(t, policy.policyMapChanges.synced, 3)
 
 	deleted1 := identity.IdentityMap{
-		identity.NumericIdentity(193): labels.ParseSelectLabelArray("id=resolve_test_1", "num=2"),
+		identity.NumericIdentity(193): labels.ParseSelectLabels("id=resolve_test_1", "num=2"),
 	}
 	wg = &sync.WaitGroup{}
 	td.sc.UpdateIdentities(nil, deleted1, wg)
@@ -904,12 +905,7 @@ func TestMapStateWithIngress(t *testing.T) {
 							cachedSelectorWorldV4:        nil,
 							cachedSelectorWorldV6:        nil,
 							cachedSelectorAggregateWorld: nil,
-							cachedSelectorTest: &PerSelectorPolicy{
-								Verdict: types.Allow,
-								Authentication: &api.Authentication{
-									Mode: api.AuthenticationModeDisabled,
-								},
-							},
+							cachedSelectorTest:           nil,
 						},
 						RuleOrigin: OriginForTest(map[CachedSelector]labels.LabelArrayList{
 							cachedSelectorWorld:          {ruleLabel},
@@ -932,8 +928,8 @@ func TestMapStateWithIngress(t *testing.T) {
 			IngressKey().WithIdentity(identity.ReservedIdentityWorldIPv4).WithTCPPort(80):      rule1MapStateEntry,
 			IngressKey().WithIdentity(identity.ReservedIdentityWorldIPv6).WithTCPPort(80):      rule1MapStateEntry,
 			IngressKey().WithIdentity(identity.ReservedIdentityAggregateWorld).WithTCPPort(80): rule1MapStateEntry,
-			IngressKey().WithIdentity(192).WithTCPPort(80):                                     rule1MapStateEntry.withExplicitAuth(AuthTypeDisabled),
-			IngressKey().WithIdentity(194).WithTCPPort(80):                                     rule1MapStateEntry.withExplicitAuth(AuthTypeDisabled),
+			IngressKey().WithIdentity(192).WithTCPPort(80):                                     rule1MapStateEntry,
+			IngressKey().WithIdentity(194).WithTCPPort(80):                                     rule1MapStateEntry,
 		}),
 	}
 
@@ -1174,7 +1170,7 @@ func TestEndpointPolicy_GetRuleMeta(t *testing.T) {
 
 	// test non-empty mapstate
 	p.policyMapState = emptyMapState(log).withState(mapStateMap{
-		key1: newMapStateEntry(0, types.HighestPriority, types.LowestPriority, makeSingleRuleOrigin(lbls, logstr), 0, 0, types.Allow, NoAuthRequirement),
+		key1: newMapStateEntry(0, types.HighestPriority, types.LowestPriority, makeSingleRuleOrigin(lbls, logstr), 0, 0, types.Allow),
 	})
 
 	rm, err := p.GetRuleMeta(key1)
@@ -1187,7 +1183,7 @@ func TestEndpointPolicy_GetRuleMeta(t *testing.T) {
 
 	// test mapstate from dump
 	msDump := MapStateMap{
-		key1: types.NewMapStateEntry(0, false, 0, 0, NoAuthRequirement),
+		key1: types.NewMapStateEntry(0, false, 0, 0),
 	}
 
 	p = &EndpointPolicy{
@@ -1211,7 +1207,7 @@ func TestEndpointPolicy_Lookup_PortRange(t *testing.T) {
 
 	p := &EndpointPolicy{
 		policyMapState: emptyMapState(log).withState(mapStateMap{
-			rangeEntry: newMapStateEntry(0, types.HighestPriority, types.LowestPriority, makeSingleRuleOrigin(lbls, "log"), 0, 0, types.Allow, NoAuthRequirement),
+			rangeEntry: newMapStateEntry(0, types.HighestPriority, types.LowestPriority, makeSingleRuleOrigin(lbls, "log"), 0, 0, types.Allow),
 		}),
 	}
 
@@ -1241,7 +1237,7 @@ func TestEndpointPolicy_Lookup_PortRange_L4Only(t *testing.T) {
 
 	p := &EndpointPolicy{
 		policyMapState: emptyMapState(log).withState(mapStateMap{
-			rangeEntry: newMapStateEntry(0, types.HighestPriority, types.LowestPriority, makeSingleRuleOrigin(lbls, "log"), 0, 0, types.Allow, NoAuthRequirement),
+			rangeEntry: newMapStateEntry(0, types.HighestPriority, types.LowestPriority, makeSingleRuleOrigin(lbls, "log"), 0, 0, types.Allow),
 		}),
 	}
 

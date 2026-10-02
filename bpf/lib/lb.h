@@ -17,10 +17,8 @@
 
 #ifndef SKIP_CALLS_MAP
 #include "drop.h"
-#ifdef SERVICE_NO_BACKEND_RESPONSE
 #include "icmp.h"
 #include "icmp6.h"
-#endif
 #endif
 
 struct lb6_key {
@@ -415,13 +413,41 @@ static __always_inline bool lb_is_svc_proto(__u8 proto)
 	switch (proto) {
 	case IPPROTO_TCP:
 	case IPPROTO_UDP:
-#ifdef ENABLE_SCTP
-	case IPPROTO_SCTP:
-#endif /* ENABLE_SCTP */
 		return true;
+	case IPPROTO_SCTP:
+		return CONFIG(enable_sctp);
 	default:
 		return false;
 	}
+}
+
+static __always_inline bool
+lb_need_dsr_info(const void *map, const void *tuple, __u8 nexthdr,
+		 const struct ct_state *ct_state, bool new_backend)
+{
+	if (ct_state->need_dsr_info)
+		return true;
+
+	if (nexthdr != IPPROTO_TCP)
+		return true;
+
+	/* For TCP we want to embed the DSR info only into the SYN,
+	 * to avoid MTU troubles.
+	 */
+	if (ct_state->syn)
+		return true;
+
+	/* If a non-SYN picked a new backend, we enter "forced DSR info" mode.
+	 * To avoid loss of the *one* TCP packet that would carry the
+	 * DSR info, we simply send it on all subsequent packets of the
+	 * connection.
+	 */
+	if (new_backend) {
+		ct_update_need_dsr_info(map, tuple, true);
+		return true;
+	}
+
+	return false;
 }
 
 static __always_inline
@@ -647,6 +673,32 @@ bool lb6_svc_is_itp_local(const struct lb6_service *svc)
 	return svc->flags2 & SVC_FLAG_INT_LOCAL_SCOPE;
 }
 
+static __always_inline bool
+lb_svc_uses_dsr(bool flip __maybe_unused)
+{
+#ifdef ENABLE_DSR
+# ifdef ENABLE_DSR_BYUSER
+	return flip;
+# else
+	return true;
+# endif
+#else
+	return false;
+#endif
+}
+
+static __always_inline bool
+lb4_svc_uses_dsr(const struct lb4_service *svc)
+{
+	return lb_svc_uses_dsr(svc->flags2 & SVC_FLAG_FWD_MODE_DSR);
+}
+
+static __always_inline bool
+lb6_svc_uses_dsr(const struct lb6_service *svc)
+{
+	return lb_svc_uses_dsr(svc->flags2 & SVC_FLAG_FWD_MODE_DSR);
+}
+
 static __always_inline
 bool lb_punt_etp_local(void)
 {
@@ -662,22 +714,22 @@ static __always_inline int reverse_map_l4_port(struct __ctx_buff *ctx, __u8 next
 					       struct csum_offset *csum_off)
 {
 	switch (nexthdr) {
+	case IPPROTO_SCTP:
+		if (!CONFIG(enable_sctp))
+			goto unsup_proto;
+		fallthrough;
 	case IPPROTO_TCP:
 	case IPPROTO_UDP:
-#ifdef ENABLE_SCTP
-	case IPPROTO_SCTP:
-#endif  /* ENABLE_SCTP */
 		if (port) {
 			int ret;
 
 			if (port != old_port) {
-#ifdef ENABLE_SCTP
 				/* This will change the SCTP checksum, which we cannot fix right now.
 				 * This will likely need kernel changes before we can remove this.
 				 */
 				if (nexthdr == IPPROTO_SCTP)
 					return DROP_CSUM_L4;
-#endif  /* ENABLE_SCTP */
+
 				ret = l4_modify_port(ctx, l4_off, TCP_SPORT_OFF,
 						     csum_off, port, old_port);
 				if (IS_ERR(ret))
@@ -691,6 +743,7 @@ static __always_inline int reverse_map_l4_port(struct __ctx_buff *ctx, __u8 next
 		return CTX_ACT_OK;
 
 	default:
+unsup_proto:
 		return DROP_UNKNOWN_L4;
 	}
 
@@ -698,19 +751,17 @@ static __always_inline int reverse_map_l4_port(struct __ctx_buff *ctx, __u8 next
 }
 
 static __always_inline int
-lb_l4_xlate(struct __ctx_buff *ctx, __u8 nexthdr __maybe_unused, int l4_off,
+lb_l4_xlate(struct __ctx_buff *ctx, __u8 nexthdr, int l4_off,
 	    struct csum_offset *csum_off, __be16 dport, __be16 backend_port)
 {
 	if (likely(backend_port) && dport != backend_port) {
 		int ret;
 
-#ifdef ENABLE_SCTP
 		/* This will change the SCTP checksum, which we cannot fix right now.
 		 * This will likely need kernel changes before we can remove this.
 		 */
-		if (nexthdr == IPPROTO_SCTP)
+		if (CONFIG(enable_sctp) && nexthdr == IPPROTO_SCTP)
 			return DROP_CSUM_L4;
-#endif  /* ENABLE_SCTP */
 
 		/* Port offsets for UDP and TCP are the same */
 		ret = l4_modify_port(ctx, l4_off, TCP_DPORT_OFF, csum_off,
@@ -912,16 +963,18 @@ lb6_extract_tuple(const struct __ctx_buff *ctx, const struct ipv6hdr *ip6, fragi
 	ipv6_addr_copy(&tuple->saddr, (const union v6addr *)&ip6->saddr);
 
 	switch (tuple->nexthdr) {
+	case IPPROTO_SCTP:
+		if (!CONFIG(enable_sctp))
+			goto unsup_proto;
+		fallthrough;
 	case IPPROTO_TCP:
 	case IPPROTO_UDP:
-#ifdef ENABLE_SCTP
-	case IPPROTO_SCTP:
-#endif  /* ENABLE_SCTP */
 		return ipv6_load_l4_ports(ctx, ip6, fraginfo, l4_off,
 					  CT_EGRESS, &tuple->dport);
 	case IPPROTO_ICMPV6:
 		return DROP_UNSUPP_SERVICE_PROTO;
 	default:
+unsup_proto:
 		return DROP_UNKNOWN_L4;
 	}
 }
@@ -1282,7 +1335,7 @@ __lb6_affinity_backend_id(const struct lb6_service *svc, bool netns_cookie,
 		ipv6_addr_copy_unaligned(&key.client_id.client_ip, &id->client_ip);
 
 	val = map_lookup_elem(&cilium_lb6_affinity, &key);
-	if (val != NULL) {
+	if (val) {
 		__u32 now = (__u32)bpf_mono_now();
 		struct lb_affinity_match match = {
 			.rev_nat_id	= svc->rev_nat_index,
@@ -1381,9 +1434,11 @@ static __always_inline int lb6_local(const void *map, struct __ctx_buff *ctx,
 				     const struct lb6_service *svc,
 				     struct ct_state *state,
 				     const struct lb6_backend **selected_backend,
+				     bool *need_dsr_info __maybe_unused,
 				     __s8 *ext_err,
 				     const struct lb6_backend *forced_backend)
 {
+	bool new_backend __maybe_unused = false;
 	__u32 monitor; /* Deliberately ignored; regular CT will determine monitoring. */
 	__u8 flags = tuple->flags;
 	const struct lb6_backend *backend;
@@ -1431,7 +1486,7 @@ static __always_inline int lb6_local(const void *map, struct __ctx_buff *ctx,
 			backend_id = lb6_affinity_backend_id_by_addr(svc, &client_id);
 			if (backend_id != 0) {
 				backend = lb6_lookup_backend(ctx, backend_id);
-				if (backend == NULL)
+				if (!backend)
 					backend_id = 0;
 			}
 		}
@@ -1439,10 +1494,10 @@ static __always_inline int lb6_local(const void *map, struct __ctx_buff *ctx,
 			/* No CT entry has been found, so select a svc endpoint */
 			backend_id = lb6_select_backend_id(ctx, key, tuple, svc);
 			backend = lb6_lookup_backend(ctx, backend_id);
-			if (backend == NULL)
+			if (!backend)
 				goto no_service;
 
-			state->new_backend = true;
+			new_backend = true;
 		}
 
 		state->backend_id = backend_id;
@@ -1477,20 +1532,29 @@ static __always_inline int lb6_local(const void *map, struct __ctx_buff *ctx,
 #endif
 		if (unlikely(!backend || backend->flags != BE_STATE_ACTIVE)) {
 			/* Drain existing connections, but redirect new ones to only
-			 * active backends.
+			 * active backends. UDP connections are not drained because
+			 * UDP is connectionless.
 			 */
-			if (backend && !state->syn)
+			if (backend && !state->syn && tuple->nexthdr != IPPROTO_UDP)
 				break;
 
-			if (unlikely(svc->count == 0))
+			if (unlikely(svc->count == 0)) {
+				/* If all backends are terminating, fall back to the existing
+				 * terminating backend for UDP only. New TCP connections (SYN)
+				 * are rejected as no active backends exist. Established TCP
+				 * connections were already drained above.
+				 */
+				if (backend && tuple->nexthdr == IPPROTO_UDP)
+					break;
 				goto no_service;
+			}
 
 			backend_id = lb6_select_backend_id(ctx, key, tuple, svc);
 			backend = lb6_lookup_backend(ctx, backend_id);
 			if (!backend)
 				goto no_service;
 
-			state->new_backend = true;
+			new_backend = true;
 			state->rev_nat_index = svc->rev_nat_index;
 			ct_update_svc_entry(map, tuple, backend_id, svc->rev_nat_index);
 		}
@@ -1500,6 +1564,12 @@ static __always_inline int lb6_local(const void *map, struct __ctx_buff *ctx,
 		ret = DROP_UNKNOWN_CT;
 		goto drop_err;
 	}
+
+#if DSR_ENCAP_MODE == DSR_ENCAP_NONE || DSR_ENCAP_MODE == DSR_ENCAP_GENEVE
+	if (lb6_svc_uses_dsr(svc) && need_dsr_info)
+		*need_dsr_info = lb_need_dsr_info(map, tuple, tuple->nexthdr,
+						  state, new_backend);
+#endif
 
 	/* Restore flags so that SERVICE flag is only used in used when the
 	 * service lookup happens and future lookups use EGRESS or INGRESS.
@@ -1717,16 +1787,18 @@ lb4_extract_tuple(const struct __ctx_buff *ctx, const struct iphdr *ip4, fraginf
 	tuple->saddr = ip4->saddr;
 
 	switch (tuple->nexthdr) {
+	case IPPROTO_SCTP:
+		if (!CONFIG(enable_sctp))
+			goto unsup_proto;
+		fallthrough;
 	case IPPROTO_TCP:
 	case IPPROTO_UDP:
-#ifdef ENABLE_SCTP
-	case IPPROTO_SCTP:
-#endif  /* ENABLE_SCTP */
 		return ipv4_load_l4_ports(ctx, ip4, fraginfo, l4_off,
 					  CT_EGRESS, &tuple->dport);
 	case IPPROTO_ICMP:
 		return DROP_UNSUPP_SERVICE_PROTO;
 	default:
+unsup_proto:
 		return DROP_UNKNOWN_L4;
 	}
 }
@@ -2105,7 +2177,7 @@ __lb4_affinity_backend_id(const struct lb4_service *svc, bool netns_cookie,
 	struct lb_affinity_val *val;
 
 	val = map_lookup_elem(&cilium_lb4_affinity, &key);
-	if (val != NULL) {
+	if (val) {
 		__u32 now = (__u32)bpf_mono_now();
 		struct lb_affinity_match match = {
 			.rev_nat_id	= svc->rev_nat_index,
@@ -2207,9 +2279,11 @@ static __always_inline int lb4_local(const void *map, struct __ctx_buff *ctx,
 				     const struct lb4_service *svc,
 				     struct ct_state *state,
 				     const struct lb4_backend **selected_backend,
+				     bool *need_dsr_info __maybe_unused,
 				     __s8 *ext_err,
 				     const struct lb4_backend *forced_backend)
 {
+	bool new_backend __maybe_unused = false;
 	__u32 monitor; /* Deliberately ignored; regular CT will determine monitoring. */
 	__u8 flags = tuple->flags;
 	const struct lb4_backend *backend;
@@ -2261,7 +2335,7 @@ static __always_inline int lb4_local(const void *map, struct __ctx_buff *ctx,
 			backend_id = lb4_affinity_backend_id_by_addr(svc, &client_id);
 			if (backend_id != 0) {
 				backend = lb4_lookup_backend(ctx, backend_id);
-				if (backend == NULL)
+				if (!backend)
 					backend_id = 0;
 			}
 		}
@@ -2269,10 +2343,10 @@ static __always_inline int lb4_local(const void *map, struct __ctx_buff *ctx,
 			/* No CT entry has been found, so select a svc endpoint */
 			backend_id = lb4_select_backend_id(ctx, key, tuple, svc);
 			backend = lb4_lookup_backend(ctx, backend_id);
-			if (backend == NULL)
+			if (!backend)
 				goto no_service;
 
-			state->new_backend = true;
+			new_backend = true;
 		}
 
 		state->backend_id = backend_id;
@@ -2307,20 +2381,29 @@ static __always_inline int lb4_local(const void *map, struct __ctx_buff *ctx,
 #endif
 		if (unlikely(!backend || backend->flags != BE_STATE_ACTIVE)) {
 			/* Drain existing connections, but redirect new ones to only
-			 * active backends.
+			 * active backends. UDP connections are not drained because
+			 * UDP is connectionless.
 			 */
-			if (backend && !state->syn)
+			if (backend && !state->syn && tuple->nexthdr != IPPROTO_UDP)
 				break;
 
-			if (unlikely(svc->count == 0))
+			if (unlikely(svc->count == 0)) {
+				/* If all backends are terminating, fall back to the existing
+				 * terminating backend for UDP only. New TCP connections (SYN)
+				 * are rejected as no active backends exist. Established TCP
+				 * connections were already drained above.
+				 */
+				if (backend && tuple->nexthdr == IPPROTO_UDP)
+					break;
 				goto no_service;
+			}
 
 			backend_id = lb4_select_backend_id(ctx, key, tuple, svc);
 			backend = lb4_lookup_backend(ctx, backend_id);
 			if (!backend)
 				goto no_service;
 
-			state->new_backend = true;
+			new_backend = true;
 			state->rev_nat_index = svc->rev_nat_index;
 			ct_update_svc_entry(map, tuple, backend_id, svc->rev_nat_index);
 		}
@@ -2330,6 +2413,12 @@ static __always_inline int lb4_local(const void *map, struct __ctx_buff *ctx,
 		ret = DROP_UNKNOWN_CT;
 		goto drop_err;
 	}
+
+#if DSR_ENCAP_MODE == DSR_ENCAP_NONE || DSR_ENCAP_MODE == DSR_ENCAP_GENEVE
+	if (lb4_svc_uses_dsr(svc) && need_dsr_info)
+		*need_dsr_info = lb_need_dsr_info(map, tuple, tuple->nexthdr,
+						  state, new_backend);
+#endif
 
 	/* Restore flags so that SERVICE flag is only used in used when the
 	 * service lookup happens and future lookups use EGRESS or INGRESS.
@@ -2375,9 +2464,12 @@ lb4_dnat_request(struct __ctx_buff *ctx, const struct lb4_backend *backend,
 }
 #endif /* ENABLE_IPV4 */
 
+DECLARE_CONFIG(bool,
+	       enable_service_no_backend_response,
+	       "Reply with ICMP to traffic to a service with no backends")
+
 /* Because we use tail calls and this file is included in bpf_sock.h */
 #ifndef SKIP_CALLS_MAP
-#ifdef SERVICE_NO_BACKEND_RESPONSE
 
 #ifdef ENABLE_IPV4
 __declare_tail(CILIUM_CALL_IPV4_NO_SERVICE)
@@ -2386,7 +2478,7 @@ int tail_no_service_ipv4(struct __ctx_buff *ctx)
 	__u32 src_sec_identity = ctx_load_meta(ctx, CB_SRC_LABEL);
 	int ret;
 
-	ret = generate_icmp4_reply(ctx, ICMP_DEST_UNREACH, ICMP_PORT_UNREACH);
+	ret = generate_icmp4_reply(ctx, ICMP_DEST_UNREACH, ICMP_PORT_UNREACH, 0);
 	if (!ret) {
 		/* Redirect ICMP to the interface we received it on. */
 		cilium_dbg_capture(ctx, DBG_CAPTURE_DELIVERY,
@@ -2424,7 +2516,7 @@ int tail_no_service_ipv6(struct __ctx_buff *ctx)
 		goto drop_err;
 	}
 
-	ret = generate_icmp6_reply(ctx, ICMPV6_DEST_UNREACH, ICMPV6_PORT_UNREACH);
+	ret = generate_icmp6_reply(ctx, ICMPV6_DEST_UNREACH, ICMPV6_PORT_UNREACH, 0);
 	if (!ret) {
 		/* Redirect ICMP to the interface we received it on. */
 		cilium_dbg_capture(ctx, DBG_CAPTURE_DELIVERY,
@@ -2441,7 +2533,6 @@ drop_err:
 }
 #endif /* ENABLE_IPV6 */
 
-#endif /* SERVICE_NO_BACKEND_RESPONSE */
 #endif /* SKIP_CALLS_MAP */
 
 static __always_inline

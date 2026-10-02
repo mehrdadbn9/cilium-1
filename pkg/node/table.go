@@ -4,33 +4,59 @@
 package node
 
 import (
+	"iter"
 	"net/netip"
 	"slices"
 	"strings"
 
 	"github.com/cilium/statedb"
 	"github.com/cilium/statedb/index"
+	"github.com/cilium/statedb/reconciler"
 	k8stypes "k8s.io/apimachinery/pkg/types"
 
-	"github.com/cilium/cilium/pkg/cidr"
+	cmtypes "github.com/cilium/cilium/pkg/clustermesh/types"
 	"github.com/cilium/cilium/pkg/datapath/tunnel"
+	"github.com/cilium/cilium/pkg/ip"
+	"github.com/cilium/cilium/pkg/node/addressing"
 	"github.com/cilium/cilium/pkg/node/types"
 )
 
-// LocalNode is the local Cilium node. This is derived from the k8s corev1.Node object.
+// LocalNode is an alias for the [Node] type to mark that we expect this
+// to be the local node.
+type LocalNode = Node
+
+// Node is a Cilium node. It is the local node if [Node.Local] is non-nil.
 //
-// +k8s:deepcopy-gen=true
 // +deepequal-gen=true
-type LocalNode struct {
+type Node struct {
 	types.Node
+
+	// addressClusterID identifies the cluster address space used by
+	// cluster-scoped node addresses. It is derived when the node is written and
+	// is not part of the externally serialized node data.
+	// +deepequal-gen=false
+	addressClusterID uint32
 
 	// Local is non-nil if this is the local node. This carries additional
 	// information about the local node that is not shared outside.
 	Local *LocalNodeInfo
+
+	// Statuses for reconcilers acting on this object.
+	// DeepEqual is reserved for comparing the desired node data.
+	// +deepequal-gen=false
+	Statuses reconciler.StatusSet
+}
+
+// DeepCopy returns a deep copy of the node.
+func (n *Node) DeepCopy() *Node {
+	n2 := *n
+	n2.Node = *n2.Node.DeepCopy()
+	n2.Local = n2.Local.DeepCopy()
+	return &n2
 }
 
 // TableHeader implements statedb.TableWritable.
-func (n *LocalNode) TableHeader() []string {
+func (n *Node) TableHeader() []string {
 	return []string{
 		"Name",
 		"Source",
@@ -39,10 +65,10 @@ func (n *LocalNode) TableHeader() []string {
 }
 
 // TableRow implements statedb.TableWritable.
-func (n *LocalNode) TableRow() []string {
+func (n *Node) TableRow() []string {
 	addrs := make([]string, len(n.IPAddresses))
 	for i := range n.IPAddresses {
-		addrs[i] = string(n.IPAddresses[i].Type) + ":" + n.IPAddresses[i].ToString()
+		addrs[i] = string(n.IPAddresses[i].Type) + ":" + n.IPAddresses[i].IP.String()
 	}
 	slices.Sort(addrs)
 	return []string{
@@ -52,10 +78,57 @@ func (n *LocalNode) TableRow() []string {
 	}
 }
 
-var _ statedb.TableWritable = &LocalNode{}
+var _ statedb.TableWritable = &Node{}
+
+// addressClusters returns the normalized, cluster-aware addresses associated
+// with the node. The optional predicate omits configured Cilium internal
+// router addresses that may intentionally be shared by every node.
+func (n *Node) addressClusters(
+	omitStaticLocalRouterIP func(netip.Addr) bool,
+) iter.Seq[cmtypes.AddrCluster] {
+	return func(yield func(cmtypes.AddrCluster) bool) {
+		yieldAddr := func(addr netip.Addr, clusterID uint32) bool {
+			if !addr.IsValid() {
+				return true
+			}
+			return yield(cmtypes.AddrClusterFrom(addr.Unmap(), clusterID))
+		}
+
+		for _, address := range n.IPAddresses {
+			if address.Type == addressing.NodeCiliumInternalIP &&
+				omitStaticLocalRouterIP != nil &&
+				omitStaticLocalRouterIP(address.IP.Addr) {
+				continue
+			}
+			clusterID := uint32(0)
+			if address.Type == addressing.NodeCiliumInternalIP {
+				clusterID = n.addressClusterID
+			}
+			if !yieldAddr(address.IP.Addr, clusterID) {
+				return
+			}
+		}
+
+		for _, addr := range []netip.Addr{
+			n.IPv4HealthIP.Addr,
+			n.IPv6HealthIP.Addr,
+			n.IPv4IngressIP.Addr,
+			n.IPv6IngressIP.Addr,
+		} {
+			if !yieldAddr(addr, n.addressClusterID) {
+				return
+			}
+		}
+	}
+}
 
 // LocalNodeInfo is the additional information about the local node that
 // is only used internally.
+//
+// DeepEqual is generated, except for the netip.Addr and netip.Prefix fields:
+// deepequal-gen cannot synthesize a comparison for an external type with
+// unexported pointer fields, so those carry +deepequal-gen=false and are
+// compared by the hand-written prologue in DeepEqual below.
 //
 // +k8s:deepcopy-gen=false
 // +deepequal-gen=true
@@ -70,9 +143,11 @@ type LocalNodeInfo struct {
 	// ID of the node assigned by the cloud provider.
 	ProviderID string
 	// v4 CIDR in which pod IPs are routable
-	IPv4NativeRoutingCIDR *cidr.CIDR
+	// +deepequal-gen=false
+	IPv4NativeRoutingCIDR netip.Prefix
 	// v6 CIDR in which pod IPs are routable
-	IPv6NativeRoutingCIDR *cidr.CIDR
+	// +deepequal-gen=false
+	IPv6NativeRoutingCIDR netip.Prefix
 	// ServiceLoopbackIPv4 is the source address used for SNAT when a Pod talks to
 	// itself through a Service.
 	// +deepequal-gen=false
@@ -81,6 +156,14 @@ type LocalNodeInfo struct {
 	// itself through a Service.
 	// +deepequal-gen=false
 	ServiceLoopbackIPv6 netip.Addr
+	// IPv4PodSubnets are the v4 subnets pod IPs are allocated from, for IPAM
+	// modes where pods live in cloud provider subnets rather than in a node
+	// PodCIDR. Empty for every other mode.
+	IPv4PodSubnets []ip.Prefix
+	// IPv6PodSubnets are the v6 subnets pod IPs are allocated from, for IPAM
+	// modes where pods live in cloud provider subnets rather than in a node
+	// PodCIDR. Empty for every other mode.
+	IPv6PodSubnets []ip.Prefix
 	// IsBeingDeleted indicates that the local node is being deleted.
 	IsBeingDeleted bool
 	// UnderlayProtocol is the IP family of our underlay.
@@ -90,14 +173,8 @@ type LocalNodeInfo struct {
 // DeepCopyInto copies the receiver into out. in must be non-nil.
 func (in *LocalNodeInfo) DeepCopyInto(out *LocalNodeInfo) {
 	*out = *in
-	// Deep copy pointer fields
-	if in.IPv4NativeRoutingCIDR != nil {
-		out.IPv4NativeRoutingCIDR = in.IPv4NativeRoutingCIDR.DeepCopy()
-	}
-	if in.IPv6NativeRoutingCIDR != nil {
-		out.IPv6NativeRoutingCIDR = in.IPv6NativeRoutingCIDR.DeepCopy()
-	}
-	// netip.Addr fields are value types, already copied by *out = *in
+	out.IPv4PodSubnets = slices.Clone(in.IPv4PodSubnets)
+	out.IPv6PodSubnets = slices.Clone(in.IPv6PodSubnets)
 }
 
 // DeepCopy creates a deep copy of the LocalNodeInfo.
@@ -110,28 +187,52 @@ func (in *LocalNodeInfo) DeepCopy() *LocalNodeInfo {
 	return out
 }
 
-// DeepEqual compares two LocalNodeInfo structs for equality.
+// DeepEqual compares two LocalNodeInfo structs for equality. in must be non-nil.
 func (in *LocalNodeInfo) DeepEqual(other *LocalNodeInfo) bool {
 	if other == nil {
 		return false
 	}
-	// Manually compare netip.Addr fields
+	// Manually compare the netip.Addr and netip.Prefix fields, which
+	// deepequal-gen cannot generate a comparison for.
+	if in.IPv4NativeRoutingCIDR != other.IPv4NativeRoutingCIDR {
+		return false
+	}
+	if in.IPv6NativeRoutingCIDR != other.IPv6NativeRoutingCIDR {
+		return false
+	}
 	if in.ServiceLoopbackIPv4 != other.ServiceLoopbackIPv4 {
 		return false
 	}
 	if in.ServiceLoopbackIPv6 != other.ServiceLoopbackIPv6 {
 		return false
 	}
-	// Call generated private method for other fields
+	// Call the generated `deepEqual` method, which compares all other fields.
 	return in.deepEqual(other)
 }
 
+// SetPodSubnets records the subnets pod IPs are allocated from, coalescing
+// them into the minimal equivalent set and splitting them by address family.
+// It replaces any previously recorded value, so repeated calls with the same
+// input are idempotent and dedup against the previous revision in statedb.
+func (n *LocalNode) SetPodSubnets(prefixes []netip.Prefix) {
+	var v4, v6 []ip.Prefix
+	for _, p := range ip.CoalescePrefixes(prefixes) {
+		if p.Addr().Is4() {
+			v4 = append(v4, ip.PrefixFrom(p))
+		} else {
+			v6 = append(v6, ip.PrefixFrom(p))
+		}
+	}
+	n.Local.IPv4PodSubnets = v4
+	n.Local.IPv6PodSubnets = v6
+}
+
 const (
-	LocalNodeTableName = "local-node"
+	NodeTableName = "nodes"
 )
 
 var (
-	LocalNodeNameIndex = statedb.Index[*LocalNode, string]{
+	NodeNameIndex = statedb.Index[*Node, string]{
 		Name: "name",
 		FromObject: func(obj *LocalNode) index.KeySet {
 			return index.NewKeySet(index.String(obj.Fullname()))
@@ -140,9 +241,31 @@ var (
 		FromString: index.FromString,
 		Unique:     true,
 	}
-	NodeByName = LocalNodeNameIndex.Query
+	NodeByName = NodeNameIndex.Query
 
-	LocalNodeLocalIndex = statedb.Index[*LocalNode, bool]{
+	// NodeAddressIndex indexes every address of the node. The index is non-unique
+	// because configured Cilium internal router addresses may legitimately be
+	// shared by every node. Writer resolves all other conflicts according to
+	// source priority.
+	NodeAddressIndex = statedb.Index[*Node, cmtypes.AddrCluster]{
+		Name: "address",
+		FromObject: func(obj *Node) index.KeySet {
+			keys := make([]index.Key, 0, len(obj.IPAddresses)+4)
+			for addr := range obj.addressClusters(nil) {
+				keys = append(keys, nodeAddressKey(addr))
+			}
+			if len(keys) == 0 {
+				return index.EmptyKeySet
+			}
+			return index.NewKeySet(keys[0], keys[1:]...)
+		},
+		FromKey:    nodeAddressKey,
+		FromString: nodeAddressKeyString,
+		Unique:     false,
+	}
+	NodeByAddress = NodeAddressIndex.Query
+
+	NodeLocalIndex = statedb.Index[*Node, bool]{
 		Name: "local",
 		FromObject: func(obj *LocalNode) index.KeySet {
 			if obj.Local == nil {
@@ -156,15 +279,29 @@ var (
 		Unique:     true,
 	}
 
-	NodeByLocal    = LocalNodeLocalIndex.Query
+	NodeByLocal    = NodeLocalIndex.Query
 	LocalNodeQuery = NodeByLocal(true)
 )
 
-func NewLocalNodeTable(db *statedb.DB) (statedb.RWTable[*LocalNode], error) {
+func nodeAddressKey(addr cmtypes.AddrCluster) index.Key {
+	key := addr.As20()
+	return key[:]
+}
+
+func nodeAddressKeyString(s string) (index.Key, error) {
+	addr, err := cmtypes.ParseAddrCluster(s)
+	if err != nil {
+		return nil, err
+	}
+	return nodeAddressKey(addr), nil
+}
+
+func NewNodeTable(db *statedb.DB) (statedb.RWTable[*Node], error) {
 	return statedb.NewTable(
 		db,
-		LocalNodeTableName,
-		LocalNodeNameIndex,
-		LocalNodeLocalIndex,
+		NodeTableName,
+		NodeNameIndex,
+		NodeLocalIndex,
+		NodeAddressIndex,
 	)
 }

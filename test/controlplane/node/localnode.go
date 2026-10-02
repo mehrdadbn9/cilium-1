@@ -14,6 +14,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
+	cmtypes "github.com/cilium/cilium/pkg/clustermesh/types"
 	"github.com/cilium/cilium/pkg/k8s"
 	"github.com/cilium/cilium/pkg/k8s/client"
 	"github.com/cilium/cilium/pkg/node"
@@ -74,7 +75,7 @@ func validateLocalNodeInit(lns *node.LocalNodeStore) error {
 	// LocalNodeStore has started:
 	assert.Equal(errs, localNodeObject.Name, node.Name)
 	assert.Equal(errs, "10.0.0.1", node.GetNodeIP(false).String())
-	assert.Equal(errs, "20.0.0.2", node.GetExternalIP(false).String())
+	assert.Equal(errs, "20.0.0.2", node.GetNodeExternalIPv4().String())
 	assert.Contains(errs, node.Labels, "foo")
 	assert.Contains(errs, node.Annotations, "cilium.io/baz")
 
@@ -117,7 +118,7 @@ func validateLocalNodeAgent(cs client.Clientset, lns *node.LocalNodeStore) error
 		assert.Equal(errs, localNodeObject.UID, ciliumNode.OwnerReferences[0].UID)
 	}
 
-	parsedCiliumNode := k8s.ParseCiliumNode(&ciliumNode)
+	parsedCiliumNode := k8s.ParseCiliumNode(&ciliumNode, cmtypes.DefaultClusterInfo)
 	assert.Equal(errs, node.IPv4HealthIP, parsedCiliumNode.IPv4HealthIP, "CiliumNode HealthIP")
 	assert.Equal(errs, node.IPAddresses, parsedCiliumNode.IPAddresses, "CiliumNode IPAddresses")
 	assert.Equal(errs, node.Labels, parsedCiliumNode.Labels, "CiliumNode Labels")

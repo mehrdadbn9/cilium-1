@@ -173,7 +173,7 @@ DEFINE_AUX(struct ipv6_hdrlen_arg, ipv6_hdrlen_arg);
 __noinline __weak
 int ipv6_hdrlen_with_fraginfo_weak(const struct __ctx_buff *ctx)
 {
-	struct ipv6_hdrlen_arg *arg = AUX(ipv6_hdrlen_arg);
+	struct ipv6_hdrlen_arg *arg = AUX_REUSE(ipv6_hdrlen_arg);
 
 	return ipv6_hdrlen_offset(ctx, ETH_HLEN, &arg->nexthdr, &arg->fraginfo);
 }
@@ -305,6 +305,25 @@ ipv6_store_daddr(struct __ctx_buff *ctx, const __u8 *addr, int off)
 	return ctx_store_bytes(ctx, off + offsetof(struct ipv6hdr, daddr), addr, 16, 0);
 }
 
+/**
+ * Rewrite the L3 address at addr_off (IPv6 has no L3 checksum to amend).
+ * @arg sum: set to the checksum diff of the change, for the caller to fold
+ *      into any paired L4 pseudo-header checksum update.
+ *
+ * Return 0 on success or a negative DROP_* reason
+ */
+static __always_inline int
+ipv6_l3_rewrite_addr(struct __ctx_buff *ctx, int l3_off, __u16 addr_off,
+		     const union v6addr *old_addr, const union v6addr *new_addr,
+		     __wsum *sum)
+{
+	*sum = csum_diff(old_addr, 16, new_addr, 16, 0);
+	if (ctx_store_bytes(ctx, l3_off + addr_off, new_addr, 16, 0) < 0)
+		return DROP_WRITE_ERROR;
+
+	return 0;
+}
+
 static __always_inline int ipv6_load_nexthdr(const struct __ctx_buff *ctx, int off,
 					     __u8 *nexthdr)
 {
@@ -348,14 +367,6 @@ static __always_inline __be32 ipv6_pseudohdr_checksum(struct ipv6hdr *hdr,
 	sum = csum_diff(NULL, 0, &nexthdr, sizeof(nexthdr), sum);
 
 	return sum;
-}
-
-/*
- * Ipv4 mapped address - 0:0:0:0:0:FFFF::/96
- */
-static __always_inline int ipv6_addr_is_mapped(const union v6addr *addr)
-{
-	return addr->p1 == 0 && addr->p2 == 0 && addr->p3 == 0xFFFF0000;
 }
 
 /* As opposed to ipfrag_encode_ipv6, this function can return errors. */

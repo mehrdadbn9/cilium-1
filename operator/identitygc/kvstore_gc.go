@@ -9,7 +9,6 @@ import (
 	"time"
 
 	"github.com/cilium/cilium/pkg/allocator"
-	ciliumIdentity "github.com/cilium/cilium/pkg/identity"
 	"github.com/cilium/cilium/pkg/identity/cache"
 	"github.com/cilium/cilium/pkg/idpool"
 	kvstoreallocator "github.com/cilium/cilium/pkg/kvstore/allocator"
@@ -23,8 +22,8 @@ func (igc *GC) startKVStoreModeGC(ctx context.Context) error {
 		return fmt.Errorf("unable to initialize kvstore backend for identity allocation")
 	}
 
-	minID := idpool.ID(ciliumIdentity.GetMinimalAllocationIdentity(igc.clusterInfo.ID))
-	maxID := idpool.ID(ciliumIdentity.GetMaximumAllocationIdentity(igc.clusterInfo.ID))
+	minID := idpool.ID(igc.clusterInfo.MinimalAllocationIdentity())
+	maxID := idpool.ID(igc.clusterInfo.MaximumAllocationIdentity())
 	igc.logger.InfoContext(ctx, "Garbage Collecting kvstore identities between range",
 		logfields.Min, minID,
 		logfields.Max, maxID,
@@ -48,14 +47,6 @@ func (igc *GC) runKVStoreModeGC(ctx context.Context) error {
 			igc.metrics.IdentityGCRuns.WithLabelValues(LabelValueOutcomeFail, LabelIdentityTypeKVStore).Inc()
 			igc.metrics.IdentityGCLatency.WithLabelValues(LabelValueOutcomeFail, LabelIdentityTypeKVStore).Set(float64(time.Since(now).Seconds()))
 		} else {
-			// Best effort to run auth identity GC
-			err = igc.runAuthGC(ctx, keysToDeletePrev)
-			if err != nil {
-				igc.logger.WarnContext(ctx, "Unable to run kvstore auth identity garbage collector",
-					logfields.IdentitiesToDelete, keysToDeletePrev,
-					logfields.Error, err)
-			}
-
 			keysToDeletePrev = keysToDelete
 
 			igc.metrics.IdentityGCRuns.WithLabelValues(LabelValueOutcomeSuccess, LabelIdentityTypeKVStore).Inc()
@@ -90,18 +81,4 @@ func (igc *GC) runKVStoreModeGC(ctx context.Context) error {
 			"Will delete kvstore identities if they are still unused",
 			logfields.IdentitiesToDelete, keysToDeletePrev)
 	}
-}
-
-func (igc *GC) runAuthGC(ctx context.Context, staleKeys map[string]uint64) error {
-	// Wait until we can delete an identity
-	if err := igc.rateLimiter.Wait(ctx); err != nil {
-		return err
-	}
-
-	for k := range staleKeys {
-		if err := igc.authIdentityClient.Delete(ctx, k); err != nil {
-			return err
-		}
-	}
-	return nil
 }

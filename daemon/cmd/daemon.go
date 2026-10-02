@@ -20,11 +20,6 @@ import (
 	wgTypes "github.com/cilium/cilium/pkg/wireguard/types"
 )
 
-const (
-	// AutoCIDR indicates that a CIDR should be allocated
-	AutoCIDR = "auto"
-)
-
 func initAndValidateDaemonConfig(params daemonConfigParams) error {
 	// WireGuard and IPSec are mutually exclusive.
 	if params.IPSecConfig.Enabled() && params.WireguardConfig.Enabled() {
@@ -137,6 +132,15 @@ func initAndValidateDaemonConfig(params daemonConfigParams) error {
 	return nil
 }
 
+func needsCiliumNodeBeforeIPAM(mode string) bool {
+	switch mode {
+	case ipamOption.IPAMClusterPool, ipamOption.IPAMMultiPool, ipamOption.IPAMENI, ipamOption.IPAMAzure:
+		return true
+	default:
+		return false
+	}
+}
+
 func configureDaemon(ctx context.Context, params daemonParams) error {
 	if params.Clientset.IsEnabled() {
 		// Errors are handled inside WaitForCRDsToRegister. It will fatal on a
@@ -149,9 +153,7 @@ func configureDaemon(ctx context.Context, params daemonParams) error {
 			}
 		}
 
-		if params.DaemonConfig.IPAM == ipamOption.IPAMClusterPool ||
-			params.DaemonConfig.IPAM == ipamOption.IPAMMultiPool ||
-			params.DaemonConfig.IPAM == ipamOption.IPAMENI {
+		if needsCiliumNodeBeforeIPAM(params.DaemonConfig.IPAM) {
 			// Create the CiliumNode custom resource. This call will block until
 			// the custom resource has been created
 			params.NodeDiscovery.UpdateCiliumNodeResource()
@@ -198,7 +200,9 @@ func configureDaemon(ctx context.Context, params daemonParams) error {
 	params.K8sWatcher.InitK8sSubsystem(ctx)
 
 	// Configure and start IPAM without using the configuration yet.
-	params.IPAMInitializer.ConfigureAndStartIPAM(ctx)
+	if err := params.IPAMInitializer.ConfigureAndStartIPAM(ctx); err != nil {
+		return err
+	}
 
 	// restore endpoints before any IPs are allocated to avoid eventual IP
 	// conflicts later on, otherwise any IP conflict will result in the
@@ -246,7 +250,7 @@ func configureDaemon(ctx context.Context, params daemonParams) error {
 		return err
 	}
 
-	if err := params.IPsecAgent.StartBackgroundJobs(params.NodeHandler, params.Orchestrator.DatapathInitialized()); err != nil {
+	if err := params.IPsecAgent.StartBackgroundJobs(params.Orchestrator.DatapathInitialized()); err != nil {
 		params.Logger.Error("Unable to start IPsec key watcher", logfields.Error, err)
 	}
 
@@ -326,6 +330,7 @@ func unloadDNSPolicies(params daemonParams) {
 
 			PolicyRevisionToWaitFor: params.Policy.BumpRevision(),
 		}
+		params.PolicyComputer.RecomputeIdentityPolicyForAllIdentities(regenerationMetadata.PolicyRevisionToWaitFor)
 		wg := params.EndpointManager.RegenerateAllEndpoints(regenerationMetadata)
 		wg.Wait()
 		params.Logger.Info("All endpoints regenerated after unloading DNS rules on graceful shutdown")

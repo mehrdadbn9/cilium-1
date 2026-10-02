@@ -5,13 +5,13 @@ package ipam
 
 import (
 	"fmt"
-	"maps"
 	"net/netip"
 	"strings"
 	"testing"
 
 	"github.com/cilium/hive/hivetest"
 	"github.com/stretchr/testify/require"
+	"k8s.io/apimachinery/pkg/util/sets"
 
 	ipamOption "github.com/cilium/cilium/pkg/ipam/option"
 	"github.com/cilium/cilium/pkg/node"
@@ -99,14 +99,11 @@ func (f fakePoolAllocator) AllocateNextWithoutSyncUpstream(owner string, pool Po
 	return f.AllocateNext(owner, pool)
 }
 
-func (f fakePoolAllocator) Dump() (map[Pool]map[string]string, string) {
-	result := map[Pool]map[string]string{}
+func (f fakePoolAllocator) Dump() (map[Pool]sets.Set[netip.Addr], string) {
+	result := map[Pool]sets.Set[netip.Addr]{}
 	for name, alloc := range f.pools {
 		dump, _ := alloc.Dump()
-		if _, ok := result[name]; !ok {
-			result[name] = map[string]string{}
-		}
-		maps.Copy(result[name], dump[name])
+		result[name] = result[name].Union(dump[name])
 	}
 	return result, fmt.Sprintf("%d pools", len(f.pools))
 }
@@ -130,7 +127,7 @@ func TestLock(t *testing.T) {
 		NodeResource:   &resourceMock{},
 		MTUConfig:      &mtuMock,
 	})
-	ipam.ConfigureAllocator()
+	require.NoError(t, ipam.ConfigureAllocator(t.Context()))
 
 	// Since the IPs we have allocated to the endpoints might or might not
 	// be in the allocrange specified in cilium, we need to specify them
@@ -163,7 +160,7 @@ func TestExcludeIP(t *testing.T) {
 		NodeResource:   &resourceMock{},
 		MTUConfig:      &mtuMock,
 	})
-	ipam.ConfigureAllocator()
+	require.NoError(t, ipam.ConfigureAllocator(t.Context()))
 
 	ipv4 := fakeIPv4AllocCIDRIP(fakeAddressing)
 	ipv4 = ipv4.Next()
@@ -221,7 +218,7 @@ func TestIPAMMetadata(t *testing.T) {
 		MTUConfig:      &mtuMock,
 		Metadata:       fakeMetadata,
 	})
-	ipam.ConfigureAllocator()
+	require.NoError(t, ipam.ConfigureAllocator(t.Context()))
 	ipam.ipv4Allocator = newFakePoolAllocator(map[string]string{
 		"default": "10.10.0.0/16",
 		"test":    "192.168.178.0/24",
@@ -290,7 +287,7 @@ func TestLegacyAllocatorIPAMMetadata(t *testing.T) {
 		MTUConfig:      &mtuMock,
 		Metadata:       fakeMetadata,
 	})
-	ipam.ConfigureAllocator()
+	require.NoError(t, ipam.ConfigureAllocator(t.Context()))
 
 	// AllocateIP requires explicit pool
 	ipv4 := fakeIPv4AllocCIDRIP(fakeAddressing)

@@ -5,8 +5,12 @@ package cache
 
 import (
 	"context"
+	"fmt"
+	"io"
 	"log/slog"
 	"reflect"
+	"sort"
+	"text/tabwriter"
 
 	"github.com/cilium/cilium/api/v1/models"
 	"github.com/cilium/cilium/pkg/allocator"
@@ -28,12 +32,34 @@ func (s IdentitiesModel) Less(i, j int) bool {
 	return s[i].ID < s[j].ID
 }
 
+// FormatIdentities writes the identities as an ID/LABELS table, sorted by ID.
+func FormatIdentities(w io.Writer, identities []*models.Identity) {
+	im := IdentitiesModel(identities)
+	sort.Slice(im, im.Less)
+
+	tw := tabwriter.NewWriter(w, 2, 0, 3, ' ', 0)
+	fmt.Fprintf(tw, "ID\tLABELS\n")
+	for _, identity := range im {
+		lbls := labels.NewLabelsFromModel(identity.Labels)
+		first := true
+		for _, lbl := range lbls.GetPrintableModel() {
+			if first {
+				fmt.Fprintf(tw, "%d\t%s\n", identity.ID, lbl)
+				first = false
+			} else {
+				fmt.Fprintf(tw, "\t%s\n", lbl)
+			}
+		}
+	}
+	tw.Flush()
+}
+
 // FromIdentityCache populates the provided model from an identity cache.
 func (s IdentitiesModel) FromIdentityCache(cache identity.IdentityMap) IdentitiesModel {
 	for id, lbls := range cache {
 		s = append(s, identitymodel.CreateModel(&identity.Identity{
 			ID:     id,
-			Labels: lbls.Labels(),
+			Labels: lbls,
 		}))
 	}
 	return s
@@ -48,7 +74,7 @@ func (m *CachingIdentityAllocator) GetIdentityCache() identity.IdentityMap {
 		m.IdentityAllocator.ForeachCache(func(id idpool.ID, val allocator.AllocatorKey) {
 			if val != nil {
 				if gi, ok := val.(*key.GlobalIdentity); ok {
-					cache[identity.NumericIdentity(id)] = gi.LabelArray
+					cache[identity.NumericIdentity(id)] = gi.Labels()
 				} else {
 					m.logger.Warn(
 						"Ignoring unknown identity type",
@@ -61,14 +87,14 @@ func (m *CachingIdentityAllocator) GetIdentityCache() identity.IdentityMap {
 	}
 
 	identity.IterateReservedIdentities(func(ni identity.NumericIdentity, id *identity.Identity) {
-		cache[ni] = id.Labels.LabelArray()
+		cache[ni] = id.Labels
 	})
 
 	for _, identity := range m.localIdentities.GetIdentities() {
-		cache[identity.ID] = identity.Labels.LabelArray()
+		cache[identity.ID] = identity.Labels
 	}
 	for _, identity := range m.localNodeIdentities.GetIdentities() {
-		cache[identity.ID] = identity.Labels.LabelArray()
+		cache[identity.ID] = identity.Labels
 	}
 
 	return cache
@@ -81,7 +107,7 @@ func (m *CachingIdentityAllocator) GetIdentities() IdentitiesModel {
 	if m.isGlobalIdentityAllocatorInitialized() {
 		m.IdentityAllocator.ForeachCache(func(id idpool.ID, val allocator.AllocatorKey) {
 			if gi, ok := val.(*key.GlobalIdentity); ok {
-				identity := identity.NewIdentityFromLabelArray(identity.NumericIdentity(id), gi.LabelArray)
+				identity := identity.NewIdentity(identity.NumericIdentity(id), gi.Labels())
 				identities = append(identities, identitymodel.CreateModel(identity))
 			}
 
@@ -104,7 +130,11 @@ func (m *CachingIdentityAllocator) GetIdentities() IdentitiesModel {
 type identityWatcher struct {
 	logger *slog.Logger
 	owner  IdentityAllocatorOwner
+}
 
+// identityBatch collects identity changes destined for a single owner update.
+// Added and deleted identities are kept in disjoint sets.
+type identityBatch struct {
 	added, deleted identity.IdentityMap
 	toClose        []chan<- struct{}
 }
@@ -112,9 +142,9 @@ type identityWatcher struct {
 // collectEvent records the 'event' as an added or deleted identity,
 // and makes sure that any identity is present in only one of the sets
 // (added or deleted).
-func (w *identityWatcher) collectEvent(event allocator.AllocatorEvent) {
+func (w *identityWatcher) collectEvent(batch *identityBatch, event allocator.AllocatorEvent) {
 	if event.Done != nil {
-		w.toClose = append(w.toClose, event.Done)
+		batch.toClose = append(batch.toClose, event.Done)
 	}
 
 	if event.Typ == allocator.AllocatorChangeSync {
@@ -128,8 +158,8 @@ func (w *identityWatcher) collectEvent(event allocator.AllocatorEvent) {
 			// Un-delete the added ID if previously
 			// 'deleted' so that collected events can be
 			// processed in any order.
-			delete(w.deleted, id)
-			w.added[id] = gi.LabelArray
+			delete(batch.deleted, id)
+			batch.added[id] = gi.Labels()
 		} else {
 			w.logger.Warn(
 				"collectEvent: Ignoring unknown identity type",
@@ -140,11 +170,11 @@ func (w *identityWatcher) collectEvent(event allocator.AllocatorEvent) {
 		return
 	}
 	// Reverse an add when subsequently deleted
-	delete(w.added, id)
+	delete(batch.added, id)
 	// record the id deleted even if an add was reversed, as the
 	// id may also have previously existed, in which case the
 	// result is not no-op!
-	w.deleted[id] = labels.LabelArray{}
+	batch.deleted[id] = labels.Labels{}
 }
 
 // watch starts the identity watcher
@@ -152,9 +182,10 @@ func (w *identityWatcher) watch(events allocator.AllocatorEventRecvChan) {
 
 	go func() {
 		for {
-			w.added = identity.IdentityMap{}
-			w.deleted = identity.IdentityMap{}
-			w.toClose = nil
+			batch := identityBatch{
+				added:   identity.IdentityMap{},
+				deleted: identity.IdentityMap{},
+			}
 
 			// Consume first event synchronously
 			event, ok := <-events
@@ -164,7 +195,7 @@ func (w *identityWatcher) watch(events allocator.AllocatorEventRecvChan) {
 				return
 			}
 
-			w.collectEvent(event)
+			w.collectEvent(&batch, event)
 
 		More:
 			for {
@@ -176,7 +207,7 @@ func (w *identityWatcher) watch(events allocator.AllocatorEventRecvChan) {
 						break More
 					}
 					// Collect more added and deleted labels
-					w.collectEvent(event)
+					w.collectEvent(&batch, event)
 
 				default:
 					// No more events available without blocking
@@ -184,8 +215,8 @@ func (w *identityWatcher) watch(events allocator.AllocatorEventRecvChan) {
 				}
 			}
 			// Issue collected updates
-			if len(w.added)+len(w.deleted) > 0 {
-				w.owner.UpdateIdentities(w.added, w.deleted) // disjoint sets
+			if len(batch.added)+len(batch.deleted) > 0 {
+				w.owner.UpdateIdentities(batch.added, batch.deleted) // disjoint sets
 			}
 
 			// If requested, inform producers that events have been consumed
@@ -193,7 +224,7 @@ func (w *identityWatcher) watch(events allocator.AllocatorEventRecvChan) {
 			// Note that this does not wait for PolicyMap updates to be distributed
 			// via the SelectorCache. This is curently safe, as it is only used during
 			// initialization, and thus there are no endpoints (and no policymaps).
-			for _, ch := range w.toClose {
+			for _, ch := range batch.toClose {
 				close(ch)
 			}
 		}
@@ -235,8 +266,7 @@ func (m *CachingIdentityAllocator) LookupIdentity(ctx context.Context, lbls labe
 		return nil
 	}
 
-	lblArray := lbls.LabelArray()
-	id, err := m.IdentityAllocator.GetIncludeRemoteCaches(ctx, &key.GlobalIdentity{LabelArray: lblArray})
+	id, err := m.IdentityAllocator.GetIncludeRemoteCaches(ctx, key.NewGlobalIdentity(lbls))
 	if err != nil {
 		return nil
 	}
@@ -248,7 +278,7 @@ func (m *CachingIdentityAllocator) LookupIdentity(ctx context.Context, lbls labe
 		return nil
 	}
 
-	return identity.NewIdentityFromLabelArray(identity.NumericIdentity(id), lblArray)
+	return identity.NewIdentity(identity.NumericIdentity(id), lbls)
 }
 
 var unknownIdentity = identity.NewIdentity(identity.IdentityUnknown, labels.Labels{labels.IDNameUnknown: labels.NewLabel(labels.IDNameUnknown, "", labels.LabelSourceReserved)})
@@ -286,7 +316,7 @@ func (m *CachingIdentityAllocator) LookupIdentityByID(ctx context.Context, id id
 	}
 
 	if gi, ok := allocatorKey.(*key.GlobalIdentity); ok {
-		return identity.NewIdentityFromLabelArray(id, gi.LabelArray)
+		return identity.NewIdentity(id, gi.Labels())
 	}
 
 	return nil

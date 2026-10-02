@@ -9,7 +9,6 @@
 #define ENABLE_IPV4			1
 #define ENABLE_IPV6			1
 #define ENABLE_NODEPORT			1
-#define SERVICE_NO_BACKEND_RESPONSE	1
 
 #define CLIENT_IP	v4_ext_one
 #define CLIENT_PORT	tcp_src_one
@@ -31,6 +30,7 @@ static const union v6addr backend_ip6 = { .addr = v6_pod_one_addr };
 #include "lib/bpf_host.h"
 
 ASSIGN_CONFIG(bool, enable_no_service_endpoints_routable, true)
+ASSIGN_CONFIG(bool, enable_service_no_backend_response, true)
 
 #include "lib/ipcache.h"
 #include "lib/lb.h"
@@ -556,7 +556,7 @@ int tc_nodeport_lb6_wildcard_drop_not_unknown2_pktgen(struct __ctx_buff *ctx)
 SETUP(PROG_TYPE, "tc_nodeport_lb6_wildcard_drop_not_unknown2")
 int tc_nodeport_lb6_wildcard_drop_not_unknown2_setup(struct __ctx_buff *ctx)
 {
-	if (generate_icmp6_reply(ctx, ICMPV6_DEST_UNREACH, ICMPV6_PORT_UNREACH))
+	if (generate_icmp6_reply(ctx, ICMPV6_DEST_UNREACH, ICMPV6_PORT_UNREACH, 0))
 		return TEST_ERROR;
 
 	setup_services6(ctx);

@@ -88,6 +88,8 @@ long mock_fib_lookup(const __maybe_unused void *ctx, const struct bpf_fib_lookup
 #include "lib/nat.h"
 #include "lib/nodeport.h"
 
+ASSIGN_CONFIG(union v4addr, router_ipv4, { .be32 = 0xfffff50a })
+
 static __always_inline int
 pktgen(struct __ctx_buff *ctx, bool v4)
 {
@@ -256,11 +258,13 @@ check_ctx(const struct __ctx_buff *ctx, bool v4, __u32 expected_result)
 		 * through a tunnel.
 		 */
 
-		if (expected_result == CTX_ACT_REDIRECT && l3->saddr != IPV4_GATEWAY)
-			test_fatal("src IP was not changed to IPV4_GATEWAY");
+		if (expected_result == CTX_ACT_REDIRECT &&
+		    l3->saddr != CONFIG(router_ipv4).be32)
+			test_fatal("src IP was not changed to router_ipv4");
 
-		if (expected_result == CTX_ACT_DROP && l3->saddr != IPV4_DIRECT_ROUTING)
-			test_fatal("src IP was not changed to IPV4_DIRECT_ROUTING");
+		if (expected_result == CTX_ACT_DROP &&
+		    l3->saddr != CONFIG(ipv4_direct_routing).be32)
+			test_fatal("src IP was not changed to ipv4_direct_routing");
 
 		if (l3->daddr != DST_IPV4)
 			test_fatal("dest IP was not dnatted");
@@ -281,9 +285,10 @@ check_ctx(const struct __ctx_buff *ctx, bool v4, __u32 expected_result)
 				test_fatal("src IP was not changed to IPV6_GATEWAY");
 		}
 
+		union v6addr direct_routing_ip = CONFIG(ipv6_direct_routing);
 		if (expected_result == CTX_ACT_DROP &&
-		    memcmp((__u8 *)&l3->saddr, &((union v6addr)IPV6_DIRECT_ROUTING), 16) != 0) {
-			test_fatal("src IP was not changed to IPV6_DIRECT_ROUTING")
+		    memcmp(&l3->saddr, &direct_routing_ip, sizeof(l3->saddr)) != 0) {
+			test_fatal("src IP was not changed to ipv6_direct_routing")
 		}
 
 		if (memcmp((__u8 *)&l3->daddr, (__u8 *)DST_IPV6, 16) != 0)

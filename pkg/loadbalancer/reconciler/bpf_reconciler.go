@@ -119,6 +119,7 @@ type BPFOps struct {
 	maglev        *maglev.Maglev
 	lastUpdatedAt atomic.Pointer[time.Time]
 	pruneCount    atomic.Int32
+	metrics       *reconcilerMetrics
 
 	// mu protects the state below. The reconciler itself is single-threaded, but we need
 	// to protect the state in order to be able to ResetAndRestore() in tests.
@@ -188,6 +189,7 @@ type bpfOpsParams struct {
 	DB             *statedb.DB
 	NodeAddresses  statedb.Table[tables.NodeAddress]
 	Frontends      statedb.Table[*loadbalancer.Frontend]
+	Metrics        *reconcilerMetrics
 }
 
 const (
@@ -206,6 +208,7 @@ func newBPFOps(p bpfOpsParams) *BPFOps {
 		db:        p.DB,
 		nodeAddrs: p.NodeAddresses,
 		frontends: p.Frontends,
+		metrics:   p.Metrics,
 	}
 	ops.setLastUpdatedAt()
 
@@ -230,10 +233,22 @@ func (ops *BPFOps) ResetAndRestore() (err error) {
 	ops.mu.Lock()
 	defer ops.mu.Unlock()
 
-	ops.serviceIDAlloc = newIDAllocator(firstFreeServiceID, maxSetOfServiceID)
+	ops.serviceIDAlloc = newIDAllocator(
+		firstFreeServiceID,
+		maxSetOfServiceID,
+		newIDAllocatorMetrics(ops.metrics, idAllocTypeService),
+	)
 	ops.restoredServiceIDs = map[loadbalancer.L3n4Addr]loadbalancer.ServiceID{}
-	ops.backendIDAlloc = newIDAllocator(firstFreeBackendID, maxSetOfBackendID)
+	ops.metrics.setIDMappingsPendingRestore(idAllocTypeService, len(ops.restoredServiceIDs))
+
+	ops.backendIDAlloc = newIDAllocator(
+		firstFreeBackendID,
+		maxSetOfBackendID,
+		newIDAllocatorMetrics(ops.metrics, idAllocTypeBackend),
+	)
 	ops.restoredBackendIDs = map[loadbalancer.L3n4Addr]loadbalancer.BackendID{}
+	ops.metrics.setIDMappingsPendingRestore(idAllocTypeBackend, len(ops.restoredBackendIDs))
+
 	ops.backendStates = map[loadbalancer.L3n4Addr]backendState{}
 	ops.backendReferences = map[loadbalancer.L3n4Addr]sets.Set[loadbalancer.L3n4Addr]{}
 	ops.wildcardReferences = map[netip.Addr][]loadbalancer.ServiceID{}
@@ -259,6 +274,7 @@ func (ops *BPFOps) ResetAndRestore() (err error) {
 		}
 		ops.backendIDAlloc.nextID = max(ops.backendIDAlloc.nextID, key.GetID()+1)
 	})
+	ops.metrics.setIDMappingsPendingRestore(idAllocTypeBackend, len(ops.restoredBackendIDs))
 	if err != nil {
 		return fmt.Errorf("restore backend ids: %w", err)
 	}
@@ -301,25 +317,31 @@ func (ops *BPFOps) ResetAndRestore() (err error) {
 		}
 		ops.serviceIDAlloc.nextID = max(ops.serviceIDAlloc.nextID, id+1)
 
-		if master.GetQCount() > 0 && len(slots) == 1+master.GetCount()+master.GetQCount() {
-			if ops.restoredQuarantinedBackends == nil {
-				ops.restoredQuarantinedBackends = make(map[loadbalancer.L3n4Addr]sets.Set[loadbalancer.L3n4Addr])
+		// qcount describes the inactive tail of the service slots. It also
+		// includes terminating backends, so restore health quarantine only
+		// from explicitly flagged slots in that tail. Bound the scan by the
+		// master counts to ignore stale slots left in the map.
+		firstInactiveSlot := 1 + master.GetCount()
+		lastInactiveSlot := min(len(slots), firstInactiveSlot+master.GetQCount())
+		for slotID := firstInactiveSlot; slotID < lastInactiveSlot; slotID++ {
+			slot := slots[slotID]
+			if slot == nil || !loadbalancer.ServiceFlags(slot.GetFlags()).SVCSlotQuarantined() {
+				continue
 			}
-			backends := ops.restoredQuarantinedBackends[addr]
-			if backends == nil {
-				backends = sets.New[loadbalancer.L3n4Addr]()
-				ops.restoredQuarantinedBackends[addr] = backends
-			}
-			for _, slot := range slots[1+master.GetCount():] {
-				if slot == nil {
-					continue
+			if beAddr, found := backendIDToAddress[slot.GetBackendID()]; found {
+				if ops.restoredQuarantinedBackends == nil {
+					ops.restoredQuarantinedBackends = make(map[loadbalancer.L3n4Addr]sets.Set[loadbalancer.L3n4Addr])
 				}
-				if addr, found := backendIDToAddress[slot.GetBackendID()]; found {
-					backends.Insert(addr)
+				backends := ops.restoredQuarantinedBackends[addr]
+				if backends == nil {
+					backends = sets.New[loadbalancer.L3n4Addr]()
+					ops.restoredQuarantinedBackends[addr] = backends
 				}
+				backends.Insert(beAddr)
 			}
 		}
 	}
+	ops.metrics.setIDMappingsPendingRestore(idAllocTypeService, len(ops.restoredServiceIDs))
 	return nil
 }
 
@@ -463,7 +485,7 @@ func (ops *BPFOps) deleteFrontend(fe *loadbalancer.Frontend) error {
 	var svcKey maps.ServiceKey
 	var revNatKey maps.RevNatKey
 
-	ip := fe.Address.AddrCluster().AsNetIP()
+	ip := fe.Address.Addr()
 	proto, err := u8proto.ParseProtocol(fe.Address.Protocol())
 	if err != nil {
 		return fmt.Errorf("invalid L4 protocol %q: %w", fe.Address.Protocol(), err)
@@ -616,7 +638,9 @@ func (ops *BPFOps) pruneBackendMaps() error {
 
 func (ops *BPFOps) pruneRestoredIDs() error {
 	ops.restoredServiceIDs = nil
+	ops.metrics.setIDMappingsPendingRestore(idAllocTypeService, len(ops.restoredServiceIDs))
 	ops.restoredBackendIDs = nil
+	ops.metrics.setIDMappingsPendingRestore(idAllocTypeBackend, len(ops.restoredBackendIDs))
 	return nil
 }
 
@@ -735,7 +759,7 @@ func (ops *BPFOps) Update(_ context.Context, txn statedb.ReadTxn, _ statedb.Revi
 	if isDatapathCandidate {
 		isLocalAddr := func(addr netip.Addr) bool {
 			k := tables.NodeAddressKey{Addr: addr}
-			for range ops.nodeAddrs.Prefix(txn, tables.NodeAddressIndex.Query(k)) {
+			for range ops.nodeAddrs.Prefix(txn, tables.NodeAddressByKey(k)) {
 				return true
 			}
 			return false
@@ -772,7 +796,7 @@ func (ops *BPFOps) Update(_ context.Context, txn statedb.ReadTxn, _ statedb.Revi
 		// empty so any previously expanded frontends are withdrawn below.
 		var nodePortAddrs []netip.Addr
 		if isDatapathCandidate {
-			for na := range ops.nodeAddrs.List(txn, tables.NodeAddressNodePortIndex.Query(true)) {
+			for na := range ops.nodeAddrs.List(txn, tables.NodeAddressesByNodePort(true)) {
 				if na.Addr.Is6() != fe.Address.IsIPv6() {
 					continue
 				}
@@ -862,6 +886,7 @@ func (ops *BPFOps) updateFrontend(fe *loadbalancer.Frontend, isLocalAddr func(ne
 		feID = id
 		ops.serviceIDAlloc.addID(fe.Address, id)
 		delete(ops.restoredServiceIDs, fe.Address)
+		ops.metrics.setIDMappingsPendingRestore(idAllocTypeService, len(ops.restoredServiceIDs))
 	} else {
 		var err error
 		feID, err = ops.serviceIDAlloc.acquireLocalID(fe.Address)
@@ -879,7 +904,7 @@ func (ops *BPFOps) updateFrontend(fe *loadbalancer.Frontend, isLocalAddr func(ne
 		return fmt.Errorf("invalid L4 protocol %q: %w", fe.Address.Protocol(), err)
 	}
 
-	ip := fe.Address.AddrCluster().AsNetIP()
+	ip := fe.Address.Addr()
 	if fe.Address.IsIPv6() {
 		svcKey = maps.NewService6Key(ip, fe.Address.Port(), proto, fe.Address.Scope(), 0)
 		svcVal = &maps.Service6Value{}
@@ -904,7 +929,7 @@ func (ops *BPFOps) updateFrontend(fe *loadbalancer.Frontend, isLocalAddr func(ne
 		forwardingMode = svc.ForwardingMode
 	}
 
-	flag := loadbalancer.NewSvcFlag(&loadbalancer.SvcFlagParam{
+	masterFlagParams := &loadbalancer.SvcFlagParam{
 		SvcType:          svcType,
 		SvcNatPolicy:     svc.NatPolicy,
 		SvcFwdModeDSR:    forwardingMode == loadbalancer.SVCForwardingModeDSR,
@@ -917,9 +942,22 @@ func (ops *BPFOps) updateFrontend(fe *loadbalancer.Frontend, isLocalAddr func(ne
 		L7LoadBalancer:   svc.ProxyRedirects.Redirects(fe.ServicePort),
 		LoopbackHostport: svc.LoopbackHostPort || proxyDelegation != loadbalancer.SVCProxyDelegationNone,
 		Quarantined:      false,
-	})
-	svcVal.SetFlags(flag.UInt16())
+	}
+	masterFlags := loadbalancer.NewSvcFlag(masterFlagParams)
+	svcVal.SetFlags(masterFlags.UInt16())
 	svcVal.SetRevNat(int(feID))
+	slotVal := svcVal.New().(maps.ServiceValue)
+	slotVal.SetRevNat(int(feID))
+
+	// Source-range flags apply to the master slot. SourceRangeDeny shares its
+	// bit with backend quarantine, so omit both source-range flags from backend
+	// slots to keep quarantine unambiguous when restoring.
+	slotFlagParams := *masterFlagParams
+	slotFlagParams.CheckSourceRange = false
+	slotFlagParams.SourceRangeDeny = false
+	healthySlotFlags := loadbalancer.NewSvcFlag(&slotFlagParams)
+	slotFlagParams.Quarantined = true
+	quarantinedSlotFlags := loadbalancer.NewSvcFlag(&slotFlagParams)
 
 	// Gather backends for the service
 	orderedBackends := ops.sortedBackends(fe)
@@ -955,6 +993,7 @@ func (ops *BPFOps) updateFrontend(fe *loadbalancer.Frontend, isLocalAddr func(ne
 				beID = id
 				ops.backendIDAlloc.addID(be.Address, id)
 				delete(ops.restoredBackendIDs, be.Address)
+				ops.metrics.setIDMappingsPendingRestore(idAllocTypeBackend, len(ops.restoredBackendIDs))
 			} else {
 				var err error
 				beID, err = ops.backendIDAlloc.acquireLocalID(be.Address)
@@ -982,6 +1021,20 @@ func (ops *BPFOps) updateFrontend(fe *loadbalancer.Frontend, isLocalAddr func(ne
 			continue
 		}
 
+		state := be.State
+		if be.Unhealthy {
+			// We only care about [be.Unhealthy] for the Count/QCount and not for
+			// the state in the backend maps as the backend might be healthy for some
+			// service and unhealthy for another.
+			state = loadbalancer.BackendStateQuarantined
+		}
+
+		if state == loadbalancer.BackendStateQuarantined {
+			slotVal.SetFlags(quarantinedSlotFlags.UInt16())
+		} else {
+			slotVal.SetFlags(healthySlotFlags.UInt16())
+		}
+
 		// Update the service slot for the backend. We do this regardless
 		// if the backend entry is up-to-date since the backend slot order might've
 		// changed.
@@ -992,10 +1045,9 @@ func (ops *BPFOps) updateFrontend(fe *loadbalancer.Frontend, isLocalAddr func(ne
 			logfields.Slot, slotID,
 			logfields.BackendID, beID)
 
-		svcVal.SetBackendID(beID)
-		svcVal.SetRevNat(int(feID))
+		slotVal.SetBackendID(beID)
 		svcKey.SetBackendSlot(slotID)
-		if err := ops.upsertService(svcKey, svcVal); err != nil {
+		if err := ops.upsertService(svcKey, slotVal); err != nil {
 			return fmt.Errorf("upsert service: %w", err)
 		}
 
@@ -1020,14 +1072,6 @@ func (ops *BPFOps) updateFrontend(fe *loadbalancer.Frontend, isLocalAddr func(ne
 
 		if be.UnhealthyUpdatedAt != nil {
 			ops.deleteRestoredQuarantinedBackends(fe.Address, be.Address)
-		}
-
-		state := be.State
-		if be.Unhealthy {
-			// We only care about [be.Unhealthy] for the Count/QCount and not for
-			// the state in the backend maps as the backend might be healthy for some
-			// service and unhealthy for another.
-			state = loadbalancer.BackendStateQuarantined
 		}
 
 		switch state {
@@ -1410,11 +1454,11 @@ func (ops *BPFOps) upsertWildcard(fe *loadbalancer.Frontend, feID loadbalancer.S
 		var wildcardVal maps.ServiceValue
 
 		if addr.Is6() {
-			wildcardKey = maps.NewService6Key(addr.AsSlice(), WildcardPortNumber,
+			wildcardKey = maps.NewService6Key(addr, WildcardPortNumber,
 				WildcardProtoNumber, fe.Address.Scope(), 0)
 			wildcardVal = &maps.Service6Value{}
 		} else {
-			wildcardKey = maps.NewService4Key(addr.AsSlice(), WildcardPortNumber,
+			wildcardKey = maps.NewService4Key(addr, WildcardPortNumber,
 				WildcardProtoNumber, fe.Address.Scope(), 0)
 			wildcardVal = &maps.Service4Value{}
 		}
@@ -1471,10 +1515,10 @@ func (ops *BPFOps) deleteWildcard(fe *loadbalancer.Frontend, feID loadbalancer.S
 		var wildcardKey maps.ServiceKey
 
 		if addr.Is6() {
-			wildcardKey = maps.NewService6Key(addr.AsSlice(), WildcardPortNumber,
+			wildcardKey = maps.NewService6Key(addr, WildcardPortNumber,
 				WildcardProtoNumber, fe.Address.Scope(), 0)
 		} else {
-			wildcardKey = maps.NewService4Key(addr.AsSlice(), WildcardPortNumber,
+			wildcardKey = maps.NewService4Key(addr, WildcardPortNumber,
 				WildcardProtoNumber, fe.Address.Scope(), 0)
 		}
 

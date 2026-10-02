@@ -14,6 +14,7 @@
 {{- $defaultK8sClientBurst := 10 -}}
 {{- $defaultDNSProxyEnableTransparentMode := "false" -}}
 {{- $defaultEnableIPv4Masquerade := "true" -}}
+{{- $defaultEnableIPv6Masquerade := "true" -}}
 {{- $envoyDS := eq (include "envoyDaemonSetEnabled" .) "true" -}}
 {{- $readSecretsOnlyFromSecretsNamespace := eq (include "readSecretsOnlyFromSecretsNamespace" .) "true" -}}
 {{- $secretSyncEnabled := eq (include "secretSyncEnabled" .) "true" -}}
@@ -58,9 +59,27 @@
   {{- /* defaultIPv4Masquerad in ENI mode for 1.18 needed to override earlier version defaults set above when upgradeCompatibility is not specified */ -}}
   {{- if .Values.eni.enabled }}
     {{- $defaultEnableIPv4Masquerade = "false" -}}
-    # Will also do this for ipv6 when ENI mode works with ipv6.
   {{- end }}
 {{- end -}}
+
+{{- /* Default values when 1.21 was initially deployed */ -}}
+{{- if semverCompare ">=1.21" (default "1.21" .Values.upgradeCompatibility) -}}
+  {{- /* IPv6 counterpart of the ENI IPv4 masquerading default set above. */ -}}
+  {{- if .Values.eni.enabled }}
+    {{- $defaultEnableIPv6Masquerade = "false" -}}
+  {{- end }}
+{{- end -}}
+
+{{- /* Effective masquerading settings */ -}}
+{{- $enableIPv4Masquerade := $defaultEnableIPv4Masquerade -}}
+{{- if not (kindIs "invalid" .Values.enableIPv4Masquerade) -}}
+  {{- $enableIPv4Masquerade = toString .Values.enableIPv4Masquerade -}}
+{{- end -}}
+{{- $enableIPv6Masquerade := $defaultEnableIPv6Masquerade -}}
+{{- if not (kindIs "invalid" .Values.enableIPv6Masquerade) -}}
+  {{- $enableIPv6Masquerade = toString .Values.enableIPv6Masquerade -}}
+{{- end -}}
+
 {{- $ipam := (coalesce .Values.ipam.mode $defaultIPAM) -}}
 {{- if .Values.eni.enabled }}
   {{- $ipam = "eni" -}}
@@ -427,10 +446,6 @@ data:
   bpf-node-map-max: {{ .Values.bpf.nodeMapMax | quote }}
 {{- end }}
 
-{{- if .Values.bpf.authMapMax }}
-  # bpf-auth-map-max specifies the maximum number of entries in the auth map
-  bpf-auth-map-max: "{{ .Values.bpf.authMapMax | int }}"
-{{- end }}
 {{- if or $bpfCtTcpMax $bpfCtAnyMax }}
   # bpf-ct-global-*-max specifies the maximum number of connections
   # supported across all endpoints, split by protocol: tcp or other. One pair
@@ -527,6 +542,7 @@ data:
   # If this option is set to "false" during an upgrade from 1.3 or earlier to
   # 1.4 or later, then it may cause one-time disruptions during the upgrade.
   preallocate-bpf-maps: "{{ .Values.bpf.preallocateMaps }}"
+  enable-bpf-stats: "{{ .Values.bpf.stats.enabled }}"
 
   # Name of the cluster. Only relevant when building a mesh of clusters.
   cluster-name: {{ .Values.cluster.name | quote }}
@@ -557,14 +573,14 @@ data:
   tunnel-protocol: {{ .Values.tunnelProtocol | default "vxlan" | quote }}
 
 {{- if eq .Values.routingMode "native" }}
-  {{- if and .Values.ipv4.enabled .Values.enableIPv4Masquerade (not .Values.ipMasqAgent.enabled) }}
+  {{- if and .Values.ipv4.enabled (eq $enableIPv4Masquerade "true") (not .Values.ipMasqAgent.enabled) }}
     {{- if and (ne $ipam "eni") (ne $ipam "alibabacloud") }}
       {{- if and (not .Values.ipv4NativeRoutingCIDR) (not (and (eq $ipam "cluster-pool") .Values.nativeRoutingCIDRFromClusterPool)) }}
         {{- fail " ipv4NativeRoutingCIDR must be set when routingMode is native"}}
       {{- end }}
     {{- end }}
   {{- end }}
-  {{- if and .Values.ipv6.enabled .Values.enableIPv6Masquerade (not .Values.ipMasqAgent.enabled) }}
+  {{- if and .Values.ipv6.enabled (eq $enableIPv6Masquerade "true") (not .Values.ipMasqAgent.enabled) }}
     {{- if and (not .Values.ipv6NativeRoutingCIDR) (not (and (eq $ipam "cluster-pool") .Values.nativeRoutingCIDRFromClusterPool)) }}
       {{- fail "ipv6NativeRoutingCIDR must be set when routingMode is native"  }}
     {{- end }}
@@ -716,14 +732,10 @@ data:
   enable-identity-mark: {{ .Values.enableIdentityMark | quote }}
 {{- end }}
 
-{{- if (not (kindIs "invalid" .Values.enableIPv4Masquerade)) }}
-  enable-ipv4-masquerade: {{.Values.enableIPv4Masquerade | quote }}
-{{- else }}
-  enable-ipv4-masquerade: {{ $defaultEnableIPv4Masquerade | quote }}
-{{- end }}
+  enable-ipv4-masquerade: {{ $enableIPv4Masquerade | quote }}
   enable-ipv4-big-tcp: {{ .Values.enableIPv4BIGTCP | quote }}
   enable-ipv6-big-tcp: {{ .Values.enableIPv6BIGTCP | quote }}
-  enable-ipv6-masquerade: {{ .Values.enableIPv6Masquerade | quote }}
+  enable-ipv6-masquerade: {{ $enableIPv6Masquerade | quote }}
 
 {{- if hasKey .Values.bpf "enableTCX" }}
   enable-tcx: {{ .Values.bpf.enableTCX | quote }}
@@ -893,6 +905,9 @@ data:
 {{- end }}
 {{- if hasKey .Values.nodePort "enableDynamicSourceLookup" }}
   enable-dynamic-source-lookup-nodeport: {{ .Values.nodePort.enableDynamicSourceLookup | quote}}
+{{- end }}
+{{- if .Values.nodePort.extendedNATPortRange }}
+  node-port-nat-range-ext: {{ .Values.nodePort.extendedNATPortRange | quote }}
 {{- end }}
 {{- if .Values.gke.enabled }}
   enable-health-check-loadbalancer-ip: "true"
@@ -1419,7 +1434,7 @@ data:
 {{- end }}
 
 {{- if ne .Values.operator.unmanagedPodWatcher.selector nil }}
-  pod-restart-selector: {{ .Values.operator.unmanagedPodWatcher.selector }}
+  pod-restart-selector: {{ .Values.operator.unmanagedPodWatcher.selector | quote }}
 {{- end }}
 
 {{- if .Values.dnsProxy }}
@@ -1467,16 +1482,8 @@ data:
   agent-not-ready-taint-key: {{ .Values.agentNotReadyTaintKey | quote }}
 {{- end }}
 
-  mesh-auth-enabled: {{ .Values.authentication.enabled | quote }}
-  mesh-auth-queue-size: {{ .Values.authentication.queueSize | quote }}
-  mesh-auth-rotated-identities-queue-size: {{ .Values.authentication.rotatedIdentitiesQueueSize | quote }}
-  mesh-auth-gc-interval: {{ include "validateDuration" .Values.authentication.gcInterval | quote }}
-
 {{- if .Values.authentication.mutual.spire.enabled }}
-  mesh-auth-mutual-enabled: "true"
-  mesh-auth-mutual-listener-port: {{ .Values.authentication.mutual.port | quote }}
   mesh-auth-spire-agent-socket: {{ .Values.authentication.mutual.spire.agentSocketPath | quote }}
-  mesh-auth-mutual-connect-timeout: {{ include "validateDuration" .Values.authentication.mutual.connectTimeout | quote }}
   {{- if .Values.authentication.mutual.spire.serverAddress }}
   mesh-auth-spire-server-address: {{ .Values.authentication.mutual.spire.serverAddress | quote }}
   {{- else }}
@@ -1501,13 +1508,14 @@ data:
   proxy-cluster-max-pending-requests: {{ .Values.envoy.clusterMaxPendingRequests | quote }}
   proxy-cluster-max-requests: {{ .Values.envoy.clusterMaxRequests | quote }}
   http-retry-count: {{ .Values.envoy.httpRetryCount | quote }}
+  http-retry-timeout: {{ .Values.envoy.httpRetryTimeout | quote }}
   http-stream-idle-timeout: {{ .Values.envoy.streamIdleTimeoutDurationSeconds | quote }}
   envoy-node-locality-enabled: {{ .Values.envoy.nodeLocality.enabled | quote }}
 
   external-envoy-proxy: {{ include "envoyDaemonSetEnabled" . | quote }}
   envoy-base-id: {{ .Values.envoy.baseID | quote }}
 
-{{- if .Values.envoy.httpUpstreamLingerTimeout }}
+{{- if ne .Values.envoy.httpUpstreamLingerTimeout nil }}
   envoy-http-upstream-linger-timeout: {{ .Values.envoy.httpUpstreamLingerTimeout | quote }}
 {{- end }}
 

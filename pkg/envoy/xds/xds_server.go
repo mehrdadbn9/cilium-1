@@ -5,7 +5,9 @@ package xds
 
 import (
 	"context"
+	"fmt"
 	"maps"
+	"strings"
 
 	cilium "github.com/cilium/proxy/go/cilium/api"
 	envoy_config_cluster "github.com/envoyproxy/go-control-plane/envoy/config/cluster/v3"
@@ -57,8 +59,10 @@ type XDSServer interface {
 	DeleteEnvoyResources(ctx context.Context, resources Resources, wg *completion.WaitGroup) error
 	// UpdateNetworkPolicy adds or updates a network policy in the set published to L7 proxies.
 	// When the proxy acknowledges the network policy update, it will result in
-	// a subsequent call to the endpoint's OnProxyPolicyUpdate() function.
-	UpdateNetworkPolicy(ctx context.Context, ep endpoint.EndpointUpdater, policy *policy.EndpointPolicy, wg *completion.WaitGroup) (error, revert.RevertFunc, revert.FinalizeFunc)
+	// a subsequent call to the endpoint's OnProxyPolicyUpdate() function. After
+	// a successful update, the caller must eventually finalize or revert the
+	// returned Revertible when the enclosing endpoint transaction finishes.
+	UpdateNetworkPolicy(ctx context.Context, ep endpoint.EndpointUpdater, policy *policy.EndpointPolicy, wg *completion.WaitGroup) (error, revert.Revertible)
 	// RemoveNetworkPolicy removes network policies relevant to the specified
 	// endpoint from the set published to L7 proxies, and stops listening for
 	// acks for policies on this endpoint.
@@ -79,7 +83,9 @@ type Resources struct {
 	NetworkPolicies    map[string]*cilium.NetworkPolicy
 	NetworkPolicyHosts map[string]*cilium.NetworkPolicyHosts
 
-	// Callback functions that are called if the corresponding Listener change was successfully acked by Envoy
+	// Callback functions that confirm newly allocated primary proxy ports after
+	// the corresponding Listener change is successfully ACKed by Envoy. A
+	// listener update that retains its primary port must not call one again.
 	PortAllocationCallbacks map[string]func(context.Context) error `json:"-" yaml:"-"`
 }
 
@@ -104,6 +110,35 @@ func cloneOrInit[K comparable, V any](m map[K]V) map[K]V {
 		return make(map[K]V)
 	}
 	return maps.Clone(m)
+}
+
+// DebugInfo returns aggregated info about the underlying envoy resources in the object
+func (r *Resources) DebugInfo() string {
+	resourcesInfo := make([]string, 0, 7)
+
+	if len(r.Listeners) > 0 {
+		resourcesInfo = append(resourcesInfo, fmt.Sprintf("%d listeners", len(r.Listeners)))
+	}
+	if len(r.Routes) > 0 {
+		resourcesInfo = append(resourcesInfo, fmt.Sprintf("%d routes", len(r.Routes)))
+	}
+	if len(r.Clusters) > 0 {
+		resourcesInfo = append(resourcesInfo, fmt.Sprintf("%d clusters", len(r.Clusters)))
+	}
+	if len(r.Endpoints) > 0 {
+		resourcesInfo = append(resourcesInfo, fmt.Sprintf("%d endpoints", len(r.Endpoints)))
+	}
+	if len(r.Secrets) > 0 {
+		resourcesInfo = append(resourcesInfo, fmt.Sprintf("%d listeners", len(r.Secrets)))
+	}
+	if len(r.NetworkPolicies) > 0 {
+		resourcesInfo = append(resourcesInfo, fmt.Sprintf("%d networkpolicies", len(r.NetworkPolicies)))
+	}
+	if len(r.NetworkPolicyHosts) > 0 {
+		resourcesInfo = append(resourcesInfo, fmt.Sprintf("%d networkpolicyhosts", len(r.NetworkPolicyHosts)))
+	}
+
+	return strings.Join(resourcesInfo, ", ")
 }
 
 func (r *Resources) DeepCopy() *Resources {

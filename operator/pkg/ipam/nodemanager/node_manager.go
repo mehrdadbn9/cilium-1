@@ -7,9 +7,11 @@ package nodemanager
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/netip"
+	"slices"
 	"sort"
 
 	"golang.org/x/sync/semaphore"
@@ -71,7 +73,7 @@ type NodeOperations interface {
 	// to perform the actual allocation.
 	AllocateIPs(ctx context.Context, allocation *AllocationAction) error
 
-	AllocateStaticIP(ctx context.Context, staticIPTags ipamTypes.Tags) (string, error)
+	AllocateStaticIP(ctx context.Context, staticIPTags ipamTypes.Tags) (netip.Addr, error)
 
 	// PrepareIPRelease is called to calculate whether any IP excess needs
 	// to be resolved. It behaves identical to PrepareIPAllocation but
@@ -140,7 +142,9 @@ type AllocationImplementation interface {
 	Resync(ctx context.Context) (time.Time, error)
 
 	// InstanceSync is called to sync the state of the specified instance with
-	// external APIs or systems.
+	// external APIs or systems. Implementations must return an error wrapping
+	// ErrInstanceNotFound if the external API authoritatively reports that the
+	// instance no longer exists.
 	InstanceSync(ctx context.Context, instanceID string) (time.Time, error)
 
 	// HasInstance returns whether the instance is in instances
@@ -351,7 +355,13 @@ func (n *NodeManager) Upsert(resource *v2.CiliumNode) {
 			MetricsObserver: n.metricsAPI.PoolMaintainerTrigger(),
 			TriggerFunc: func(reasons []string) {
 				if err := node.MaintainIPPool(ctx); err != nil {
-					node.logger.Load().Warn("Unable to maintain ip pool of node", logfields.Error, err)
+					// An unstable instances API is a cluster wide failure
+					// that every node hits on every attempt, and it is
+					// already reported by the instances API resync itself,
+					// so don't log it once more per node.
+					if !errors.Is(err, errInstancesAPIUnstable) {
+						node.logger.Load().Warn("Unable to maintain ip pool of node", logfields.Error, err)
+					}
 					backoff.Wait(ctx)
 				}
 			},
@@ -361,17 +371,6 @@ func (n *NodeManager) Upsert(resource *v2.CiliumNode) {
 			node.logger.Load().Error("Unable to create pool-maintainer trigger", logfields.Error, err)
 			return
 		}
-
-		retry, err := trigger.NewTrigger(trigger.Parameters{
-			Name:        fmt.Sprintf("ipam-pool-maintainer-%s-retry", resource.Name),
-			MinInterval: time.Minute, // large minimal interval to not retry too often
-			TriggerFunc: func(reasons []string) { poolMaintainer.Trigger() },
-		})
-		if err != nil {
-			node.logger.Load().Error("Unable to create pool-maintainer-retry trigger", logfields.Error, err)
-			return
-		}
-		node.retry = retry
 
 		k8sSync, err := trigger.NewTrigger(trigger.Parameters{
 			Name:            fmt.Sprintf("ipam-node-k8s-sync-%s", resource.Name),
@@ -395,6 +394,12 @@ func (n *NodeManager) Upsert(resource *v2.CiliumNode) {
 				syncTime, err := node.manager.instancesAPI.InstanceSync(ctx, resource.InstanceID())
 				if err != nil {
 					node.logger.Load().Warn("Unable to sync instance", logfields.Error, err)
+					// A transient recovery failure must re-arm the node's one-shot re-trigger.
+					// An authoritative instance-not-found error must not re-arm the node's
+					// one-shot re-trigger.
+					if slices.Contains(reasons, instanceNotFoundSyncReason) && !errors.Is(err, ErrInstanceNotFound) {
+						node.reArmInstanceSync()
+					}
 					return
 				}
 				node.manager.Resync(ctx, syncTime)
@@ -432,9 +437,6 @@ func (n *NodeManager) Delete(resource *v2.CiliumNode) {
 		}
 		if node.k8sSync != nil {
 			node.k8sSync.Shutdown()
-		}
-		if node.retry != nil {
-			node.retry.Shutdown()
 		}
 		if node.instanceSync != nil {
 			node.instanceSync.Shutdown()
@@ -506,13 +508,18 @@ type ipResyncStats struct {
 	nodeCapacity        int
 }
 
-func (n *NodeManager) resyncNode(ctx context.Context, node *Node, stats *resyncStats, syncTime time.Time) {
+func (n *NodeManager) resyncNode(ctx context.Context, node *Node, stats *resyncStats, syncTime time.Time, instancesAPIReady bool) {
 	node.updateLastResync(syncTime)
 	node.recalculate(ctx)
+	if instancesAPIReady && !n.instancesAPI.HasInstance(node.InstanceID()) {
+		// Recover a node dropped from the instance cache. The caller
+		// holds the NodeManager mutex, so the instances API readiness
+		// is passed in rather than queried here.
+		node.retriggerInstanceSync()
+	}
 	allocationNeeded := node.allocationNeeded()
 	releaseNeeded := node.releaseNeeded()
 	if allocationNeeded || releaseNeeded {
-		node.requirePoolMaintenance()
 		node.poolMaintainer.Trigger()
 	}
 
@@ -569,7 +576,11 @@ func (n *NodeManager) Resync(ctx context.Context, syncTime time.Time) {
 			continue
 		}
 		go func(node *Node, stats *resyncStats) {
-			n.resyncNode(ctx, node, stats, syncTime)
+			// n.mutex is held for the whole duration of Resync, so
+			// n.stableInstancesAPI cannot change concurrently. The
+			// workers must not acquire the mutex themselves as that
+			// would deadlock with the semaphore acquisition below.
+			n.resyncNode(ctx, node, stats, syncTime, n.stableInstancesAPI)
 			sem.Release(1)
 		}(node, &stats)
 	}

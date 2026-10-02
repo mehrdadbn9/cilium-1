@@ -5,22 +5,45 @@ package ip
 
 import (
 	"fmt"
-	"net"
 	"net/netip"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
-func TestIPToNetPrefix(t *testing.T) {
-	v4, _, err := net.ParseCIDR("1.1.1.1/32")
-	assert.NoError(t, err)
-	v6, _, err := net.ParseCIDR("::ff/128")
-	assert.NoError(t, err)
-	assert.Equal(t, netip.PrefixFrom(netip.MustParseAddr(v4.String()), 32), IPToNetPrefix(v4.To4()))
-	assert.Equal(t, netip.PrefixFrom(netip.MustParseAddr(v6.String()), 128), IPToNetPrefix(v6.To16()))
+func TestParsePrefixes(t *testing.T) {
+	valid, err := ParsePrefixes([]string{
+		"10.0.0.0/8",
+		"10.0.0.1",
+		"2001:db8::/32",
+		"2001:db8::1",
+		"10.1.2.3/8", // not masked
+		"10.0.0.0/33",
+		"10.0.0/8",
+		"not-an-ip",
+	})
 
-	assert.Equal(t, netip.Prefix{}, IPToNetPrefix(nil))
+	// Every entry that parses is returned, even though others did not.
+	assert.Equal(t, []netip.Prefix{
+		netip.MustParsePrefix("10.0.0.0/8"),
+		netip.MustParsePrefix("10.0.0.1/32"),
+		netip.MustParsePrefix("2001:db8::/32"),
+		netip.MustParsePrefix("2001:db8::1/128"),
+		netip.MustParsePrefix("10.0.0.0/8"), // got masked
+	}, valid)
+
+	// The joined error names every rejected entry, and describes the parse the
+	// input asked for: the prefix parse for an entry carrying a '/', the
+	// address parse for one without.
+	require.Error(t, err)
+	assert.ErrorContains(t, err, `netip.ParsePrefix("10.0.0.0/33"): prefix length out of range`)
+	assert.ErrorContains(t, err, `netip.ParsePrefix("10.0.0/8"): ParseAddr("10.0.0"): IPv4 address too short`)
+	assert.ErrorContains(t, err, `ParseAddr("not-an-ip"): unable to parse IP`)
+
+	valid, err = ParsePrefixes(nil)
+	assert.NoError(t, err)
+	assert.Empty(t, valid)
 }
 
 func TestPrefixesContains(t *testing.T) {
@@ -109,6 +132,112 @@ func TestLaminarCIDRsOverlap(t *testing.T) {
 			// The check must be symmetric.
 			assert.Equal(t, tt.want, LaminarCIDRsOverlap(c1, c2))
 			assert.Equal(t, tt.want, LaminarCIDRsOverlap(c2, c1))
+		})
+	}
+}
+
+func TestCoalescePrefixes(t *testing.T) {
+	cases := []struct {
+		name string
+		in   []netip.Prefix
+		want []netip.Prefix
+	}{
+		{
+			name: "single prefix",
+			in:   []netip.Prefix{netip.MustParsePrefix("10.0.0.0/8")},
+			want: []netip.Prefix{netip.MustParsePrefix("10.0.0.0/8")},
+		},
+		{
+			name: "contained prefix is dropped",
+			in:   []netip.Prefix{netip.MustParsePrefix("10.105.0.0/16"), netip.MustParsePrefix("10.0.0.0/8")},
+			want: []netip.Prefix{netip.MustParsePrefix("10.0.0.0/8")},
+		},
+		{
+			name: "several contained prefixes are dropped",
+			in: []netip.Prefix{
+				netip.MustParsePrefix("10.105.0.0/16"),
+				netip.MustParsePrefix("10.104.0.0/19"),
+				netip.MustParsePrefix("10.0.0.0/8"),
+			},
+			want: []netip.Prefix{netip.MustParsePrefix("10.0.0.0/8")},
+		},
+		{
+			name: "disjoint prefixes are kept",
+			in:   []netip.Prefix{netip.MustParsePrefix("10.105.0.0/16"), netip.MustParsePrefix("192.168.1.0/24")},
+			want: []netip.Prefix{netip.MustParsePrefix("10.105.0.0/16"), netip.MustParsePrefix("192.168.1.0/24")},
+		},
+		{
+			name: "adjacent prefixes are merged",
+			in:   []netip.Prefix{netip.MustParsePrefix("10.0.0.0/9"), netip.MustParsePrefix("10.128.0.0/9")},
+			want: []netip.Prefix{netip.MustParsePrefix("10.0.0.0/8")},
+		},
+		{
+			name: "duplicate prefixes are deduplicated",
+			in:   []netip.Prefix{netip.MustParsePrefix("10.0.0.0/16"), netip.MustParsePrefix("10.0.0.0/16")},
+			want: []netip.Prefix{netip.MustParsePrefix("10.0.0.0/16")},
+		},
+		{
+			name: "unmasked prefix is masked",
+			in:   []netip.Prefix{netip.MustParsePrefix("10.1.2.3/8")},
+			want: []netip.Prefix{netip.MustParsePrefix("10.0.0.0/8")},
+		},
+		{
+			name: "contained and disjoint prefixes",
+			in: []netip.Prefix{
+				netip.MustParsePrefix("10.105.0.0/16"),
+				netip.MustParsePrefix("192.168.1.0/24"),
+				netip.MustParsePrefix("10.0.0.0/8"),
+			},
+			want: []netip.Prefix{netip.MustParsePrefix("10.0.0.0/8"), netip.MustParsePrefix("192.168.1.0/24")},
+		},
+		{
+			name: "both families coalesce independently",
+			in: []netip.Prefix{
+				netip.MustParsePrefix("10.105.0.0/16"),
+				netip.MustParsePrefix("192.168.1.0/24"),
+				netip.MustParsePrefix("10.0.0.0/8"),
+				netip.MustParsePrefix("f00d::a0f:0:0:0/96"),
+			},
+			want: []netip.Prefix{
+				netip.MustParsePrefix("10.0.0.0/8"),
+				netip.MustParsePrefix("192.168.1.0/24"),
+				netip.MustParsePrefix("f00d::a0f:0:0:0/96"),
+			},
+		},
+		{
+			name: "input order does not matter",
+			in: []netip.Prefix{
+				netip.MustParsePrefix("f00d::a0f:0:0:0/96"),
+				netip.MustParsePrefix("10.105.0.0/16"),
+				netip.MustParsePrefix("192.168.1.0/24"),
+				netip.MustParsePrefix("10.0.0.0/8"),
+			},
+			want: []netip.Prefix{
+				netip.MustParsePrefix("10.0.0.0/8"),
+				netip.MustParsePrefix("192.168.1.0/24"),
+				netip.MustParsePrefix("f00d::a0f:0:0:0/96"),
+			},
+		},
+		{
+			name: "IPv6 only",
+			in:   []netip.Prefix{netip.MustParsePrefix("f00d::a0f:0:0:0/96")},
+			want: []netip.Prefix{netip.MustParsePrefix("f00d::a0f:0:0:0/96")},
+		},
+		{
+			name: "invalid prefixes are dropped",
+			in:   []netip.Prefix{{}, netip.MustParsePrefix("10.0.0.0/8")},
+			want: []netip.Prefix{netip.MustParsePrefix("10.0.0.0/8")},
+		},
+		{
+			name: "no prefixes",
+			in:   nil,
+			want: []netip.Prefix{},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			require.Equal(t, tc.want, CoalescePrefixes(tc.in))
 		})
 	}
 }

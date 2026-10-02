@@ -13,6 +13,7 @@
 
 #include "endian.h"
 #include "eth.h"
+#include "ipv4_core.h"
 #include "ipv6_core.h"
 #include "map_defs.h"
 #include "config.h"
@@ -35,14 +36,12 @@
 #define ENABLE_EGRESS_GATEWAY_COMMON
 #endif
 
+/* TUNNEL_MODE needs the encapsulation helpers guarded by HAVE_ENCAP. */
 #if defined(ENCAP_IFINDEX) || defined(ENABLE_EGRESS_GATEWAY_COMMON) || \
-    (defined(ENABLE_DSR) && DSR_ENCAP_MODE == DSR_ENCAP_GENEVE)
+	defined(TUNNEL_MODE) || \
+	(defined(DSR_ENCAP_MODE) && DSR_ENCAP_MODE == DSR_ENCAP_GENEVE)
 #define HAVE_ENCAP	1
 
-/* NOT_VTEP_DST is passed to an encapsulation function when the
- * destination of the tunnel is not a VTEP.
- */
-#define NOT_VTEP_DST 0
 #endif
 
 /* XFER_FLAGS that get transferred from XDP to SKB */
@@ -59,13 +58,6 @@ enum {
 
 /* FIB errors from BPF neighbor map. */
 #define BPF_FIB_MAP_NO_NEIGH	100
-
-typedef __u64 mac_t;
-
-union v4addr {
-	__u8 addr[4];
-	__be32 be32;
-};
 
 #define THIS_IS_L3_DEV		(ETH_HLEN == 0)
 
@@ -141,43 +133,6 @@ __revalidate_data_pull(const struct __ctx_buff *ctx, void **data_, void **data_e
 #define revalidate_data_arp_pull(ctx, data, data_end, arp)		\
 	__revalidate_data_pull(ctx, data, data_end, (void **)arp,	\
 		ETH_HLEN + sizeof(struct arphdr), sizeof(**arp), true)
-
-struct auth_key {
-	__u32       local_sec_label;
-	__u32       remote_sec_label;
-	__u16       remote_node_id; /* zero for local node */
-	__u8        auth_type;
-	__u8        pad;
-};
-
-/* expiration is Unix epoch time in unit nanosecond/2^9 (ns/512). */
-struct auth_info {
-	__u64       expiration;
-};
-
-struct srv6_vrf_key4 {
-	struct bpf_lpm_trie_key lpm;
-	__u32 src_ip;
-	__u32 dst_cidr;
-};
-
-struct srv6_vrf_key6 {
-	struct bpf_lpm_trie_key lpm;
-	union v6addr src_ip;
-	union v6addr dst_cidr;
-};
-
-struct srv6_policy_key4 {
-	struct bpf_lpm_trie_key lpm;
-	__u32 vrf_id;
-	__u32 dst_cidr;
-};
-
-struct srv6_policy_key6 {
-	struct bpf_lpm_trie_key lpm;
-	__u32 vrf_id;
-	union v6addr dst_cidr;
-};
 
 #ifndef BPF_F_PSEUDO_HDR
 # define BPF_F_PSEUDO_HDR                (1ULL << 4)
@@ -279,7 +234,6 @@ enum metric_dir {
 #define TC_INDEX_F_FROM_EGRESS_PROXY	2
 #define TC_INDEX_F_SKIP_NODEPORT	4
 #define TC_INDEX_F_SKIP_HEALTH_CHECK	8
-#define TC_INDEX_F_SKIP_HOST_FIREWALL	16
 
 #define CB_DELIVERY_FLAGS_REDIRECT		(1 << 0)
 #define CB_DELIVERY_FLAGS_FROM_HOST		(1 << 1)
@@ -400,11 +354,6 @@ struct lb4_reverse_nat {
 	__be32 address;
 	__be16 port;
 } __packed;
-
-static __always_inline __u64 ctx_adjust_hroom_flags(void)
-{
-	return BPF_F_ADJ_ROOM_NO_CSUM_RESET;
-}
 
 struct lpm_v4_key {
 	struct bpf_lpm_trie_key lpm;

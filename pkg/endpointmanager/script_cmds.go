@@ -7,14 +7,14 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"text/tabwriter"
 
 	"github.com/cilium/hive/script"
-	"github.com/davecgh/go-spew/spew"
 
 	endpointapi "github.com/cilium/cilium/api/v1/server/restapi/endpoint"
+	"github.com/cilium/cilium/pkg/client"
 	"github.com/cilium/cilium/pkg/endpoint"
 	"github.com/cilium/cilium/pkg/endpoint/regeneration"
-	endpointtypes "github.com/cilium/cilium/pkg/endpoint/types"
 	"github.com/cilium/cilium/pkg/identity"
 	"github.com/cilium/cilium/pkg/labels"
 )
@@ -44,15 +44,12 @@ func ScriptCmds(epm EndpointManager, template *endpoint.Endpoint) map[string]scr
 
 				id := &identity.Identity{
 					ID:         identity.NumericIdentity(num),
-					Labels:     labels.FromSlice(labelArr),
+					Labels:     labels.FromSlice(labelArr...),
 					LabelArray: labels.LabelArray(labelArr),
 				}
 
-				// The following order of steps simulate adding an Endpoint the
-				// way that the Agent does. Mark it fake so teardown skips the
-				// host datapath, which the script harness does not provide.
+				// Simulate adding an Endpoint the way the Agent does.
 				ep := template.CopyFromTemplate()
-				ep.SetPropertyValue(endpointtypes.PropertyFakeEndpoint, true)
 				err = epm.AddEndpoint(ep)
 				if err != nil {
 					return nil, err
@@ -106,19 +103,8 @@ func ScriptCmds(epm EndpointManager, template *endpoint.Endpoint) map[string]scr
 			func(s *script.State, args ...string) (script.WaitFunc, error) {
 				return func(s *script.State) (stdout string, stderr string, err error) {
 					var sb strings.Builder
-					sb.WriteRune('[')
-					for _, ep := range epm.GetEndpointList(endpointapi.GetEndpointParams{}) {
-						sb.WriteRune('{')
-						sb.WriteString(spew.Sdump(
-							"id", ep.ID,
-							"identity", ep.Status.Identity,
-							"status", ep.Status.Policy,
-						))
-						sb.WriteRune('}')
-						sb.WriteRune(',')
-						sb.WriteRune('\n')
-					}
-					sb.WriteString("]\n")
+					w := tabwriter.NewWriter(&sb, 5, 0, 3, ' ', 0)
+					client.FormatEndpoints(w, epm.GetEndpointList(endpointapi.GetEndpointParams{}), false)
 					return sb.String(), "", nil
 				}, nil
 			},

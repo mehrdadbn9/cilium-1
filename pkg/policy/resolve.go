@@ -14,6 +14,7 @@ import (
 
 	cilium "github.com/cilium/proxy/go/cilium/api"
 
+	cmtypes "github.com/cilium/cilium/pkg/clustermesh/types"
 	"github.com/cilium/cilium/pkg/endpoint/regeneration"
 	"github.com/cilium/cilium/pkg/identity"
 	"github.com/cilium/cilium/pkg/logging/logfields"
@@ -170,10 +171,6 @@ type SelectorPolicy interface {
 	// GetEgressNamedPorts iterates named ports for the given identities
 	GetEgressNamedPorts(name string, proto u8proto.U8proto, idents iter.Seq[identity.NumericIdentity]) pkgTypes.NidPortSeq
 
-	// GetAuthTypes returns the AuthTypes required by the policy for traffic to
-	// remoteID, or nil if none.
-	GetAuthTypes(remoteID identity.NumericIdentity) types.AuthTypes
-
 	AddHold() bool
 	ReleaseHold()
 	Detach()
@@ -189,6 +186,8 @@ type NamedPortsGetter interface {
 // particular Identity across all layers (L3, L4, and L7), with the policy
 // still determined in terms of EndpointSelectors.
 type selectorPolicy struct {
+	clusterInfo cmtypes.ClusterInfo
+
 	// Revision is the revision of the policy repository used to generate
 	// this selectorPolicy.
 	Revision uint64
@@ -220,33 +219,6 @@ func (p *selectorPolicy) GetEgressNamedPorts(name string, proto u8proto.U8proto,
 		return pkgTypes.EmptyNidPortSeq
 	}
 	return p.namedPortsGetter.GetNamedPorts().GetNamedPorts(name, proto, idents)
-}
-
-// GetAuthTypes returns the AuthTypes required by the policy for traffic to
-// remoteID, or nil if none. The selectorPolicy is treated as immutable after
-// creation, so no locking is required.
-func (p *selectorPolicy) GetAuthTypes(remoteID identity.NumericIdentity) types.AuthTypes {
-	var resTypes types.AuthTypes
-	for cs, authTypes := range p.L4Policy.authMap {
-		missing := false
-		for authType := range authTypes {
-			if _, exists := resTypes[authType]; !exists {
-				missing = true
-				break
-			}
-		}
-		// Only check if 'cs' selects 'remoteID' if one of the authTypes is still missing
-		// from the result.
-		if missing && cs.Selects(remoteID) {
-			if resTypes == nil {
-				resTypes = make(types.AuthTypes, 1)
-			}
-			for authType := range authTypes {
-				resTypes[authType] = struct{}{}
-			}
-		}
-	}
-	return resTypes
 }
 
 func (p *selectorPolicy) Attach(ctx PolicyContext) {
@@ -334,13 +306,18 @@ type PolicyOwner interface {
 	GetIngressNamedPort(name string, proto u8proto.U8proto) uint16
 	PolicyDebug(msg string, attrs ...any)
 	IsHost() bool
-	PreviousMapState() *MapState
+	// PreviousMapStateSizes returns the map sizes of the owner's current policy map state, to
+	// be used as capacity hints for the map state of a new policy. It is called with the
+	// PolicyOwner unlocked, so that it may take the owner's lock to synchronize against the
+	// incremental updates applied to the current map state.
+	PreviousMapStateSizes() MapStateSizes
 	RegenerateIfAlive(regenMetadata *regeneration.ExternalRegenerationMetadata) <-chan bool
 }
 
 // newSelectorPolicy returns an empty selectorPolicy stub.
-func newSelectorPolicy(selectorCache *SelectorCache) *selectorPolicy {
+func newSelectorPolicy(selectorCache *SelectorCache, clusterInfo cmtypes.ClusterInfo) *selectorPolicy {
 	return &selectorPolicy{
+		clusterInfo:   clusterInfo,
 		Revision:      0,
 		SelectorCache: selectorCache,
 		L4Policy:      NewL4Policy(0),
@@ -397,6 +374,13 @@ func (p *selectorPolicy) Detach() {
 func (p *selectorPolicy) DistillPolicy(logger *slog.Logger, policyOwner PolicyOwner, redirects map[string]uint16) *EndpointPolicy {
 	var calculatedPolicy *EndpointPolicy
 
+	// Size the new map state after the owner's current one. This must be done before taking
+	// the selector cache read lock below: the accessor takes the PolicyOwner's (endpoint)
+	// lock, and the established lock order is endpoint lock first, selector cache lock second
+	// (e.g. Detach takes the selector cache write lock while the endpoint lock is held).
+	// Taking the endpoint lock inside 'WithRLock' would invert that order and deadlock.
+	sizes := policyOwner.PreviousMapStateSizes()
+
 	// EndpointPolicy is initialized while 'WithRLock' keeps the selector cache read
 	// locked. This syncronizes the selector snapshot creation and the registration of the new
 	// EndpointPolicy as a user of the selectorPolicy 'p' before any new incremental updated can
@@ -416,7 +400,7 @@ func (p *selectorPolicy) DistillPolicy(logger *slog.Logger, policyOwner PolicyOw
 		calculatedPolicy = &EndpointPolicy{
 			SelectorPolicy: p,
 			selectors:      selectors,
-			policyMapState: newMapState(logger, policyOwner.PreviousMapState(), features),
+			policyMapState: newMapState(logger, sizes, features, p.clusterInfo),
 			policyMapChanges: MapChanges{
 				logger:   logger,
 				firstRev: selectors.Revision,
@@ -713,8 +697,8 @@ func (p *EndpointPolicy) ConsumeMapChanges() (closer func(), changes ChangeState
 // PolicyOwner is left as nil
 func NewEndpointPolicy(logger *slog.Logger, repo PolicyRepository) *EndpointPolicy {
 	return &EndpointPolicy{
-		SelectorPolicy: newSelectorPolicy(repo.GetSelectorCache()),
-		policyMapState: emptyMapState(logger),
+		SelectorPolicy: newSelectorPolicy(repo.GetSelectorCache(), repo.GetClusterInfo()),
+		policyMapState: newMapState(logger, MapStateSizes{}, 0, repo.GetClusterInfo()),
 	}
 }
 

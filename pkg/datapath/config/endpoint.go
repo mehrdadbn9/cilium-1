@@ -24,8 +24,8 @@ func Endpoint(ep endpoint.Config, lnc *Config) any {
 	// address. Unlike other L2-less devices, the ethernet header length remains
 	// at its default non-zero value.
 	em := ep.GetNodeMAC()
-	if len(em) == 6 {
-		cfg.InterfaceMAC.Addr = em.As6()
+	if em.IsValid() {
+		cfg.InterfaceMAC.Addr = em
 	}
 
 	cfg.InterfaceIfIndex = uint32(ep.GetIfIndex())
@@ -43,18 +43,21 @@ func Endpoint(ep endpoint.Config, lnc *Config) any {
 	cfg.EnableExtendedIPProtocols = option.Config.EnableExtendedIPProtocols
 	cfg.EnableNetkit = lnc.DatapathIsNetkit
 
+	cfg.EnableVTEP = option.Config.EnableVTEP
 	if option.Config.EnableVTEP {
 		cfg.VTEPMask = byteorder.NetIPAddrToHost32(option.Config.VtepCidrMask)
 	}
 
 	cfg.AllowICMPFragNeeded = option.Config.AllowICMPFragNeeded
 	cfg.EnableICMPRule = option.Config.EnableICMPRules
+	cfg.EnableSIPVerification = ep.GetOptions().IsEnabled(option.SourceIPVerification)
 	cfg.EnableLRP = option.Config.EnableLocalRedirectPolicy
 
 	cfg.EphemeralMin = lnc.EphemeralMin
 
 	cfg.EnablePolicyAccounting = lnc.EnablePolicyAccounting
 	cfg.DebugLB = ep.GetOptions().IsEnabled(option.DebugLB)
+	cfg.EnableDropNotify = ep.GetOptions().IsEnabled(option.DropNotify)
 
 	cfg.MonitorAggregation = uint8(ep.GetOptions().GetValue(option.MonitorAggregation))
 
@@ -70,7 +73,14 @@ func Endpoint(ep endpoint.Config, lnc *Config) any {
 	cfg.EnableIPv4Fragments = option.Config.EnableIPv4FragmentsTracking
 	cfg.EnableIPv6Fragments = option.Config.EnableIPv6FragmentsTracking
 
+	cfg.EnableServiceNoBackendResponse = option.Config.ServiceNoBackendResponseEnabled()
+
 	cfg.HybridRoutingEnabled = option.Config.RoutingMode == option.RoutingModeHybrid
+
+	if lnc.KPRConfig.EnableSocketLB &&
+		!option.Config.UnsafeDaemonConfigOption.BPFSocketLBHostnsOnly {
+		cfg.EnableSocketLBFull = true
+	}
 
 	return cfg
 }

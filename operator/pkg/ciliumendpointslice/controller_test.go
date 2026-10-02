@@ -16,6 +16,7 @@ import (
 	"github.com/cilium/cilium/operator/k8s"
 	tu "github.com/cilium/cilium/operator/pkg/ciliumendpointslice/testutils"
 	idtu "github.com/cilium/cilium/operator/pkg/ciliumidentity/testutils"
+	cmtypes "github.com/cilium/cilium/pkg/clustermesh/types"
 	"github.com/cilium/cilium/pkg/datapath/linux/ipsec"
 	"github.com/cilium/cilium/pkg/hive"
 	cilium_v2 "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2"
@@ -41,6 +42,9 @@ func TestRegisterController(t *testing.T) {
 		k8s.ResourcesCell,
 		ipsec.OperatorCell,
 		wgAgent.OperatorCell,
+		cell.Provide(func() cmtypes.ClusterInfo {
+			return cmtypes.DefaultClusterInfo
+		}),
 		cell.Provide(func() Config {
 			return defaultConfig
 		}),
@@ -96,6 +100,9 @@ func TestNotRegisterControllerWithCESDisabled(t *testing.T) {
 		k8s.ResourcesCell,
 		ipsec.OperatorCell,
 		wgAgent.OperatorCell,
+		cell.Provide(func() cmtypes.ClusterInfo {
+			return cmtypes.DefaultClusterInfo
+		}),
 		cell.Provide(func() Config {
 			return defaultConfig
 		}),
@@ -159,10 +166,11 @@ func TestRegisterControllerNoCEPs(t *testing.T) {
 	fakeClient, pod, ciliumEndpointSlice, namespace, ciliumNode, ciliumIdentity, _, hive := initHiveTest(t, true, true)
 
 	tlog := hivetest.Logger(t)
+	labelsfilter.ParseLabelPrefixCfg(tlog, nil, nil, "")
+
 	if err := hive.Start(tlog, t.Context()); err != nil {
 		t.Fatalf("failed to start: %s", err)
 	}
-	labelsfilter.ParseLabelPrefixCfg(tlog, nil, nil, "")
 
 	cesCreated, err := createPodandVerifyCESCreated(t, fakeClient, pod, ciliumEndpointSlice, namespace, ciliumIdentity, ciliumNode)
 
@@ -216,6 +224,9 @@ func initHiveTest(t *testing.T, enableCES, enableCESwithoutCEPs bool) (k8sClient
 		k8s.ResourcesCell,
 		ipsec.OperatorCell,
 		wgAgent.OperatorCell,
+		cell.Provide(func() cmtypes.ClusterInfo {
+			return cmtypes.DefaultClusterInfo
+		}),
 		cell.Provide(func() Config {
 			config := defaultConfig
 			if enableCESwithoutCEPs {

@@ -157,6 +157,11 @@ kind: CiliumEndpoint
 metadata:
   name: cep-002
   namespace: bar
+  ownerReferences:
+  - apiVersion: v1
+    kind: Pod
+    name: cep-002
+    uid: cep-pod-uid
 status:
   encryption:
     key: 5
@@ -224,7 +229,6 @@ status:
 # cilium/state/ip/v1/default/10.244.1.79
 {
   "IP": "10.244.1.79",
-  "Mask": null,
   "HostIP": "172.18.0.3",
   "ID": 199472,
   "Key": 0,
@@ -236,13 +240,13 @@ status:
 # cilium/state/ip/v1/default/10.244.2.74
 {
   "IP": "10.244.2.74",
-  "Mask": null,
   "HostIP": "172.18.0.2",
   "ID": 199475,
   "Key": 5,
   "Metadata": "",
   "K8sNamespace": "bar",
   "K8sPodName": "cep-002",
+  "K8sPodUID": "cep-pod-uid",
   "K8sServiceAccount": "default",
   "NamedPorts": [
     {
@@ -260,7 +264,6 @@ status:
 # cilium/state/ip/v1/default/fd00:10:244:1::d643
 {
   "IP": "fd00:10:244:1::d643",
-  "Mask": null,
   "HostIP": "172.18.0.3",
   "ID": 199472,
   "Key": 0,
@@ -272,13 +275,13 @@ status:
 # cilium/state/ip/v1/default/fd00:10:244:2::e024
 {
   "IP": "fd00:10:244:2::e024",
-  "Mask": null,
   "HostIP": "172.18.0.2",
   "ID": 199475,
   "Key": 5,
   "Metadata": "",
   "K8sNamespace": "bar",
   "K8sPodName": "cep-002",
+  "K8sPodUID": "cep-pod-uid",
   "K8sServiceAccount": "default",
   "NamedPorts": [
     {
@@ -297,7 +300,6 @@ status:
 # cilium/state/ip/v1/default/10.244.1.80
 {
   "IP": "10.244.1.80",
-  "Mask": null,
   "HostIP": "172.18.0.3",
   "ID": 199472,
   "Key": 0,
@@ -309,13 +311,13 @@ status:
 # cilium/state/ip/v1/default/10.244.2.74
 {
   "IP": "10.244.2.74",
-  "Mask": null,
   "HostIP": "172.18.0.2",
   "ID": 199475,
   "Key": 5,
   "Metadata": "",
   "K8sNamespace": "bar",
   "K8sPodName": "cep-002",
+  "K8sPodUID": "cep-pod-uid",
   "K8sServiceAccount": "default",
   "NamedPorts": [
     {
@@ -333,13 +335,13 @@ status:
 # cilium/state/ip/v1/default/fd00:10:244:2::e024
 {
   "IP": "fd00:10:244:2::e024",
-  "Mask": null,
   "HostIP": "172.18.0.2",
   "ID": 199475,
   "Key": 5,
   "Metadata": "",
   "K8sNamespace": "bar",
   "K8sPodName": "cep-002",
+  "K8sPodUID": "cep-pod-uid",
   "K8sServiceAccount": "default",
   "NamedPorts": [
     {
@@ -358,7 +360,6 @@ status:
 # cilium/state/ip/v1/default/10.244.1.80
 {
   "IP": "10.244.1.80",
-  "Mask": null,
   "HostIP": "172.18.0.3",
   "ID": 199472,
   "Key": 0,
@@ -370,13 +371,13 @@ status:
 # cilium/state/ip/v1/default/10.244.2.74
 {
   "IP": "10.244.2.74",
-  "Mask": null,
   "HostIP": "172.18.0.2",
   "ID": 199475,
   "Key": 5,
   "Metadata": "",
   "K8sNamespace": "bar",
   "K8sPodName": "cep-002",
+  "K8sPodUID": "cep-pod-uid",
   "K8sServiceAccount": "default",
   "NamedPorts": [
     {
@@ -394,7 +395,6 @@ status:
 # cilium/state/ip/v1/default/10.244.2.91
 {
   "IP": "10.244.2.91",
-  "Mask": null,
   "HostIP": "172.18.0.2",
   "ID": 199472,
   "Key": 0,
@@ -406,13 +406,13 @@ status:
 # cilium/state/ip/v1/default/fd00:10:244:2::e024
 {
   "IP": "fd00:10:244:2::e024",
-  "Mask": null,
   "HostIP": "172.18.0.2",
   "ID": 199475,
   "Key": 5,
   "Metadata": "",
   "K8sNamespace": "bar",
   "K8sPodName": "cep-002",
+  "K8sPodUID": "cep-pod-uid",
   "K8sServiceAccount": "default",
   "NamedPorts": [
     {
@@ -430,7 +430,6 @@ status:
 # cilium/state/ip/v1/default/fd00:10:244:2::e4b4
 {
   "IP": "fd00:10:244:2::e4b4",
-  "Mask": null,
   "HostIP": "172.18.0.2",
   "ID": 199472,
   "Key": 0,
@@ -443,7 +442,6 @@ status:
 # cilium/state/ip/v1/default/10.244.1.80
 {
   "IP": "10.244.1.80",
-  "Mask": null,
   "HostIP": "172.18.0.3",
   "ID": 199472,
   "Key": 0,
@@ -455,7 +453,6 @@ status:
 # cilium/state/ip/v1/default/10.244.2.91
 {
   "IP": "10.244.2.91",
-  "Mask": null,
   "HostIP": "172.18.0.2",
   "ID": 199472,
   "Key": 0,
@@ -467,7 +464,6 @@ status:
 # cilium/state/ip/v1/default/fd00:10:244:2::e4b4
 {
   "IP": "fd00:10:244:2::e4b4",
-  "Mask": null,
   "HostIP": "172.18.0.2",
   "ID": 199472,
   "Key": 0,
@@ -480,7 +476,6 @@ status:
 # cilium/state/ip/v1/default/10.244.1.80
 {
   "IP": "10.244.1.80",
-  "Mask": null,
   "HostIP": "172.18.0.3",
   "ID": 199472,
   "Key": 0,
@@ -492,7 +487,6 @@ status:
 # cilium/state/ip/v1/default/10.244.2.91
 {
   "IP": "10.244.2.91",
-  "Mask": null,
   "HostIP": "172.18.0.3",
   "ID": 199479,
   "Key": 0,
@@ -504,7 +498,6 @@ status:
 # cilium/state/ip/v1/default/fd00:10:244:2::e4b4
 {
   "IP": "fd00:10:244:2::e4b4",
-  "Mask": null,
   "HostIP": "172.18.0.2",
   "ID": 199472,
   "Key": 0,
@@ -516,7 +509,6 @@ status:
 # cilium/state/ip/v1/default/fd00:10:244:2::e4b5
 {
   "IP": "fd00:10:244:2::e4b5",
-  "Mask": null,
   "HostIP": "172.18.0.3",
   "ID": 199479,
   "Key": 0,
@@ -529,7 +521,6 @@ status:
 # cilium/state/ip/v1/default/10.244.1.80
 {
   "IP": "10.244.1.80",
-  "Mask": null,
   "HostIP": "172.18.0.3",
   "ID": 199472,
   "Key": 0,
@@ -541,7 +532,6 @@ status:
 # cilium/state/ip/v1/default/10.244.2.91
 {
   "IP": "10.244.2.91",
-  "Mask": null,
   "HostIP": "172.18.0.2",
   "ID": 199472,
   "Key": 0,
@@ -553,7 +543,6 @@ status:
 # cilium/state/ip/v1/default/fd00:10:244:2::e4b4
 {
   "IP": "fd00:10:244:2::e4b4",
-  "Mask": null,
   "HostIP": "172.18.0.2",
   "ID": 199472,
   "Key": 0,
@@ -565,7 +554,6 @@ status:
 # cilium/state/ip/v1/default/fd00:10:244:2::e4b5
 {
   "IP": "fd00:10:244:2::e4b5",
-  "Mask": null,
   "HostIP": "172.18.0.3",
   "ID": 199479,
   "Key": 0,
@@ -578,7 +566,6 @@ status:
 # cilium/state/ip/v1/default/10.244.1.80
 {
   "IP": "10.244.1.80",
-  "Mask": null,
   "HostIP": "172.18.0.3",
   "ID": 199472,
   "Key": 0,
@@ -590,7 +577,6 @@ status:
 # cilium/state/ip/v1/default/10.244.2.91
 {
   "IP": "10.244.2.91",
-  "Mask": null,
   "HostIP": "172.18.0.3",
   "ID": 199479,
   "Key": 0,
@@ -602,7 +588,6 @@ status:
 # cilium/state/ip/v1/default/fd00:10:244:2::e4b5
 {
   "IP": "fd00:10:244:2::e4b5",
-  "Mask": null,
   "HostIP": "172.18.0.3",
   "ID": 199479,
   "Key": 0,
@@ -615,7 +600,6 @@ status:
 # cilium/state/ip/v1/default/10.244.1.80
 {
   "IP": "10.244.1.80",
-  "Mask": null,
   "HostIP": "172.18.0.3",
   "ID": 199472,
   "Key": 0,

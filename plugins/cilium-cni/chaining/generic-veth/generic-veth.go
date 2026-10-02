@@ -16,6 +16,7 @@ import (
 	"github.com/cilium/cilium/api/v1/client/daemon"
 	"github.com/cilium/cilium/api/v1/models"
 	"github.com/cilium/cilium/pkg/client"
+	"github.com/cilium/cilium/pkg/datapath/link"
 	"github.com/cilium/cilium/pkg/datapath/linux/safenetlink"
 	endpointid "github.com/cilium/cilium/pkg/endpoint/id"
 	"github.com/cilium/cilium/pkg/logging/logfields"
@@ -52,9 +53,10 @@ func (f *GenericVethChainer) Add(ctx context.Context, pluginCtx chainingapi.Plug
 		}
 	}()
 	var (
-		hostMac, vethHostName, vethLXCMac, vethLXCName, vethIP, vethIPv6 string
-		vethHostIdx, peerIndex                                           int
-		peer                                                             netlink.Link
+		vethHostName, vethLXCName, vethIP, vethIPv6 string
+		hostMac, vethLXCMac                         mac.MAC
+		vethHostIdx, peerIndex                      int
+		peer                                        netlink.Link
 	)
 
 	ns, err := netns.OpenPinned(pluginCtx.Args.Netns)
@@ -80,7 +82,9 @@ func (f *GenericVethChainer) Add(ctx context.Context, pluginCtx chainingapi.Plug
 				continue
 			}
 
-			vethLXCMac = link.Attrs().HardwareAddr.String()
+			// A link with no usable MAC leaves vethLXCMac unset; it is
+			// reported along with the other missing attributes below.
+			vethLXCMac, _ = mac.FromHardwareAddr(link.Attrs().HardwareAddr)
 			vethLXCName = link.Attrs().Name
 
 			veth, ok := link.(*netlink.Veth)
@@ -177,7 +181,7 @@ func (f *GenericVethChainer) Add(ctx context.Context, pluginCtx chainingapi.Plug
 		return
 	}
 
-	hostMac = peer.Attrs().HardwareAddr.String()
+	hostMac, _ = mac.FromHardwareAddr(peer.Attrs().HardwareAddr)
 	vethHostName = peer.Attrs().Name
 	vethHostIdx = peer.Attrs().Index
 
@@ -185,7 +189,10 @@ func (f *GenericVethChainer) Add(ctx context.Context, pluginCtx chainingapi.Plug
 	case vethHostName == "":
 		err = errors.New("unable to determine name of veth pair on the host side")
 		return
-	case vethLXCMac == "":
+	case !hostMac.IsValid():
+		err = errors.New("unable to determine MAC address of veth pair on the host side")
+		return
+	case !vethLXCMac.IsValid():
 		err = errors.New("unable to determine MAC address of veth pair on the container side")
 		return
 	case vethIP == "" && vethIPv6 == "":
@@ -243,11 +250,11 @@ func (f *GenericVethChainer) Add(ctx context.Context, pluginCtx chainingapi.Plug
 		err = fmt.Errorf("unable to create endpoint: %w", err)
 		return
 	}
-	if newEp != nil && newEp.Status != nil && newEp.Status.Networking != nil && newEp.Status.Networking.Mac != "" &&
+	if newEp != nil && newEp.Status != nil && newEp.Status.Networking != nil && newEp.Status.Networking.Mac.IsValid() &&
 		newEp.Status.Networking.Mac != vethLXCMac {
 
 		err = ns.Do(func() error {
-			return mac.ReplaceMacAddressWithLinkName(vethLXCName, newEp.Status.Networking.Mac)
+			return link.SetHardwareAddr(vethLXCName, newEp.Status.Networking.Mac)
 		})
 		if err != nil {
 			err = fmt.Errorf("unable to set MAC address on interface %s: %w", vethLXCName, err)
@@ -255,7 +262,7 @@ func (f *GenericVethChainer) Add(ctx context.Context, pluginCtx chainingapi.Plug
 		}
 		for i := range prevRes.Interfaces {
 			if prevRes.Interfaces[i].Name == vethLXCName {
-				prevRes.Interfaces[i].Mac = newEp.Status.Networking.Mac
+				prevRes.Interfaces[i].Mac = newEp.Status.Networking.Mac.String()
 			}
 		}
 	}

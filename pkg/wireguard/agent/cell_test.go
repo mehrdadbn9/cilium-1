@@ -23,7 +23,6 @@ import (
 	"github.com/cilium/cilium/daemon/k8s"
 	"github.com/cilium/cilium/pkg/clustermesh"
 	cmtypes "github.com/cilium/cilium/pkg/clustermesh/types"
-	"github.com/cilium/cilium/pkg/datapath/iptables/ipset"
 	"github.com/cilium/cilium/pkg/datapath/linux/safenetlink"
 	"github.com/cilium/cilium/pkg/datapath/linux/sysctl"
 	"github.com/cilium/cilium/pkg/datapath/tables"
@@ -33,6 +32,7 @@ import (
 	envoyCfg "github.com/cilium/cilium/pkg/envoy/config"
 	"github.com/cilium/cilium/pkg/hive"
 	"github.com/cilium/cilium/pkg/identity/cache"
+	iputil "github.com/cilium/cilium/pkg/ip"
 	"github.com/cilium/cilium/pkg/ipcache"
 	k8sClient "github.com/cilium/cilium/pkg/k8s/client/testutils"
 	k8sSynced "github.com/cilium/cilium/pkg/k8s/synced"
@@ -126,7 +126,6 @@ func TestPrivileged_TestWireGuardCell(t *testing.T) {
 			reflectors.K8sReflectorCell,
 			clustermesh.Cell,
 			writer.Cell,
-			ipset.Cell,
 			k8s.ResourcesCell,
 			k8sTables.PodTableCell,
 			cell.Config(envoyCfg.SecretSyncConfig{}),
@@ -176,7 +175,7 @@ func TestPrivileged_TestWireGuardCell(t *testing.T) {
 								IPAddresses: []nodeTypes.Address{
 									{
 										Type: addressing.NodeInternalIP,
-										IP:   k8s1NodeIPv4,
+										IP:   iputil.AddrFrom(iputil.AddrFromIP(k8s1NodeIPv4)),
 									},
 								},
 								Annotations: map[string]string{},
@@ -274,8 +273,11 @@ func TestPrivileged_TestWireGuardCell(t *testing.T) {
 			require.NoError(t, err)
 			require.Len(t, dev.Peers, 1)
 
-			// 6.d Close CacheStatus to unlock wait from the [*Agent.peerGarbageCollector].
+			// 6.d Signal that the initial Kubernetes node listing is complete. The
+			// cache status unblocks the peer garbage collector, while NodeSync
+			// completes the corresponding node table initializer.
 			close(cacheStatus)
+			manager.NodeSync()
 
 			// 6.e TriggerLabelInjection to unlock WaitForRevision from the [*Agent.peerGarbageCollector].
 			ipCache.TriggerLabelInjection()
@@ -297,7 +299,7 @@ func TestPrivileged_TestWireGuardCell(t *testing.T) {
 				IPAddresses: []nodeTypes.Address{
 					{
 						Type: addressing.NodeInternalIP,
-						IP:   k8s2NodeIPv4,
+						IP:   iputil.AddrFrom(iputil.AddrFromIP(k8s2NodeIPv4)),
 					},
 				},
 				Source:          source.Unspec,
@@ -318,8 +320,9 @@ func TestPrivileged_TestWireGuardCell(t *testing.T) {
 			require.EventuallyWithT(t, func(c *assert.CollectT) {
 				assert.Contains(c, wgAgent.peerByNodeName, k8s2NodeName)
 				assert.Truef(c, func() bool {
-					for _, n := range wgAgent.peerByNodeName[k8s2NodeName].allowedIPs {
-						if n.Contains(pod2IPv4.IP) {
+					pfx := ipnetToPrefix(*pod2IPv4)
+					for _, n := range wgAgent.peerByNodeName[k8s2NodeName].allowedIPs.AsSlice() {
+						if n.Contains(pfx.Addr()) {
 							return true
 						}
 					}

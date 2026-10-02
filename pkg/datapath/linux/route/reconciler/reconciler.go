@@ -45,7 +45,7 @@ func registerReconciler(
 		params,
 		tbl,
 		(*DesiredRoute).Clone,
-		(*DesiredRoute).SetStatus,
+		(*DesiredRoute).WithStatus,
 		(*DesiredRoute).GetStatus,
 		ops,
 		ops,
@@ -259,8 +259,7 @@ func (ops *ops) UpdateBatch(ctx context.Context, txn statedb.ReadTxn, batch []re
 	// Write all events to the WAL first, then process the updates.
 	if err := ops.wal.Write(events...); err != nil {
 		// If we failed to write individual entries, mark them as failed.
-		var ba wal.BatchErrors
-		if errors.As(err, &ba) {
+		if ba, ok := errors.AsType[wal.BatchErrors](err); ok {
 			for _, e := range ba {
 				selected[e.Index].Result = e.Err
 			}
@@ -290,9 +289,10 @@ func (ops *ops) DeleteBatch(ctx context.Context, txn statedb.ReadTxn, batch []re
 	// replace it instead. Otherwise we briefly have no route installed.
 	toDelete := make([]*reconciler.BatchEntry[*DesiredRoute], 0, len(batch))
 	for i := range batch {
-		_, _, found := ops.tbl.Get(txn, DesiredRouteTablePrefixIndex.QueryFromObject(batch[i].Object))
-		if !found {
-			toDelete = append(toDelete, &batch[i])
+		if query, ok := DesiredRouteTablePrefixIndex.QueryFromObject(batch[i].Object); ok {
+			if _, _, found := ops.tbl.Get(txn, query); !found {
+				toDelete = append(toDelete, &batch[i])
+			}
 		}
 	}
 
@@ -325,8 +325,7 @@ func (ops *ops) DeleteBatch(ctx context.Context, txn statedb.ReadTxn, batch []re
 	// Write all events to the WAL first, then process the updates.
 	if err := ops.wal.Write(events...); err != nil {
 		// If we failed to write individual entries, mark them as failed.
-		var ba wal.BatchErrors
-		if errors.As(err, &ba) {
+		if ba, ok := errors.AsType[wal.BatchErrors](err); ok {
 			for _, e := range ba {
 				toDelete[e.Index].Result = e.Err
 			}

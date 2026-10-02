@@ -11,6 +11,8 @@
 #pragma once
 
 #include <bpf/lb_selection.h>
+#include <lib/ipv4_core.h>
+#include <lib/ipv6_core.h>
 #include <lib/static_data.h>
 
 /* Legacy node config rendered at agent runtime. */
@@ -22,6 +24,8 @@ NODE_CONFIG(__u32, cilium_host_ifindex, "Interface index of the cilium_host devi
 NODE_CONFIG(union macaddr, cilium_host_mac, "MAC address of the cilium_host device")
 
 NODE_CONFIG(union v4addr, service_loopback_ipv4, "IPv4 source address used for SNAT when a Pod talks to itself over a Service")
+NODE_CONFIG(union v4addr, router_ipv4,
+	    "Internal IPv4 router address assigned to the cilium_host interface")
 NODE_CONFIG(union v6addr, service_loopback_ipv6,
 	    "IPv6 source address used for SNAT when a Pod talks to itself over a Service")
 NODE_CONFIG(union v6addr, router_ipv6, "Internal IPv6 router address assigned to the cilium_host interface")
@@ -80,6 +84,8 @@ ASSIGN_CONFIG(__u8, lb_default_alg, LB_DEFAULT_ALG)
 
 NODE_CONFIG(__u16, nodeport_port_min, "Nodeport minimum port value.")
 NODE_CONFIG(__u16, nodeport_port_max, "Nodeport maximum port value.")
+NODE_CONFIG(__u16, nodeport_port_min_nat_ext, "Nodeport NAT extended minimum port value.")
+NODE_CONFIG(__u16, nodeport_port_max_nat_ext, "Nodeport NAT extended maximum port value.")
 
 NODE_CONFIG(__u32, hash_init4_seed, "Cluster-wide IPv4 tuple hash seed sourced")
 NODE_CONFIG(__u32, hash_init6_seed, "Cluster-wide IPv6 tuple hash seed sourced")
@@ -103,5 +109,77 @@ NODE_CONFIG(bool, encryption_strict_ingress, "Enable strict encryption for ingre
 
 NODE_CONFIG(__u8, monitor_aggregation, "Level of aggregation for monitor events")
 
+NODE_CONFIG(__u32, monitor_report_interval, "Monitor report interval in seconds")
+ASSIGN_CONFIG(__u32, monitor_report_interval, 5)
+
+NODE_CONFIG(__u8, monitor_report_flags, "TCP flags that trigger monitor reports")
+
+/* Allow to override the assigned value in tests */
+#ifndef DEFAULT_MONITOR_REPORT_FLAGS
+#define DEFAULT_MONITOR_REPORT_FLAGS 0xff
+#endif
+
+ASSIGN_CONFIG(__u8, monitor_report_flags, DEFAULT_MONITOR_REPORT_FLAGS)
+
 NODE_CONFIG(union v4addr, ipv4_inter_cluster_snat,
 	    "Node IPv4 address used as the source for inter-cluster SNAT")
+
+struct ct_timeout_config {
+	/* Lifetime of non-service TCP conntrack entries in seconds. */
+	__u32 connection_lifetime_tcp;
+	/* Lifetime of non-service non-TCP conntrack entries in seconds. */
+	__u32 connection_lifetime_non_tcp;
+	/* Lifetime of TCP service conntrack entries in seconds. */
+	__u32 service_lifetime_tcp;
+	/* Lifetime of non-TCP service conntrack entries in seconds. */
+	__u32 service_lifetime_non_tcp;
+	/* Grace period before a closed TCP service connection may be rebalanced, in seconds. */
+	__u32 service_close_rebalance;
+	/* Lifetime of TCP conntrack entries that have only seen SYN packets, in seconds. */
+	__u32 syn_timeout;
+	/* Lifetime of closed TCP conntrack entries in seconds. */
+	__u32 close_timeout;
+};
+
+NODE_CONFIG(struct ct_timeout_config, ct_timeouts, "Conntrack timeout configuration")
+ASSIGN_CONFIG(struct ct_timeout_config, ct_timeouts, {
+	.connection_lifetime_tcp = 21600,
+	.connection_lifetime_non_tcp = 60,
+	.service_lifetime_tcp = 21600,
+	.service_lifetime_non_tcp = 60,
+	.service_close_rebalance = 30,
+	.syn_timeout = 60,
+	.close_timeout = 10,
+})
+
+NODE_CONFIG(union v4addr, ipv4_direct_routing,
+	    "IPv4 address of the device used for direct routing between nodes")
+NODE_CONFIG(union v6addr, ipv6_direct_routing,
+	    "IPv6 address of the device used for direct routing between nodes")
+
+struct ipv4_snat_exclusion_prefix {
+	union v4addr dst_addr;
+	__u8 bits;
+	bool enabled;
+};
+
+NODE_CONFIG(struct ipv4_snat_exclusion_prefix, ipv4_snat_exclusion,
+	    "IPv4 destination prefix excluded from SNAT")
+
+struct ipv6_snat_exclusion_prefix {
+	union v6addr dst_addr;
+	union v6addr dst_mask;
+	bool enabled;
+};
+
+NODE_CONFIG(struct ipv6_snat_exclusion_prefix, ipv6_snat_exclusion,
+	    "IPv6 destination prefix excluded from SNAT")
+
+NODE_CONFIG(__u32, encap4_ifindex,
+	    "Interface index of the IPv4 IPIP encapsulation device")
+NODE_CONFIG(__u32, encap6_ifindex,
+	    "Interface index of the IPv6 IPIP encapsulation device")
+
+NODE_CONFIG(bool, enable_sctp, "Enable SCTP support")
+
+NODE_CONFIG(bool, enable_drop_notify, "Enable drop notifications")

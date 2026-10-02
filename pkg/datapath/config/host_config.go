@@ -21,6 +21,8 @@ type BPFHost struct {
 	EnableARPResponder bool `config:"enable_arp_responder"`
 	// Pass traffic with extended IP protocols.
 	EnableExtendedIPProtocols bool `config:"enable_extended_ip_protocols"`
+	// Enable IPIP health probes data path.
+	EnableHealthCheck bool `config:"enable_health_check"`
 	// Apply Network Policy for ICMP packets.
 	EnableICMPRule bool `config:"enable_icmp_rule"`
 	// Enable IPv4 fragments tracking.
@@ -37,7 +39,11 @@ type BPFHost struct {
 	EnablePolicyAccounting bool `config:"enable_policy_accounting"`
 	// Masquerade traffic to remote nodes.
 	EnableRemoteNodeMasquerade bool `config:"enable_remote_node_masquerade"`
-	// Ephemeral port range minimun.
+	// Reply with ICMP to traffic to a service with no backends.
+	EnableServiceNoBackendResponse bool `config:"enable_service_no_backend_response"`
+	// Enable VTEP integration.
+	EnableVTEP bool `config:"enable_vtep"`
+	// Ephemeral port range minimum.
 	EphemeralMin uint16 `config:"ephemeral_min"`
 	// Length of the Ethernet header on this device. May be set to zero on L2-less
 	// devices. (default __ETH_HLEN).
@@ -60,14 +66,14 @@ type BPFHost struct {
 	ProxyRedirectViaCiliumNet bool `config:"proxy_redirect_via_cilium_net"`
 	// The endpoint's security label.
 	SecurityLabel uint32 `config:"security_label"`
-	// IPv4 network where strict egress encryption is enforced.
-	StrictIPv4Net types.V4Addr `config:"strict_ipv4_net"`
-	// Prefix length of the strict egress encryption IPv4 network.
-	StrictIPv4NetSize uint8 `config:"strict_ipv4_net_size"`
+	// Strict encryption mode drops all unencrypted pod-to-pod egress traffic.
+	StrictEgressEncryption types.StrictEncryptionCfg `config:"strict_egress_encryption"`
 	// Port number used for the overlay network.
 	TunnelPort uint16 `config:"tunnel_port"`
 	// The identifier of the tunnel protocol used for the overlay network.
 	TunnelProtocol uint8 `config:"tunnel_protocol"`
+	// VLAN IDs allowed to bypass filtering on this device.
+	VLANFilter types.VLANFilterConfig `config:"vlan_filter"`
 	// VXLAN tunnel endpoint network mask.
 	VTEPMask uint32 `config:"vtep_mask"`
 	// Index of the WireGuard interface.
@@ -80,10 +86,13 @@ type BPFHost struct {
 
 func NewBPFHost(node Node) *BPFHost {
 	return &BPFHost{false, 0x0, false, false, false, false, false, false, false, false,
-		false, false, 0x0, 0xe, 0x0, false, 0x0,
+		false, false, false, false, false, 0x0, 0xe, 0x0, false, 0x0,
 		cast[types.MACAddr]([]byte{0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0}),
 		0x0, cast[types.V4Addr]([]byte{0x0, 0x0, 0x0, 0x0}),
 		cast[types.V6Addr]([]byte{0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0}),
-		false, 0x0, cast[types.V4Addr]([]byte{0x0, 0x0, 0x0, 0x0}),
-		0x0, 0x0, 0x0, 0x0, 0x0, 0x0, node}
+		false, 0x0,
+		cast[types.StrictEncryptionCfg]([]byte{0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0}),
+		0x0, 0x0,
+		cast[types.VLANFilterConfig]([]byte{0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0}),
+		0x0, 0x0, 0x0, node}
 }

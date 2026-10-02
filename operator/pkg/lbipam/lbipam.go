@@ -531,6 +531,7 @@ func (ipam *LBIPAM) serviceViewFromService(key resource.Key, svc *slim_core_v1.S
 	sv.RequestedIPs = getSVCRequestedIPs(ipam.logger, svc)
 	sv.SharingKey = getSVCSharingKey(svc)
 	sv.SharingCrossNamespace = getSVCSharingCrossNamespace(svc)
+	sv.SharingPermitDifferentPods = getSVCSharingPermitDifferentPods(ipam.logger, svc)
 	sv.ExternalTrafficPolicy = svc.Spec.ExternalTrafficPolicy
 	sv.Ports = make([]slim_core_v1.ServicePort, len(svc.Spec.Ports))
 	copy(sv.Ports, svc.Spec.Ports)
@@ -781,9 +782,32 @@ func getSVCSharingKey(svc *slim_core_v1.Service) sharingKey {
 
 func getSVCSharingCrossNamespace(svc *slim_core_v1.Service) []string {
 	if val, _ := annotation.Get(svc, annotation.LBIPAMSharingAcrossNamespace, annotation.LBIPAMSharingAcrossNamespaceAlias); val != "" {
-		return strings.Split(val, ",")
+		namespaces := strings.Split(val, ",")
+		for i := range namespaces {
+			namespaces[i] = strings.TrimSpace(namespaces[i])
+		}
+		return namespaces
 	}
 	return []string{}
+}
+
+func getSVCSharingPermitDifferentPods(log *slog.Logger, svc *slim_core_v1.Service) bool {
+	val, _ := annotation.Get(svc, annotation.LBIPAMSharingPermitDifferentPods)
+	if val == "" {
+		return false
+	}
+	enabled, err := strconv.ParseBool(val)
+	if err != nil {
+		log.Warn(
+			"Invalid value for sharing-permit-different-pods annotation, defaulting to disabled",
+			logfields.ServiceName, svc.Name,
+			logfields.ServiceNamespace, svc.Namespace,
+			logfields.Value, val,
+			logfields.Error, err,
+		)
+		return false
+	}
+	return enabled
 }
 
 func (ipam *LBIPAM) handleDeletedService(svc *slim_core_v1.Service) {

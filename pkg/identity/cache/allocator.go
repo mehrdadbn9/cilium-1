@@ -221,8 +221,8 @@ func (m *CachingIdentityAllocator) InitIdentityAllocator(client clientset.Interf
 
 	m.logger.Info("Initializing identity allocator")
 
-	minID := idpool.ID(identity.GetMinimalAllocationIdentity(m.clusterInfo.ID))
-	maxID := idpool.ID(identity.GetMaximumAllocationIdentity(m.clusterInfo.ID))
+	minID := idpool.ID(m.clusterInfo.MinimalAllocationIdentity())
+	maxID := idpool.ID(m.clusterInfo.MaximumAllocationIdentity())
 
 	m.logger.Info(
 		"Allocating identities between range",
@@ -309,7 +309,7 @@ func (m *CachingIdentityAllocator) InitIdentityAllocator(client clientset.Interf
 		allocOptions := []allocator.AllocatorOption{
 			allocator.WithMax(maxID), allocator.WithMin(minID),
 			allocator.WithEvents(events), allocator.WithSyncInterval(m.syncInterval),
-			allocator.WithPrefixMask(idpool.ID(m.clusterInfo.ID << identity.GetClusterIDShift())),
+			allocator.WithPrefixMask(idpool.ID(m.clusterInfo.ID << m.clusterInfo.GetClusterIDShift())),
 		}
 		if m.operatorIDManagement {
 			allocOptions = append(allocOptions, allocator.WithOperatorIDManagement())
@@ -519,7 +519,7 @@ func (m *CachingIdentityAllocator) allocateLocalIdentityLocked(lbls labels.Label
 
 		if notifyOwner {
 			added := identity.IdentityMap{
-				id.ID: id.LabelArray,
+				id.ID: id.Labels,
 			}
 			m.owner.UpdateIdentities(added, nil)
 		}
@@ -573,7 +573,7 @@ func (m *CachingIdentityAllocator) AllocateIdentity(ctx context.Context, lbls la
 		return nil, false, fmt.Errorf("allocator not initialized")
 	}
 
-	idp, allocated, isNewLocally, err := m.IdentityAllocator.Allocate(ctx, &key.GlobalIdentity{LabelArray: lbls.LabelArray()})
+	idp, allocated, isNewLocally, err := m.IdentityAllocator.Allocate(ctx, key.NewGlobalIdentity(lbls))
 	if err != nil {
 		return nil, false, err
 	}
@@ -604,7 +604,7 @@ func (m *CachingIdentityAllocator) AllocateIdentity(ctx context.Context, lbls la
 	// relying on the kv-store update events.
 	if allocated && notifyOwner {
 		added := identity.IdentityMap{
-			id.ID: id.LabelArray,
+			id.ID: id.Labels,
 		}
 		m.owner.UpdateIdentities(added, nil)
 	}
@@ -764,7 +764,7 @@ func (m *CachingIdentityAllocator) RestoreLocalIdentities() (map[identity.Numeri
 			)
 		} else {
 			m.restoredIdentities[newID.ID] = newID
-			added[newID.ID] = newID.LabelArray
+			added[newID.ID] = newID.Labels
 			if newID.ID != oldID.ID {
 				// Paranoia, shouldn't happen
 				scopedLog.Warn(
@@ -848,7 +848,7 @@ func (m *CachingIdentityAllocator) Release(ctx context.Context, id *identity.Ide
 	// ID is no longer used locally, it may still be used by
 	// remote nodes, so we can't rely on the locally computed
 	// "lastUse".
-	released, err = m.IdentityAllocator.Release(ctx, &key.GlobalIdentity{LabelArray: id.LabelArray})
+	released, err = m.IdentityAllocator.Release(ctx, key.NewGlobalIdentity(id.Labels))
 	if released {
 		for labelSource := range id.Labels.CollectSources() {
 			metrics.IdentityLabelSources.WithLabelValues(labelSource).Dec()
@@ -859,7 +859,7 @@ func (m *CachingIdentityAllocator) Release(ctx context.Context, id *identity.Ide
 	// Remove this ID from the selectorcache and any other identity "watchers"
 	if m.owner != nil && released && notifyOwner {
 		deleted := identity.IdentityMap{
-			id.ID: id.LabelArray,
+			id.ID: id.Labels,
 		}
 		m.owner.UpdateIdentities(nil, deleted)
 	}
@@ -905,7 +905,7 @@ func (m *CachingIdentityAllocator) ReleaseLocalIdentities(nids ...identity.Numer
 		released := alloc.release(id)
 		if released {
 			dealloc = append(dealloc, nid)
-			deleted[nid] = id.LabelArray
+			deleted[nid] = id.Labels
 			for labelSource := range id.Labels.CollectSources() {
 				metrics.IdentityLabelSources.WithLabelValues(labelSource).Dec()
 			}
@@ -942,7 +942,7 @@ func (m *CachingIdentityAllocator) WatchRemoteIdentities(remoteName string, remo
 	remoteAlloc, err := allocator.NewAllocator(m.logger,
 		&key.GlobalIdentity{}, remoteAllocatorBackend,
 		allocator.WithEvents(m.IdentityAllocator.GetEvents()), allocator.WithoutGC(), allocator.WithoutAutostart(),
-		allocator.WithCacheValidator(clusterIDValidator(remoteID)),
+		allocator.WithCacheValidator(clusterIDValidator(m.clusterInfo, remoteID)),
 		allocator.WithCacheValidator(clusterNameValidator(remoteName)),
 	)
 	if err != nil {
@@ -1029,9 +1029,9 @@ func (m *CachingIdentityAllocator) LocalIdentityChanges() stream.Observable[Iden
 
 // clusterIDValidator returns a validator ensuring that the identity ID belongs
 // to the ClusterID range.
-func clusterIDValidator(clusterID uint32) allocator.CacheValidator {
-	min := idpool.ID(identity.GetMinimalAllocationIdentity(clusterID))
-	max := idpool.ID(identity.GetMaximumAllocationIdentity(clusterID))
+func clusterIDValidator(cinfo cmtypes.ClusterInfo, clusterID uint32) allocator.CacheValidator {
+	min := idpool.ID(cinfo.MinimalAllocationIdentityFor(clusterID))
+	max := idpool.ID(cinfo.MaximumAllocationIdentityFor(clusterID))
 
 	return func(_ allocator.AllocatorChangeKind, id idpool.ID, _ allocator.AllocatorKey) error {
 		if id < min || id > max {
@@ -1056,24 +1056,16 @@ func clusterNameValidator(clusterName string) allocator.CacheValidator {
 			return fmt.Errorf("unsupported key type %T", ak)
 		}
 
-		var found bool
-		for _, lbl := range gi.LabelArray {
-			if lbl.Key != api.PolicyLabelCluster {
-				continue
-			}
+		lbl, found := gi.Labels()[api.PolicyLabelCluster]
 
-			switch {
-			case lbl.Source != labels.LabelSourceK8s:
-				return fmt.Errorf("unexpected source for cluster label: got %s, expected %s", lbl.Source, labels.LabelSourceK8s)
-			case lbl.Value != clusterName:
-				return fmt.Errorf("unexpected cluster name: got %s, expected %s", lbl.Value, clusterName)
-			default:
-				found = true
-			}
-		}
-
-		if !found {
+		switch {
+		case !found:
 			return fmt.Errorf("could not find expected label %s", api.PolicyLabelCluster)
+		case lbl.Source != labels.LabelSourceK8s:
+			return fmt.Errorf("unexpected source for cluster label: got %s, expected %s", lbl.Source, labels.LabelSourceK8s)
+		case lbl.Value != clusterName:
+			return fmt.Errorf("unexpected cluster name: got %s, expected %s", lbl.Value, clusterName)
+
 		}
 
 		return nil
@@ -1089,18 +1081,7 @@ func ScriptCmds(a *CachingIdentityAllocator) map[string]script.Cmd {
 			func(s *script.State, args ...string) (script.WaitFunc, error) {
 				return func(s *script.State) (stdout string, stderr string, err error) {
 					var sb strings.Builder
-					models := a.GetIdentities()
-					sb.WriteRune('[')
-					for _, m := range models {
-						sb.WriteString(strconv.FormatInt(m.ID, 10))
-						sb.WriteRune(' ')
-						sb.WriteRune('{')
-						sb.WriteString(strings.Join([]string(m.Labels), ","))
-						sb.WriteRune('}')
-						sb.WriteRune(' ')
-					}
-					sb.WriteRune(']')
-					sb.WriteRune('\n')
+					FormatIdentities(&sb, a.GetIdentities())
 					return sb.String(), "", nil
 				}, nil
 			},

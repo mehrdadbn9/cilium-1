@@ -8,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"net"
 	"net/netip"
 
 	"github.com/cilium/hive/cell"
@@ -80,7 +79,7 @@ type l2ResponderReconciler struct {
 // Used for IPv6 Solicited node Group membership tracking.
 type McMACEntry struct {
 	IfIndex int
-	MAC     [6]byte
+	MAC     mac.MAC
 }
 
 // McMACMap stores a solicited node multicast l2 entry with
@@ -88,9 +87,8 @@ type McMACEntry struct {
 type McMACMap map[McMACEntry]struct{}
 
 func (m McMACMap) Add(ifIndex int, ip netip.Addr) {
-	mac := multicast.SolicitedNodeMACAddr(ip)
 	key := McMACEntry{
-		MAC:     mac.As6(),
+		MAC:     multicast.SolicitedNodeMACAddr(ip),
 		IfIndex: ifIndex,
 	}
 
@@ -101,7 +99,7 @@ func NewL2ResponderReconciler(params params) *l2ResponderReconciler {
 	if params.AddRemMcMACFunc == nil {
 		log := params.Logger
 		params.AddRemMcMACFunc = func(ifindex int, m mac.MAC, add bool) error {
-			ifi, err := net.InterfaceByIndex(ifindex)
+			link, err := netlink.LinkByIndex(ifindex)
 			if err != nil {
 				return fmt.Errorf("interface by index %d: %w", ifindex, err)
 			}
@@ -113,10 +111,10 @@ func NewL2ResponderReconciler(params params) *l2ResponderReconciler {
 			solAddr := netip.AddrFrom16(raw)
 
 			if add {
-				return multicast.JoinGroup(log, ifi.Name, solAddr)
+				return multicast.JoinGroup(log, link.Attrs().Name, solAddr)
 			}
 
-			return multicast.LeaveGroup(log, ifi.Name, solAddr)
+			return multicast.LeaveGroup(log, link.Attrs().Name, solAddr)
 		}
 	}
 
@@ -459,13 +457,13 @@ func (p *l2ResponderReconciler) reconcileMcMACEntries(curr McMACMap, desired McM
 			continue
 		}
 		// New group — join it.
-		if err := p.params.AddRemMcMACFunc(key.IfIndex, key.MAC[:], true); err != nil {
+		if err := p.params.AddRemMcMACFunc(key.IfIndex, key.MAC, true); err != nil {
 			errs = errors.Join(errs, fmt.Errorf("join solicited-node multicast group %s@%d: %w", key.MAC, key.IfIndex, err))
 		}
 	}
 	for key := range curr {
 		// Group no longer desired — leave it.
-		if err := p.params.AddRemMcMACFunc(key.IfIndex, key.MAC[:], false); err != nil {
+		if err := p.params.AddRemMcMACFunc(key.IfIndex, key.MAC, false); err != nil {
 			errs = errors.Join(errs, fmt.Errorf("leave solicited-node multicast group %s@%d: %w", key.MAC, key.IfIndex, err))
 		}
 	}

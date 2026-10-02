@@ -16,6 +16,7 @@ import (
 	grpcStatsv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/grpc_stats/v3"
 	grpcWebv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/grpc_web/v3"
 	httpRouterv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/router/v3"
+	statefulsessionv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/stateful_session/v3"
 	httpConnectionManagerv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/http_connection_manager/v3"
 	envoy_type_matcher_v3 "github.com/envoyproxy/go-control-plane/envoy/type/matcher/v3"
 	"google.golang.org/protobuf/types/known/durationpb"
@@ -120,6 +121,15 @@ func (i *cecTranslator) getHTTPConnectionManagerHttpFilters(m *model.Model) []*h
 		})
 	}
 
+	if m.IsSessionPersistenceConfigured() {
+		hf = append(hf, &httpConnectionManagerv3.HttpFilter{
+			Name: "envoy.filters.http.stateful_session",
+			ConfigType: &httpConnectionManagerv3.HttpFilter_TypedConfig{
+				TypedConfig: toAny(&statefulsessionv3.StatefulSession{}),
+			},
+		})
+	}
+
 	hf = append(hf, &httpConnectionManagerv3.HttpFilter{
 		Name: "envoy.filters.http.router",
 		ConfigType: &httpConnectionManagerv3.HttpFilter_TypedConfig{
@@ -192,7 +202,7 @@ func buildExtAuthzHTTPFilter(af *model.HTTPExternalAuthFilter) *httpConnectionMa
 			},
 			DecoderHeaderMutationRules: &mutation_rules_v3.HeaderMutationRules{
 				DisallowExpression: &envoy_type_matcher_v3.RegexMatcher{
-					Regex: "^(:authority|host)$",
+					Regex: "^(:authority|host|content-length)$",
 				},
 			},
 		}
@@ -222,20 +232,22 @@ func buildExtAuthzHTTPFilter(af *model.HTTPExternalAuthFilter) *httpConnectionMa
 			httpSvc.AuthorizationResponse.AllowedUpstreamHeaders = toListStringMatcher(af.AllowedResponseHeaders)
 		} else {
 			// Empty list means forward all per Gateway API spec. Use AllowedUpstreamHeaders
-			// (replace, not append) so that if the auth service returns a header that already
-			// exists on the client request (e.g. Content-Length), the upstream request ends up
-			// with exactly one value rather than a duplicate that would corrupt the request.
+			// (replace, not append) so that a header the auth service returns which already
+			// exists on the client request ends up with exactly one value rather than a
+			// duplicate that would corrupt the request. Headers describing the message body
+			// are excluded by DecoderHeaderMutationRules below.
 			httpSvc.AuthorizationResponse.AllowedUpstreamHeaders = allHeadersMatcher()
 		}
 		config = &extauthzv3.ExtAuthz{
 			Services: &extauthzv3.ExtAuthz_HttpService{
 				HttpService: httpSvc,
 			},
-			// Prevent the auth service from overriding routing-critical headers
-			// regardless of what AllowedUpstreamHeaders matches.
+			// Prevent the auth service from overriding routing-critical or
+			// message-framing headers regardless of what AllowedUpstreamHeaders
+			// matches.
 			DecoderHeaderMutationRules: &mutation_rules_v3.HeaderMutationRules{
 				DisallowExpression: &envoy_type_matcher_v3.RegexMatcher{
-					Regex: "^(:authority|host)$",
+					Regex: "^(:authority|host|content-length)$",
 				},
 			},
 		}

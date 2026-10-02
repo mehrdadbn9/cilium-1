@@ -15,6 +15,7 @@ import (
 	"strings"
 	"text/tabwriter"
 
+	"google.golang.org/protobuf/reflect/protoregistry"
 	"google.golang.org/protobuf/types/known/timestamppb"
 	"google.golang.org/protobuf/types/known/wrapperspb"
 
@@ -191,6 +192,9 @@ func GetFlowType(f *flowpb.Flow) string {
 	case api.MessageTypeTrace:
 		return api.TraceObservationPoint(uint8(f.GetEventType().GetSubType()))
 	case api.MessageTypeDrop:
+		if desc := f.GetExtDropReasonDesc(); desc != "" {
+			return desc
+		}
 		return api.DropReason(uint8(f.GetEventType().GetSubType()))
 	case api.MessageTypePolicyVerdict:
 		return fmt.Sprintf("%s:%s %s",
@@ -408,12 +412,29 @@ func (p *Printer) WriteProtoFlow(res *observerpb.GetFlowsResponse) error {
 			return fmt.Errorf("failed to write out packet: %w", w.err)
 		}
 	case JSONLegacyOutput:
+		stripUnkownExtensions(f)
 		return p.jsonEncoder.Encode(f)
 	case JSONPBOutput:
+		if stripUnkownExtensions(f) {
+			res.ResponseTypes = &observerpb.GetFlowsResponse_Flow{
+				Flow: f,
+			}
+		}
 		return p.jsonEncoder.Encode(res)
 	}
 	p.line++
 	return nil
+}
+
+func stripUnkownExtensions(f *flowpb.Flow) bool {
+	if f.GetExtensions() != nil {
+		if _, err := protoregistry.GlobalTypes.FindMessageByURL(f.GetExtensions().TypeUrl); err != nil {
+			// Type unknown - strip out the extension
+			f.Extensions = nil
+			return true
+		}
+	}
+	return false
 }
 
 // joinWithCutOff performs a strings.Join, but will omit elements if the

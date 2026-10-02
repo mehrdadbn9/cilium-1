@@ -7,11 +7,11 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
-	"net"
 	"os"
 	"path/filepath"
 
 	"github.com/cilium/cilium/pkg/components"
+	"github.com/cilium/cilium/pkg/datapath/linux/safenetlink"
 	"github.com/cilium/cilium/pkg/defaults"
 	"github.com/cilium/cilium/pkg/mountinfo"
 )
@@ -73,7 +73,6 @@ func cgroup2fsMounts() []string {
 
 // LB and CT map for debugging services; using bpftool for a reliable dump
 var bpfMapsPath = []string{
-	"tc/globals/cilium_auth_map",
 	"tc/globals/cilium_call_policy",
 	"tc/globals/cilium_calls_overlay_2",
 	"tc/globals/cilium_calls_wireguard*",
@@ -314,18 +313,19 @@ func loadConfigFile(path string) (*BugtoolConfiguration, error) {
 // Listing tc filter/chain/classes requires specific interface names.
 // Commands are generated per-interface.
 func tcInterfaceCommands() []string {
-	ifaces, err := net.Interfaces()
+	links, err := safenetlink.LinkList()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to generate per interface tc commands: %s\n", fmt.Errorf("could not list network interfaces: %w", err))
 		return nil
 	}
 	commands := []string{}
-	for _, iface := range ifaces {
+	for _, link := range links {
+		name := link.Attrs().Name
 		commands = append(commands,
-			fmt.Sprintf("tc filter show dev %s ingress", iface.Name),
-			fmt.Sprintf("tc filter show dev %s egress", iface.Name),
-			fmt.Sprintf("tc chain show dev %s", iface.Name),
-			fmt.Sprintf("tc class show dev %s", iface.Name))
+			fmt.Sprintf("tc filter show dev %s ingress", name),
+			fmt.Sprintf("tc filter show dev %s egress", name),
+			fmt.Sprintf("tc chain show dev %s", name),
+			fmt.Sprintf("tc class show dev %s", name))
 	}
 	return commands
 }
@@ -417,7 +417,6 @@ func ciliumDbgCommands(cmdDir string) []string {
 		"cilium-dbg encrypt status",
 		"cilium-dbg endpoint list",
 		"cilium-dbg endpoint list -o json",
-		"cilium-dbg bpf auth list",
 		"cilium-dbg bpf bandwidth list",
 		"cilium-dbg bpf config list",
 		"cilium-dbg bpf lb list",

@@ -8,12 +8,12 @@ import (
 	"fmt"
 	"log/slog"
 	"maps"
-	"net"
 	"net/netip"
 
 	"github.com/cilium/hive/cell"
 
 	agentK8s "github.com/cilium/cilium/daemon/k8s"
+	cmtypes "github.com/cilium/cilium/pkg/clustermesh/types"
 	ipsec "github.com/cilium/cilium/pkg/datapath/linux/ipsec/types"
 	"github.com/cilium/cilium/pkg/datapath/tunnel"
 	iputil "github.com/cilium/cilium/pkg/ip"
@@ -50,6 +50,7 @@ type localNodeSynchronizerParams struct {
 
 	Logger             *slog.Logger
 	Config             *option.DaemonConfig
+	ClusterInfo        cmtypes.ClusterInfo
 	TunnelConfig       tunnel.Config
 	K8sLocalNode       agentK8s.LocalNodeResource
 	K8sCiliumLocalNode agentK8s.LocalCiliumNodeResource
@@ -108,7 +109,7 @@ func (ini *localNodeSynchronizer) SyncLocalNode(ctx context.Context, store *node
 					ln.Local.IsBeingDeleted = true
 				})
 			}
-			new := parseNode(ini.Logger, ev.Object)
+			new := parseNode(ini.Logger, ev.Object, ini.ClusterInfo)
 			if !ini.mutableFieldsEqual(new) {
 				store.Update(func(ln *node.LocalNode) {
 					ini.syncFromK8s(ln, new)
@@ -134,8 +135,8 @@ func newLocalNodeSynchronizer(p localNodeSynchronizerParams) node.LocalNodeSynch
 }
 
 func (ini *localNodeSynchronizer) initFromConfig(n *node.LocalNode) error {
-	n.Cluster = ini.Config.ClusterName
-	n.ClusterID = ini.Config.ClusterID
+	n.Cluster = ini.ClusterInfo.Name
+	n.ClusterID = ini.ClusterInfo.ID
 	n.Name = nodeTypes.GetName()
 
 	n.Local.IPv4NativeRoutingCIDR = ini.Config.IPv4NativeRoutingCIDR
@@ -143,7 +144,7 @@ func (ini *localNodeSynchronizer) initFromConfig(n *node.LocalNode) error {
 
 	// Initialize node IP addresses from configuration.
 	if ini.Config.IPv6NodeAddr != "auto" {
-		if ip := net.ParseIP(ini.Config.IPv6NodeAddr); ip == nil {
+		if ip, err := netip.ParseAddr(ini.Config.IPv6NodeAddr); err != nil {
 			return fmt.Errorf("invalid IPv6 node address: %q", ini.Config.IPv6NodeAddr)
 		} else {
 			if !ip.IsGlobalUnicast() {
@@ -153,7 +154,7 @@ func (ini *localNodeSynchronizer) initFromConfig(n *node.LocalNode) error {
 		}
 	}
 	if ini.Config.IPv4NodeAddr != "auto" {
-		if ip := net.ParseIP(ini.Config.IPv4NodeAddr); ip == nil {
+		if ip, err := netip.ParseAddr(ini.Config.IPv4NodeAddr); err != nil {
 			return fmt.Errorf("Invalid IPv4 node address: %q", ini.Config.IPv4NodeAddr)
 		} else {
 			n.SetNodeInternalIP(ip)
@@ -205,7 +206,7 @@ func (ini *localNodeSynchronizer) initFromK8s(ctx context.Context, node *node.Lo
 	if err != nil {
 		return err
 	}
-	parsedNode := parseNode(ini.Logger, k8sNode)
+	parsedNode := parseNode(ini.Logger, k8sNode, ini.ClusterInfo)
 
 	// Initialize the fields in local node where the source of truth is in Kubernetes.
 	// Later stages will deal with updating rest of the fields depending on configuration.
@@ -213,16 +214,27 @@ func (ini *localNodeSynchronizer) initFromK8s(ctx context.Context, node *node.Lo
 	// The fields left uninitialized/unrestored here:
 	//   - Cilium internal IPs (restored from cilium_host or allocated by IPAM)
 	//   - Health IPs (allocated by IPAM)
-	//   - Ingress IPs (restored from ipcachemap or allocated)
 	//   - WireGuard key (set by WireGuard agent)
 	//   - IPsec key (set by IPsec)
 	//   - alloc CIDRs (depends on IPAM mode; restored from Node or CiliumNode)
 	node.Name = parsedNode.Name
 	for _, addr := range parsedNode.IPAddresses {
 		if addr.Type == addressing.NodeInternalIP {
-			node.SetNodeInternalIP(addr.IP)
+			node.SetNodeInternalIP(addr.IP.Addr)
 		} else if addr.Type == addressing.NodeExternalIP {
-			node.SetNodeExternalIP(addr.IP)
+			node.SetNodeExternalIP(addr.IP.Addr)
+		}
+	}
+	// The Ingress IPs parsed from Kubernetes Node annotations are only a fallback.
+	// The local CiliumNode fetched immediately below overrides them when available.
+	// A later bootstrap stage gives addresses restored from the BPF ipcache map
+	// highest precedence; IPAM allocates new addresses only if none could be restored.
+	if ini.Config.EnableEnvoyConfig {
+		if ini.Config.EnableIPv4 {
+			node.IPv4IngressIP = parsedNode.IPv4IngressIP
+		}
+		if ini.Config.EnableIPv6 {
+			node.IPv6IngressIP = parsedNode.IPv6IngressIP
 		}
 	}
 	ini.syncFromK8s(node, parsedNode)
@@ -233,7 +245,7 @@ func (ini *localNodeSynchronizer) initFromK8s(ctx context.Context, node *node.Lo
 	if k8sCiliumNode != nil {
 		for _, addr := range k8sCiliumNode.Spec.Addresses {
 			if addr.Type == addressing.NodeCiliumInternalIP {
-				node.SetCiliumInternalIP(net.ParseIP(addr.IP))
+				node.SetCiliumInternalIP(addr.Addr())
 			}
 		}
 
@@ -246,6 +258,23 @@ func (ini *localNodeSynchronizer) initFromK8s(ctx context.Context, node *node.Lo
 			if ini.Config.EnableIPv6 {
 				addr, _ := netip.ParseAddr(k8sCiliumNode.Spec.HealthAddressing.IPv6)
 				node.IPv6HealthIP = iputil.AddrFrom(addr)
+			}
+		}
+
+		// Prefer the durable local CiliumNode values over the Kubernetes Node
+		// annotation fallback. The BPF ipcache restoration runs later and may
+		// override these with the addresses used by the previous datapath.
+		if ini.Config.EnableEnvoyConfig {
+			if ini.Config.EnableIPv4 {
+				if addr, err := netip.ParseAddr(k8sCiliumNode.Spec.IngressAddressing.IPV4); err == nil {
+					node.IPv4IngressIP = iputil.AddrFrom(addr)
+				}
+			}
+
+			if ini.Config.EnableIPv6 {
+				if addr, err := netip.ParseAddr(k8sCiliumNode.Spec.IngressAddressing.IPV6); err == nil {
+					node.IPv6IngressIP = iputil.AddrFrom(addr)
+				}
 			}
 		}
 	} else {
@@ -307,9 +336,9 @@ func (ini *localNodeSynchronizer) syncFromK8s(ln, new *node.LocalNode) {
 	)
 }
 
-func parseNode(logger *slog.Logger, k8sNode *slim_corev1.Node) *node.LocalNode {
+func parseNode(logger *slog.Logger, k8sNode *slim_corev1.Node, clusterInfo cmtypes.ClusterInfo) *node.LocalNode {
 	return &node.LocalNode{
-		Node: *k8s.ParseNode(logger, k8sNode, source.Kubernetes),
+		Node: *k8s.ParseNode(logger, k8sNode, source.Kubernetes, clusterInfo),
 		Local: &node.LocalNodeInfo{
 			UID:        k8sNode.GetUID(),
 			ProviderID: k8sNode.Spec.ProviderID,

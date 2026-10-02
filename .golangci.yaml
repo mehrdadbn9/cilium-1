@@ -41,12 +41,74 @@ linters:
             - '**/*clustermesh*.go'
             - '**/*etcd*.go'
             - '**/*store*.go'
+        time:
+          deny:
+            - pkg: time$
+              desc: Use github.com/cilium/cilium/pkg/time instead to improve ordering and consistency testing
+          # The rule applies to every file not excluded below. Note that the
+          # globs are matched against absolute paths, so every pattern has to
+          # start with '**/': a repository-root-relative one matches nothing.
+          files:
+            - '!**/*_test.go'
+            # Wrapper directories
+            - '!**/time/*.go'
+            # Generated directories
+            - '!**/api/**'
+            - '!**/client/**'
+            - '!**/slim/**'
+            # Not part of any binary
+            - '!**/examples/**'
+            # Not for cilium-agent
+            - '!**/bugtool/**'
+            - '!**/cilium-dbg/**'
+            - '!**/clustermesh/**'
+            - '!**/clustermesh-apiserver/**'
+            - '!**/health/**'
+            - '!**/operator/**'
+            - '!**/plugins/**'
+            - '!**/tools/**'
+            - '!**/test/**'
+            - '!**/testutils/**'
+            # Not for cilium-cli
+            - '!**/cilium-cli/**'
+            # Source shared with other binaries
+            - '!**/hive/**'
+            - '!**/lock/**'
+            # Skip override (not applicable)
+            - '!**/defaults/**'
+            - '!**/loadinfo/**'
+            - '!**/logging/**'
+            - '!**/metric/**'
+            - '!**/probes/**'
+            - '!**/types/**'
+            # May need subsequent evaluation to detect resiliency issues in CI
+            - '!**/rate/**'
+            - '!**/resiliency/**'
     forbidigo:
       forbid:
+        - pattern: ^strings\.Title$
+          pkg: ^strings$
+          msg: "strings.Title is deprecated, use golang.org/x/text/cases instead."
         # List based on https://github.com/vishvananda/netlink/pull/1018
-        - pattern: ^netlink\.(Handle\.)?("AddrList|BridgeVlanList|ChainList|ClassList|ConntrackTableList|DevLinkGetDeviceList|DevLinkGetAllPortList|DevlinkGetDeviceParams|FilterList|FouList|GenlFamilyList|GTPPDPList|LinkByName|LinkByAlias|LinkList|LinkSubscribeWithOptions|NeighList|NeighProxyList|NeighListExecute|LinkGetProtinfo|QdiscList|RdmaLinkList|RdmaLinkByName|RdmaLinkDel|RouteList|RouteListFiltered|RouteListFilteredIter|RouteSubscribeWithOptions|RuleList|RuleListFiltered|SocketGet|SocketDiagTCPInfo|SocketDiagTCP|SocketDiagUDPInfo|SocketDiagUDP|UnixSocketDiagInfo|UnixSocketDiag|SocketXDPGetInfo|SocketDiagXDP|VDPAGetDevList|VDPAGetDevConfigList|VDPAGetMGMTDevList|XfrmPolicyList|XfrmStateList)
+        - pattern: ^netlink\.(Handle\.)?(AddrList|BridgeVlanList|ChainList|ClassList|ConntrackTableList|DevLinkGetDeviceList|DevLinkGetAllPortList|DevlinkGetDeviceParams|FilterList|FouList|GenlFamilyList|GTPPDPList|LinkByName|LinkByAlias|LinkList|LinkSubscribeWithOptions|NeighList|NeighProxyList|NeighListExecute|LinkGetProtinfo|QdiscList|RdmaLinkList|RdmaLinkByName|RdmaLinkDel|RouteList|RouteListFiltered|RouteListFilteredIter|RouteSubscribeWithOptions|RuleList|RuleListFiltered|SocketGet|SocketDiagTCPInfo|SocketDiagTCP|SocketDiagUDPInfo|SocketDiagUDP|UnixSocketDiagInfo|UnixSocketDiag|SocketXDPGetInfo|SocketDiagXDP|VDPAGetDevList|VDPAGetDevConfigList|VDPAGetMGMTDevList|XfrmPolicyList|XfrmStateList)
           pkg: ^github.com/vishvananda/netlink$
           msg: Found netlink function which can return ErrDumpInterrupted. Use safenetlink package instead.
+        - pattern: ^netlink\.(Handle\.)?XfrmState(Add|Update|Del|Flush)$
+          pkg: ^github.com/vishvananda/netlink$
+          msg: Found direct XFRM state modification which would leave the cache stale. Use xfrmStateCache instead.
+        # The stdlib net.Interface* functions query the kernel over a netlink
+        # socket without a timeout, so they can block forever. See
+        # https://github.com/cilium/cilium/issues/15051
+        - pattern: ^net\.(Interfaces|InterfaceAddrs|InterfaceByIndex|InterfaceByName|Interface\.Addrs)$
+          pkg: ^net$
+          msg: 'Found stdlib net.Interface* function which can block forever, see https://github.com/cilium/cilium/issues/15051. Use the netlink or safenetlink package instead.'
+        - pattern: ^sync\.(Mutex|RWMutex|Map)$
+          pkg: ^sync$
+          msg: Use pkg/lock instead to improve deadlock detection.
+        # Only reported in test files, see the forbidigo exclusion rule below.
+        - pattern: ^reflect\.DeepEqual$
+          pkg: ^reflect$
+          msg: Use assert.Equal from github.com/stretchr/testify/assert instead, which reports the differing fields on failure. See https://github.com/cilium/cilium/issues/40562.
       analyze-types: true
     goheader:
       values:
@@ -212,6 +274,18 @@ linters:
           - gomodguard_v2
         path: test/
         text: "logrus"
+      # The lock packages are the sanctioned wrappers around sync
+      - linters:
+          - forbidigo
+        path: (pkg|cilium-cli/utils)/lock/.+\.go
+        text: sync\.
+      # reflect.DeepEqual is discouraged in test code only: it reports that two
+      # values differ without saying which fields, making failures hard to
+      # debug. Non-test code may use it freely.
+      - linters:
+          - forbidigo
+        path-except: _test\.go$
+        text: reflect\.DeepEqual
     paths:
       - third_party$
       - builtin$

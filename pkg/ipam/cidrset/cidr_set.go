@@ -14,6 +14,7 @@ import (
 
 	"go4.org/netipx"
 
+	"github.com/cilium/cilium/pkg/ipam/cidralloc"
 	"github.com/cilium/cilium/pkg/lock"
 )
 
@@ -25,14 +26,17 @@ type CidrSet struct {
 	clusterPrefix netip.Prefix
 	// nodeMaskSize is the mask size, in bits, assigned to the nodes
 	nodeMaskSize int
-	// maxCIDRs is the maximum number of CIDRs that can be allocated
+	// maxCIDRs is the maximum number of CIDRs that can be allocated or reserved
 	maxCIDRs int
-	// allocatedCIDRs counts the number of CIDRs allocated
-	allocatedCIDRs int
+	// unavailableCIDRs counts CIDRs that cannot be returned by AllocateNext.
+	// It is derived from the union of the used and reserved bitmaps.
+	unavailableCIDRs int
 	// nextCandidate points to the next CIDR that should be free
 	nextCandidate int
 	// used is a bitmap used to track the CIDRs allocated
 	used big.Int
+	// reserved is a bitmap used to track the CIDRs reserved
+	reserved big.Int
 }
 
 const (
@@ -139,7 +143,7 @@ func (s *CidrSet) indexToCIDRBlock(index int) netip.Prefix {
 func (s *CidrSet) IsFull() bool {
 	s.Lock()
 	defer s.Unlock()
-	return s.allocatedCIDRs == s.maxCIDRs
+	return s.unavailableCIDRs == s.maxCIDRs
 }
 
 // AllocateNext allocates the next free CIDR range. This will set the range
@@ -148,12 +152,12 @@ func (s *CidrSet) AllocateNext() (netip.Prefix, error) {
 	s.Lock()
 	defer s.Unlock()
 
-	if s.allocatedCIDRs == s.maxCIDRs {
+	if s.unavailableCIDRs == s.maxCIDRs {
 		return netip.Prefix{}, ErrCIDRRangeNoCIDRsRemaining
 	}
 	candidate := s.nextCandidate
 	for range s.maxCIDRs {
-		if s.used.Bit(candidate) == 0 {
+		if s.used.Bit(candidate) == 0 && s.reserved.Bit(candidate) == 0 {
 			break
 		}
 		candidate = (candidate + 1) % s.maxCIDRs
@@ -161,7 +165,7 @@ func (s *CidrSet) AllocateNext() (netip.Prefix, error) {
 
 	s.nextCandidate = (candidate + 1) % s.maxCIDRs
 	s.used.SetBit(&s.used, candidate, 1)
-	s.allocatedCIDRs++
+	s.unavailableCIDRs++
 
 	return s.indexToCIDRBlock(candidate), nil
 }
@@ -237,7 +241,9 @@ func (s *CidrSet) Release(prefix netip.Prefix) error {
 		// double counting.
 		if s.used.Bit(i) != 0 {
 			s.used.SetBit(&s.used, i, 0)
-			s.allocatedCIDRs--
+			if s.reserved.Bit(i) == 0 {
+				s.unavailableCIDRs--
+			}
 		}
 	}
 	return nil
@@ -257,7 +263,9 @@ func (s *CidrSet) Occupy(prefix netip.Prefix) (err error) {
 		// double counting.
 		if s.used.Bit(i) == 0 {
 			s.used.SetBit(&s.used, i, 1)
-			s.allocatedCIDRs++
+			if s.reserved.Bit(i) == 0 {
+				s.unavailableCIDRs++
+			}
 		}
 	}
 
@@ -284,4 +292,104 @@ func (s *CidrSet) getIndexForAddr(addr netip.Addr) (int, error) {
 		return 0, fmt.Errorf("CIDR: %v/%v is out of the range of CIDR allocator", addr, s.nodeMaskSize)
 	}
 	return int(cidrIndex), nil
+}
+
+func countUnavailableCIDRs(used, reserved *big.Int) int {
+	usedWords := used.Bits()
+	reservedWords := reserved.Bits()
+
+	count := 0
+	for i := range max(len(usedWords), len(reservedWords)) {
+		var word big.Word
+
+		if i < len(usedWords) {
+			word |= usedWords[i]
+		}
+		if i < len(reservedWords) {
+			word |= reservedWords[i]
+		}
+
+		count += bits.OnesCount(uint(word))
+	}
+
+	return count
+}
+
+// SetReservedRanges replaces the ranges excluded from new allocations.
+func (s *CidrSet) SetReservedRanges(ranges []netipx.IPRange) error {
+	var reservedBitmap big.Int
+
+	for _, r := range ranges {
+		begin, err := s.getIndexForAddr(r.From())
+		if err != nil {
+			return err
+		}
+
+		end, err := s.getIndexForAddr(r.To())
+		if err != nil {
+			return err
+		}
+
+		for i := begin; i <= end; i++ {
+			reservedBitmap.SetBit(&reservedBitmap, i, 1)
+		}
+	}
+
+	s.Lock()
+	defer s.Unlock()
+
+	s.unavailableCIDRs = countUnavailableCIDRs(&s.used, &reservedBitmap)
+	s.reserved.Set(&reservedBitmap)
+
+	return nil
+}
+
+type ErrCIDRCollision struct {
+	cidr      string
+	allocator cidralloc.CIDRAllocator
+}
+
+func (e ErrCIDRCollision) Error() string {
+	return fmt.Sprintf("requested CIDR %s collides with %s", e.cidr, e.allocator)
+}
+
+func (e *ErrCIDRCollision) Is(target error) bool {
+	t, ok := target.(*ErrCIDRCollision)
+	if !ok {
+		return false
+	}
+	return t.cidr == e.cidr
+}
+
+func NewCIDRSets(isV6 bool, strCIDRs []string, maskSize int) ([]cidralloc.CIDRAllocator, error) {
+	cidrAllocators := make([]cidralloc.CIDRAllocator, 0, len(strCIDRs))
+	for _, strCIDR := range strCIDRs {
+		prefix, err := netip.ParsePrefix(strCIDR)
+		if err != nil {
+			return nil, err
+		}
+		// Check if CIDRs collide with each other.
+		for _, cidrAllocator := range cidrAllocators {
+			if cidrAllocator.InRange(prefix) {
+				return nil, &ErrCIDRCollision{
+					cidr:      strCIDR,
+					allocator: cidrAllocator,
+				}
+			}
+		}
+
+		addr := prefix.Addr()
+		switch {
+		case isV6 && addr.Is4():
+			return nil, fmt.Errorf("CIDR is not v6 family: %s", prefix)
+		case !isV6 && !addr.Is4():
+			return nil, fmt.Errorf("CIDR is not v4 family: %s", prefix)
+		}
+		cidrSet, err := NewCIDRSet(prefix, maskSize)
+		if err != nil {
+			return nil, err
+		}
+		cidrAllocators = append(cidrAllocators, cidrSet)
+	}
+	return cidrAllocators, nil
 }

@@ -19,6 +19,7 @@ cilium connectivity test [flags]
       --cilium-pod-selector string                                 Label selector matching all cilium-related pods (default "app.kubernetes.io/part-of=cilium")
       --cleanup                                                    Cleanup all connectivity test artifacts (namespaces, deployments, services) without running tests
       --collect-sysdump-on-failure                                 Collect sysdump after a test fails
+      --conn-disrupt-client-timeout duration                       Conn disrupt client per-request timeout, after which it exits (0 leaves the client default)
       --conn-disrupt-dispatch-interval duration                    TCP packet dispatch interval
       --conn-disrupt-test-restarts-path string                     Conn disrupt test temporary result file (used internally) (default "/tmp/cilium-conn-disrupt-restarts")
       --conn-disrupt-test-setup                                    Set up conn disrupt test dependencies
@@ -28,7 +29,7 @@ cilium connectivity test [flags]
       --curl-insecure                                              Pass --insecure to curl
       --curl-parallel uint                                         Number of parallel requests in curl commands (0 to disable)
   -d, --debug                                                      Show debug messages
-      --dns-test-server-image string                               Image path to use for CoreDNS (default "registry.k8s.io/coredns/coredns:v1.14.6@sha256:900f9c109f7a33545d3c811516e8376df9019147b750f5ce3e254468769176ea")
+      --dns-test-server-image string                               Image path to use for CoreDNS (default "registry.k8s.io/coredns/coredns:v1.14.7@sha256:7efd3c635b03efd68c4e8398fc45f0d993d0e9ab016f72c1cefb0fd6d01aa286")
       --echo-image string                                          Image path to use for echo server (default "gcr.io/k8s-staging-gateway-api/echo-advanced:v20251204-v1.4.1")
       --exit-zero-on-failure                                       Exit with zero return code even when test failures are detected
       --external-cidr string                                       IPv4 CIDR to use as external target in connectivity tests (default "1.0.0.0/8")
@@ -45,7 +46,7 @@ cilium connectivity test [flags]
       --external-target-ipv6-capable                               External target is IPv6 capable
       --flow-validation string                                     Enable Hubble flow validation { disabled | warning | strict } (default "warning")
       --force-deploy                                               Force re-deploying test artifacts
-      --frr-image string                                           Image path to use for FRR (default "quay.io/frrouting/frr:10.7.0@sha256:65e5967b922572c0565d968388fb06af69d7e9b3b3eea40ad7e3810687667f68")
+      --frr-image string                                           Image path to use for FRR (default "quay.io/frrouting/frr:10.7.1@sha256:e995beaa50fdc9edb35eadcfefa29b7f062cc06f2b812613789b68fa541554d2")
       --helm-values-secret-name string                             Secret name to store the auto-generated helm values file. The namespace is the same as where Cilium will be installed (default "cilium-cli-helm-values")
   -h, --help                                                       help for test
       --hubble                                                     Automatically use Hubble for flow validation & troubleshooting (default true)
@@ -74,7 +75,7 @@ cilium connectivity test [flags]
       --secondary-network-iface string                             Secondary network iface name (e.g., to test NodePort BPF on multiple networks)
       --service-type string                                        Type of Kubernetes Services created for connectivity tests (default "NodePort")
       --single-node                                                Limit to tests able to run on a single node
-      --socat-image string                                         Image path to use for multicast tests (default "docker.io/alpine/socat:1.8.1.3@sha256:e7b17711daaa7d49107a7193112689e91fb1a27bddd9cb0b32641b55b8e9e3b0")
+      --socat-image string                                         Image path to use for multicast tests (default "docker.io/alpine/socat:1.8.1.3@sha256:5ffbd6ae916cbad86a58fabe0d6d5a6fd5c2b47ddf031e82996baac9300e732f")
       --sysdump-cilium-bugtool-flags stringArray                   Optional set of flags to pass to cilium-bugtool command.
       --sysdump-cilium-daemon-set-label-selector string            The labels used to target Cilium daemon set (default "k8s-app=cilium")
       --sysdump-cilium-envoy-label-selector string                 The labels used to target Cilium Envoy pods (default "k8s-app=cilium-envoy")
@@ -118,7 +119,7 @@ cilium connectivity test [flags]
                                                                    NOTE: There is a lower bound requirement on the number of workers for the sysdump operation to be effective. Therefore, for low values, the actual number of workers may be adjusted upwards. Defaults to the number of available CPUs. (default 20)
       --test strings                                               Run tests that match one of the given regular expressions, skip tests by starting the expression with '!', target Scenarios with e.g. '/pod-to-cidr'
       --test-concurrency int                                       Count of namespaces to perform the connectivity tests in parallel (value <= 0 will be treated as 1) (default 1)
-      --test-conn-disrupt-image string                             Image path to use for connection disruption tests (default "quay.io/cilium/test-connection-disruption:v0.0.17@sha256:62374cfd0e87e6541244331ccf477a21c527c3eefa9d841b97af79996939be0c")
+      --test-conn-disrupt-image string                             Image path to use for connection disruption tests (default "quay.io/cilium/test-connection-disruption:v0.0.18@sha256:1666bbed3eb6f0e3074b366fbf701a5ea7206a946fa2a9fd4efff738bae2d1f9")
       --test-namespace string                                      Namespace to perform the connectivity in (always suffixed with a sequence number to be compliant with test-concurrency param, e.g.: cilium-test-1) (default "cilium-test")
       --timeout duration                                           Maximum time to allow the connectivity test suite to take
   -t, --timestamp                                                  Show timestamp in messages

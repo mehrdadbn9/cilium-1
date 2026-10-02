@@ -22,13 +22,13 @@
 #include "lib/nat_46x64.h"
 #include "lib/sock.h"
 #include "lib/trace_sock.h"
+#include "lib/health_check.h"
 
 #define SYS_REJECT	0
 #define SYS_PROCEED	1
 
-#ifndef HOST_NETNS_COOKIE
-# define HOST_NETNS_COOKIE   get_netns_cookie(NULL)
-#endif
+DECLARE_CONFIG(bool, disable_external_ip_mitigation,
+	       "Disable externalIP mitigation (CVE-2020-8554)")
 
 static __always_inline __maybe_unused bool is_v4_loopback(__be32 daddr)
 {
@@ -72,51 +72,59 @@ void ctx_set_port(struct bpf_sock_addr *ctx, __be16 dport)
 
 static __always_inline __maybe_unused bool task_in_extended_hostns(void)
 {
-#ifdef ENABLE_MKE
+	__u32 classid = CONFIG(mke_host);
+
+	if (!classid)
+		return false;
 	/* Extension for non-Cilium managed containers on MKE. */
-	return get_cgroup_classid() == MKE_HOST;
-#else
-	return false;
-#endif
+	return get_cgroup_classid() == classid;
 }
 
 static __always_inline __maybe_unused bool
 ctx_in_hostns(void *ctx __maybe_unused, __net_cookie *cookie)
 {
 	__net_cookie own_cookie = get_netns_cookie(ctx);
+	__net_cookie host_cookie = CONFIG(host_netns_cookie);
 
 	if (cookie)
 		*cookie = own_cookie;
-	return own_cookie == HOST_NETNS_COOKIE ||
+
+	if (!host_cookie)
+		host_cookie = get_netns_cookie(NULL);
+
+	return own_cookie == host_cookie ||
 	       task_in_extended_hostns();
 }
 
 static __always_inline __maybe_unused
 bool sock_is_health_check(struct bpf_sock_addr *ctx __maybe_unused)
 {
-#ifdef ENABLE_HEALTH_CHECK
+	if (!CONFIG(enable_health_check))
+		return false;
+
 	int val;
 
 	if (!get_socket_opt(ctx, SOL_SOCKET, SO_MARK, &val, sizeof(val)))
 		return val == MARK_MAGIC_HEALTH;
-#endif
+
 	return false;
 }
 
 static __always_inline __maybe_unused
 void sock_reset_health_check_marker(struct bpf_sock_addr *ctx __maybe_unused)
 {
+	if (!CONFIG(enable_health_check))
+		return;
+
 	/* connect() has been called at this point, so therefore we
 	 * can now reset the marker so that this does not leak into
 	 * the tcx datapath and looks like regular host traffic. We
 	 * cannot do much other than to proceed if resetting back to
 	 * zero should fail.
 	 */
-#ifdef ENABLE_HEALTH_CHECK
 	int val = 0;
 
 	set_socket_opt(ctx, SOL_SOCKET, SO_MARK, &val, sizeof(val));
-#endif
 }
 
 static __always_inline __maybe_unused
@@ -181,15 +189,15 @@ static __always_inline int sock4_update_revnat(struct bpf_sock_addr *ctx,
 static __always_inline int sock4_delete_revnat(const struct bpf_sock *ctx,
 					       struct bpf_sock *ctx_full)
 {
-    struct ipv4_revnat_tuple key = {};
-    int ret = 0;
+	struct ipv4_revnat_tuple key = {};
+	int ret = 0;
 
-    key.cookie = get_socket_cookie(ctx_full);
-    key.address = (__u32)ctx->dst_ip4;
-    key.port = (__u16)ctx->dst_port;
+	key.cookie = get_socket_cookie(ctx_full);
+	key.address = (__u32)ctx->dst_ip4;
+	key.port = (__u16)ctx->dst_port;
 
-    ret = map_delete_elem(&cilium_lb4_reverse_sk, &key);
-    return ret;
+	ret = map_delete_elem(&cilium_lb4_reverse_sk, &key);
+	return ret;
 }
 
 static __always_inline bool
@@ -197,7 +205,7 @@ sock4_skip_xlate(const struct lb4_service *svc, __be32 address)
 {
 	if (lb4_to_lb6_service(svc))
 		return true;
-	if ((lb4_svc_is_external_ip(svc) && !is_defined(DISABLE_EXTERNAL_IP_MITIGATION)) ||
+	if ((lb4_svc_is_external_ip(svc) && !CONFIG(disable_external_ip_mitigation)) ||
 	    (lb4_svc_is_hostport(svc) && !is_v4_loopback(address))) {
 		const struct remote_endpoint_info *info;
 
@@ -539,7 +547,6 @@ int cil_sock4_post_bind(struct bpf_sock *ctx)
 }
 #endif /* ENABLE_NODEPORT */
 
-#ifdef ENABLE_HEALTH_CHECK
 static __always_inline void sock4_auto_bind(struct bpf_sock_addr *ctx)
 {
 	ctx->user_ip4 = 0;
@@ -583,7 +590,6 @@ int cil_sock4_pre_bind(struct bpf_sock_addr *ctx)
 	}
 	return ret;
 }
-#endif /* ENABLE_HEALTH_CHECK */
 
 static __always_inline int __sock4_xlate_rev(struct bpf_sock_addr *ctx,
 					     struct bpf_sock_addr *ctx_full)
@@ -612,7 +618,7 @@ static __always_inline int __sock4_xlate_rev(struct bpf_sock_addr *ctx,
 		svc = lb4_lookup_service(&svc_key, true);
 		if (!svc) {
 			svc = sock4_wildcard_lookup_full(&svc_key,
-						ctx_in_hostns(ctx_full, NULL));
+							 ctx_in_hostns(ctx_full, NULL));
 		}
 		if (!svc || svc->rev_nat_index != val->rev_nat_index ||
 		    (svc->count == 0 && !lb4_svc_is_l7_loadbalancer(svc))) {
@@ -714,15 +720,15 @@ static __always_inline void ctx_get_v6_dst_address(const struct bpf_sock *ctx,
 
 static __always_inline int sock6_delete_revnat(struct bpf_sock *ctx)
 {
-    struct ipv6_revnat_tuple key = {};
-    int ret = 0;
+	struct ipv6_revnat_tuple key = {};
+	int ret = 0;
 
-    key.cookie = get_socket_cookie(ctx);
-    ctx_get_v6_dst_address(ctx, &key.address);
-    key.port = (__u16)ctx->dst_port;
+	key.cookie = get_socket_cookie(ctx);
+	ctx_get_v6_dst_address(ctx, &key.address);
+	key.port = (__u16)ctx->dst_port;
 
-    ret = map_delete_elem(&cilium_lb6_reverse_sk, &key);
-    return ret;
+	ret = map_delete_elem(&cilium_lb6_reverse_sk, &key);
+	return ret;
 }
 #endif /* ENABLE_IPV6 */
 
@@ -772,7 +778,7 @@ sock6_skip_xlate(const struct lb6_service *svc, const union v6addr *address)
 {
 	if (lb6_to_lb4_service(svc))
 		return true;
-	if ((lb6_svc_is_external_ip(svc) && !is_defined(DISABLE_EXTERNAL_IP_MITIGATION)) ||
+	if ((lb6_svc_is_external_ip(svc) && !CONFIG(disable_external_ip_mitigation)) ||
 	    (lb6_svc_is_hostport(svc) && !is_v6_loopback(address))) {
 		const struct remote_endpoint_info *info;
 
@@ -964,7 +970,6 @@ int cil_sock6_post_bind(struct bpf_sock *ctx)
 }
 #endif /* ENABLE_NODEPORT */
 
-#ifdef ENABLE_HEALTH_CHECK
 static __always_inline int
 sock6_pre_bind_v4_in_v6(struct bpf_sock_addr *ctx __maybe_unused)
 {
@@ -1039,7 +1044,6 @@ int cil_sock6_pre_bind(struct bpf_sock_addr *ctx)
 	}
 	return ret;
 }
-#endif /* ENABLE_HEALTH_CHECK */
 
 static __always_inline int __sock6_xlate_fwd(struct bpf_sock_addr *ctx,
 					     const bool udp_only,
@@ -1250,7 +1254,7 @@ static __always_inline int __sock6_xlate_rev(struct bpf_sock_addr *ctx)
 		svc = lb6_lookup_service(&svc_key, true);
 		if (!svc) {
 			svc = sock6_wildcard_lookup_full(&svc_key,
-						ctx_in_hostns(ctx, NULL));
+							 ctx_in_hostns(ctx, NULL));
 		}
 		if (!svc || svc->rev_nat_index != val->rev_nat_index ||
 		    (svc->count == 0 && !lb6_svc_is_l7_loadbalancer(svc))) {

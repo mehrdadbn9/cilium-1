@@ -11,15 +11,16 @@ import (
 
 	"github.com/cilium/hive/job"
 	"github.com/cilium/statedb"
+	"k8s.io/apimachinery/pkg/util/sets"
 
 	agentK8s "github.com/cilium/cilium/daemon/k8s"
 	"github.com/cilium/cilium/pkg/datapath/linux/sysctl"
 	"github.com/cilium/cilium/pkg/endpoint"
 	"github.com/cilium/cilium/pkg/ipam/podippool"
-	"github.com/cilium/cilium/pkg/ipmasq"
 	"github.com/cilium/cilium/pkg/k8s/client"
 	"github.com/cilium/cilium/pkg/lock"
 	"github.com/cilium/cilium/pkg/logging/logfields"
+	"github.com/cilium/cilium/pkg/mac"
 	"github.com/cilium/cilium/pkg/node"
 	"github.com/cilium/cilium/pkg/option"
 )
@@ -32,17 +33,12 @@ type AllocationResult struct {
 	// IPPoolName is the IPAM pool from which the above IP was allocated from
 	IPPoolName Pool
 
-	// CIDRs is a list of all CIDRs to which the IP has direct access to.
-	// This is primarily useful if the IP has been allocated out of a VPC
-	// subnet range and the VPC provides routing to a set of CIDRs in which
-	// the IP is routable.
-	CIDRs []netip.Prefix
-
 	// PrimaryMAC is the MAC address of the primary interface. This is useful
 	// when the IP is a secondary address of an interface which is
 	// represented on the node as a Linux device and all routing of the IP
-	// must occur through that master interface.
-	PrimaryMAC string
+	// must occur through that master interface. It is unset for the IPAM
+	// modes which have no master interface.
+	PrimaryMAC mac.MAC
 
 	// GatewayIP is the IP of the gateway which must be used for this IP.
 	// If the allocated IP is derived from a VPC, then the gateway
@@ -81,10 +77,10 @@ type Allocator interface {
 	// upstream or fails if no more IPs are available
 	AllocateNextWithoutSyncUpstream(owner string, pool Pool) (*AllocationResult, error)
 
-	// Dump returns a map of all allocated IPs per pool with the IP represented as key in the
-	// map. Dump must also provide a status one-liner to represent the overall status, e.g.
-	// number of IPs allocated and overall health information if available.
-	Dump() (map[Pool]map[string]string, string)
+	// Dump returns the set of all allocated IPs per pool. Dump must also
+	// provide a status one-liner to represent the overall status, e.g. number
+	// of IPs allocated and overall health information if available.
+	Dump() (map[Pool]sets.Set[netip.Addr], string)
 
 	// Capacity returns the total IPAM allocator capacity (not the current
 	// available).
@@ -104,23 +100,27 @@ type IPAM struct {
 	ipv6Allocator Allocator
 	ipv4Allocator Allocator
 
+	ipv6RoutingMetadataResolver routingMetadataResolver
+	ipv4RoutingMetadataResolver routingMetadataResolver
+
 	// metadata provides information about a particular IP owner.
 	metadata Metadata
 
-	// owner maps an IP to the owner per pool.
-	owner map[Pool]map[string]string
+	// owner maps an IP to its owner, keyed by pool and IP so no map of maps
+	// is needed.
+	owner map[poolIP]string
 
 	// expirationTimers is a map of all expiration timers. Each entry
 	// represents a IP allocation which is protected by an expiration
 	// timer.
-	expirationTimers map[timerKey]expirationTimer
+	expirationTimers map[poolIP]expirationTimer
 
 	// mutex covers access to all members of this struct
 	allocatorMutex lock.RWMutex
 
-	// excludedIPs contains excluded IPs and their respective owners per pool. The key is a
-	// combination pool:ip to avoid having to maintain a map of maps.
-	excludedIPs map[string]string
+	// excludedIPs contains excluded IPs and their respective owners, keyed by
+	// pool and IP so no map of maps is needed.
+	excludedIPs map[poolIP]string
 
 	localNodeStore *node.LocalNodeStore
 	k8sEventReg    K8sEventRegister
@@ -129,7 +129,6 @@ type IPAM struct {
 	clientset      client.Clientset
 	nodeDiscovery  Owner
 	sysctl         sysctl.Sysctl
-	ipMasqAgent    *ipmasq.IPMasqAgent
 
 	jg job.Group
 
@@ -137,6 +136,10 @@ type IPAM struct {
 	podIPPools statedb.Table[podippool.LocalPodIPPool]
 
 	onlyMasqueradeDefaultPool bool
+
+	// cloudProviders holds the registered cloud providers, keyed by the IPAM
+	// mode each one handles.
+	cloudProviders map[string]CloudProvider
 }
 
 func (ipam *IPAM) EndpointCreated(ep *endpoint.Endpoint) {}
@@ -188,9 +191,21 @@ func (p Pool) String() string {
 	return string(p)
 }
 
-type timerKey struct {
+// poolIP identifies an IP within a pool. Both members are comparable, so it
+// can be used as a map key.
+type poolIP struct {
 	ip   netip.Addr
 	pool Pool
+}
+
+// String renders the IP the way the API reports it: bare for the default pool,
+// prefixed with the pool name otherwise. The default pool is elided because it
+// is the implied pool wherever no pool is named.
+func (p poolIP) String() string {
+	if p.pool == PoolDefault() {
+		return p.ip.String()
+	}
+	return p.pool.String() + "/" + p.ip.String()
 }
 
 type expirationTimer struct {

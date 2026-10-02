@@ -16,6 +16,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	ctrlRuntime "sigs.k8s.io/controller-runtime"
@@ -224,7 +225,7 @@ type gatewayAPIParams struct {
 	OperatorConfig   *operatorOption.OperatorConfig
 	MCSAPIConfig     mcsapitypes.MCSAPIConfig
 	GatewayApiConfig gatewayApiConfig
-	ProxyTimeouts    ciliumenvoyconfig.EnvoyProxyTimeouts
+	ProxyConfig      ciliumenvoyconfig.EnvoyProxyConfig
 
 	// Preconditions is injected from private provider
 	Preconditions *gatewayAPIPreconditions
@@ -267,11 +268,12 @@ func initGatewayAPIController(params gatewayAPIParams) error {
 		ListenerConfig: translation.ListenerConfig{
 			UseProxyProtocol:         params.GatewayApiConfig.EnableGatewayAPIProxyProtocol,
 			UseAlpn:                  params.GatewayApiConfig.EnableGatewayAPIAlpn,
-			StreamIdleTimeoutSeconds: params.ProxyTimeouts.ProxyStreamIdleTimeoutSeconds,
+			StreamIdleTimeoutSeconds: params.ProxyConfig.ProxyStreamIdleTimeoutSeconds,
 		},
 		ClusterConfig: translation.ClusterConfig{
-			IdleTimeoutSeconds: params.ProxyTimeouts.ProxyIdleTimeoutSeconds,
-			UseAppProtocol:     params.GatewayApiConfig.EnableGatewayAPIAppProtocol,
+			IdleTimeoutSeconds:       params.ProxyConfig.ProxyIdleTimeoutSeconds,
+			MaxRequestsPerConnection: params.ProxyConfig.ProxyMaxRequestsPerConnection,
+			UseAppProtocol:           params.GatewayApiConfig.EnableGatewayAPIAppProtocol,
 		},
 		RouteConfig: translation.RouteConfig{
 			HostNameSuffixMatch: true,
@@ -284,6 +286,10 @@ func initGatewayAPIController(params gatewayAPIParams) error {
 	cecTranslator := translation.NewCECTranslator(cfg)
 
 	gatewayAPITranslator := gatewayApiTranslation.NewTranslator(cecTranslator, cfg)
+	var nodeLabelSelector v1.LabelSelector
+	if cfg.HostNetworkConfig.NodeLabelSelector != nil {
+		nodeLabelSelector = v1.LabelSelector{MatchLabels: cfg.HostNetworkConfig.NodeLabelSelector.MatchLabels}
+	}
 
 	if err := registerReconcilers(
 		params.CtrlRuntimeManager,
@@ -292,6 +298,7 @@ func initGatewayAPIController(params gatewayAPIParams) error {
 		defaultControllerName,
 		installedOptionalKinds,
 		cfg.HostNetworkConfig.Enabled,
+		nodeLabelSelector,
 	); err != nil {
 		return fmt.Errorf("failed to create gateway controller: %w", err)
 	}
@@ -376,8 +383,7 @@ func isTransientError(err error) bool {
 	}
 
 	// Check for network-level errors (connection refused, reset, host unreachable)
-	var errno syscall.Errno
-	if errors.As(err, &errno) {
+	if errno, ok := errors.AsType[syscall.Errno](err); ok {
 		switch errno {
 		case syscall.ECONNREFUSED, syscall.ECONNRESET, syscall.EHOSTUNREACH, syscall.ENETUNREACH:
 			return true
@@ -422,12 +428,13 @@ func registerReconcilers(
 	controllerName string,
 	installedOptionalCRDs []schema.GroupVersionKind,
 	hostNetworkEnabled bool,
+	hostNetworkLabel v1.LabelSelector,
 ) error {
 	requiredReconcilers := []interface {
 		SetupWithManager(mgr ctrlRuntime.Manager) error
 	}{
 		newGatewayClassReconciler(mgr, logger, controllerName),
-		newGatewayReconciler(mgr, translator, logger, controllerName, hostNetworkEnabled),
+		newGatewayReconciler(mgr, translator, logger, controllerName, hostNetworkEnabled, hostNetworkLabel),
 		newGammaReconciler(mgr, translator, logger, controllerName),
 		newGatewayClassConfigReconciler(mgr, logger),
 		newEndpointSliceReconciler(mgr, logger),

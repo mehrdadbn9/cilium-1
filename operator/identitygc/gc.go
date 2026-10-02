@@ -11,7 +11,6 @@ import (
 	"github.com/cilium/hive/cell"
 	"github.com/cilium/workerpool"
 
-	authIdentity "github.com/cilium/cilium/operator/auth/identity"
 	"github.com/cilium/cilium/pkg/allocator"
 	cmtypes "github.com/cilium/cilium/pkg/clustermesh/types"
 	"github.com/cilium/cilium/pkg/controller"
@@ -38,7 +37,6 @@ type params struct {
 	Identity            resource.Resource[*v2.CiliumIdentity]
 	CiliumEndpoint      resource.Resource[*v2.CiliumEndpoint]
 	CiliumEndpointSlice resource.Resource[*v2alpha1.CiliumEndpointSlice]
-	AuthIdentityClient  authIdentity.Provider
 
 	Cfg         Config
 	SharedCfg   SharedConfig
@@ -57,15 +55,11 @@ type GC struct {
 	identity            resource.Resource[*v2.CiliumIdentity]
 	ciliumEndpoint      resource.Resource[*v2.CiliumEndpoint]
 	ciliumEndpointSlice resource.Resource[*v2alpha1.CiliumEndpointSlice]
-	authIdentityClient  authIdentity.Provider
 
 	clusterInfo    cmtypes.ClusterInfo
 	allocationMode string
 
-	gcInterval       time.Duration
-	heartbeatTimeout time.Duration
-	gcRateInterval   time.Duration
-	gcRateLimit      int64
+	gcInterval time.Duration
 
 	wp             *workerpool.WorkerPool
 	heartbeatStore *heartbeatStore
@@ -101,13 +95,9 @@ func registerGC(p params) {
 		identity:            p.Identity,
 		ciliumEndpoint:      p.CiliumEndpoint,
 		ciliumEndpointSlice: p.CiliumEndpointSlice,
-		authIdentityClient:  p.AuthIdentityClient,
 		clusterInfo:         p.ClusterInfo,
 		allocationMode:      p.SharedCfg.IdentityAllocationMode,
 		gcInterval:          p.Cfg.Interval,
-		heartbeatTimeout:    p.Cfg.HeartbeatTimeout,
-		gcRateInterval:      p.Cfg.RateInterval,
-		gcRateLimit:         p.Cfg.RateLimit,
 		heartbeatStore: newHeartbeatStore(
 			p.Cfg.HeartbeatTimeout,
 			p.Logger,
